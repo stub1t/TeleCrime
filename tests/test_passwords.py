@@ -1,5 +1,6 @@
 """Tests for password extraction and ranking."""
 
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 from telecrime.passwords.extractor import (
@@ -414,3 +415,154 @@ class TestDeduplicateCandidates:
     def test_empty_input(self):
         """Test empty input."""
         assert deduplicate_candidates([]) == []
+
+
+class TestExtractPasswordsFromContext:
+    """Tests for extract_passwords_from_context (the production entry point)."""
+
+    def test_channel_username_is_high_priority(self, session, test_config):
+        """Channel username variations become high-confidence candidates."""
+        from telecrime.models import Conversation, Message
+        from telecrime.passwords.extractor import extract_passwords_from_context
+
+        conv = Conversation(
+            platform_id=1, username="examplecloud", conversation_type="channel"
+        )
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=10,
+            platform_timestamp=datetime.now(UTC),
+            text="archive file",
+        )
+        session.add(msg)
+        session.flush()
+
+        import asyncio
+        candidates = asyncio.run(extract_passwords_from_context(
+            session, msg, test_config
+        ))
+
+        values = {c.value for c in candidates}
+        assert "examplecloud" in values
+        assert "@examplecloud" in values
+        assert all(c.scope == PasswordScope.MESSAGE for c in candidates)
+        assert all(c.confidence == 0.95 for c in candidates)
+
+    def test_caption_password(self, session, test_config):
+        """Passwords marked in the caption are extracted."""
+        from telecrime.models import Conversation, Message
+        from telecrime.passwords.extractor import extract_passwords_from_context
+
+        conv = Conversation(platform_id=1, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=10,
+            platform_timestamp=datetime.now(UTC),
+            text="Download link\npassword: secret123",
+        )
+        session.add(msg)
+        session.flush()
+
+        import asyncio
+        candidates = asyncio.run(extract_passwords_from_context(
+            session, msg, test_config
+        ))
+
+        values = {c.value for c in candidates}
+        assert "secret123" in values
+        caption_c = next(c for c in candidates if c.extraction_method == "caption")
+        assert caption_c.scope == PasswordScope.MESSAGE
+
+    def test_attachment_filename_password(self, session, test_config):
+        """Passwords embedded in the archive filename are extracted."""
+        from telecrime.models import Conversation, Message
+        from telecrime.passwords.extractor import extract_passwords_from_context
+
+        conv = Conversation(platform_id=1, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=10,
+            platform_timestamp=datetime.now(UTC),
+            text="file",
+        )
+        session.add(msg)
+        session.flush()
+
+        import asyncio
+        candidates = asyncio.run(extract_passwords_from_context(
+            session, msg, test_config,
+            attachment_filename="logs_pass_9f3x2k.zip",
+        ))
+
+        values = {c.value for c in candidates}
+        assert "9f3x2k" in values
+        file_c = next(c for c in candidates if c.extraction_method == "filename")
+        assert file_c.scope == PasswordScope.MESSAGE
+
+    def test_nearby_message_passwords_lower_confidence(self, session, test_config):
+        """Passwords from nearby messages get NEARBY scope and lower confidence."""
+        from telecrime.models import Conversation, Message
+        from telecrime.passwords.extractor import extract_passwords_from_context
+
+        conv = Conversation(platform_id=1, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        main_msg = Message(
+            conversation_id=conv.id,
+            platform_id=10,
+            platform_timestamp=datetime.now(UTC),
+            text="here is the archive",
+        )
+        session.add(main_msg)
+        nearby = Message(
+            conversation_id=conv.id,
+            platform_id=9,
+            platform_timestamp=datetime.now(UTC),
+            text="password: nearbypass99",
+        )
+        session.add(nearby)
+        session.flush()
+
+        import asyncio
+        candidates = asyncio.run(extract_passwords_from_context(
+            session, main_msg, test_config
+        ))
+
+        nearby_c = [c for c in candidates if c.extraction_method == "nearby"]
+        assert any(c.value == "nearbypass99" for c in nearby_c)
+        for c in nearby_c:
+            assert c.scope == PasswordScope.NEARBY
+            assert c.confidence < 0.9
+
+    def test_duplicates_across_sources_are_deduped(self, session, test_config):
+        """The same password from multiple sources appears only once."""
+        from telecrime.models import Conversation, Message
+        from telecrime.passwords.extractor import extract_passwords_from_context
+
+        conv = Conversation(
+            platform_id=1, username="dupcloud", conversation_type="channel"
+        )
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=10,
+            platform_timestamp=datetime.now(UTC),
+            text="password: dupcloud",
+        )
+        session.add(msg)
+        session.flush()
+
+        import asyncio
+        candidates = asyncio.run(extract_passwords_from_context(
+            session, msg, test_config
+        ))
+
+        values = [c.value for c in candidates]
+        assert values.count("dupcloud") == 1
