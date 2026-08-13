@@ -526,10 +526,15 @@ def _credential_ids_via_fts(
     offset: int = 0,
 ) -> list[int]:
     if session.get_bind().dialect.name == "postgresql":
+        # Over-fetch candidates: filters (stealer:/app:/etc.) are applied AFTER
+        # the candidate fetch, so a pool trimmed to `limit` may contain zero
+        # rows that pass the filter. Fetch 5× the target so filtered searches
+        # still return `limit` matches (mirrors the search route's page_size*5).
+        fetch_limit = max(limit * 5, 50)
         candidate_ids = _pg_bounded_candidate_ids(
             session,
             terms=terms,
-            limit=limit,
+            limit=fetch_limit,
             offset=offset,
             timeout_ms=2500,
         )

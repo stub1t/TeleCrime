@@ -1,5 +1,4 @@
-"""Tests for state machine definitions."""
-
+"""Tests for state definitions."""
 
 from telecrime.states import (
     DownloadStatus,
@@ -9,65 +8,44 @@ from telecrime.states import (
 )
 
 
-class TestDownloadStatus:
-    """Tests for DownloadStatus enum."""
-
-    def test_all_statuses_exist(self):
-        """Test all expected download statuses exist."""
-        assert DownloadStatus.PENDING
-        assert DownloadStatus.DOWNLOADING
-        assert DownloadStatus.COMPLETED
-        assert DownloadStatus.FAILED
-        assert DownloadStatus.FAILED_TERMINAL
-
-    def test_string_values(self):
-        """Test status string values."""
-        assert DownloadStatus.PENDING.value == "pending"
-        assert DownloadStatus.COMPLETED.value == "completed"
+def test_download_status_string_values():
+    """Download statuses serialize to stable DB strings."""
+    assert DownloadStatus.PENDING.value == "pending"
+    assert DownloadStatus.DOWNLOADING.value == "downloading"
+    assert DownloadStatus.COMPLETED.value == "completed"
+    assert DownloadStatus.FAILED.value == "failed"
+    assert DownloadStatus.FAILED_TERMINAL.value == "failed_terminal"
 
 
-class TestGroupStatus:
-    """Tests for GroupStatus enum."""
-
-    def test_all_statuses_exist(self):
-        """Test all expected group statuses exist."""
-        assert GroupStatus.INCOMPLETE
-        assert GroupStatus.READY
-        assert GroupStatus.EXTRACTING
-        assert GroupStatus.EXTRACTED
-        assert GroupStatus.CLEANED
-        assert GroupStatus.FAILED
-        assert GroupStatus.FAILED_TERMINAL
+def test_group_status_string_values():
+    """Group statuses serialize to stable DB strings."""
+    assert GroupStatus.INCOMPLETE.value == "incomplete"
+    assert GroupStatus.READY.value == "ready"
+    assert GroupStatus.EXTRACTING.value == "extracting"
+    assert GroupStatus.EXTRACTED.value == "extracted"
+    assert GroupStatus.CLEANED.value == "cleaned"
+    assert GroupStatus.FAILED.value == "failed"
+    assert GroupStatus.FAILED_TERMINAL.value == "failed_terminal"
 
 
-class TestExtractionStatus:
-    """Tests for ExtractionStatus enum."""
-
-    def test_all_statuses_exist(self):
-        """Test all expected extraction statuses exist."""
-        assert ExtractionStatus.PENDING
-        assert ExtractionStatus.IN_PROGRESS
-        assert ExtractionStatus.PASSWORD_NEEDED
-        assert ExtractionStatus.COMPLETED
-        assert ExtractionStatus.FAILED
-        assert ExtractionStatus.FAILED_TERMINAL
+def test_extraction_status_string_values():
+    """Extraction statuses serialize to stable DB strings."""
+    assert ExtractionStatus.PENDING.value == "pending"
+    assert ExtractionStatus.IN_PROGRESS.value == "in_progress"
+    assert ExtractionStatus.PASSWORD_NEEDED.value == "password_needed"
+    assert ExtractionStatus.COMPLETED.value == "completed"
+    assert ExtractionStatus.FAILED.value == "failed"
+    assert ExtractionStatus.FAILED_TERMINAL.value == "failed_terminal"
 
 
-class TestPasswordScope:
-    """Tests for PasswordScope enum."""
-
-    def test_all_scopes_exist(self):
-        """Test all expected password scopes exist."""
-        assert PasswordScope.MESSAGE
-        assert PasswordScope.NEARBY
-        assert PasswordScope.CONVERSATION
-        assert PasswordScope.LEARNED
-        assert PasswordScope.GLOBAL
-
-    def test_scope_order_matches_priority(self):
-        """Test scopes are ordered by expected priority."""
-        # MESSAGE should be highest priority (from same message)
-        # GLOBAL should be lowest priority
-        scopes = list(PasswordScope)
-        assert scopes[0] == PasswordScope.MESSAGE
-        assert scopes[-1] == PasswordScope.GLOBAL
+def test_password_scope_order_matches_priority():
+    """Scopes are ordered by expected priority (MESSAGE highest, GLOBAL lowest)."""
+    scopes = list(PasswordScope)
+    assert scopes[0] == PasswordScope.MESSAGE
+    assert scopes[-1] == PasswordScope.GLOBAL
+    # MESSAGE -> NEARBY -> CONVERSATION -> LEARNED -> GLOBAL
+    assert PasswordScope.MESSAGE.value == "message"
+    assert PasswordScope.NEARBY.value == "nearby"
+    assert PasswordScope.CONVERSATION.value == "conversation"
+    assert PasswordScope.LEARNED.value == "learned"
+    assert PasswordScope.GLOBAL.value == "global"

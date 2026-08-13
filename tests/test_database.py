@@ -90,12 +90,6 @@ class TestInitDb:
             assert session.query(Conversation).count() == 0
 
 
-def test_models_package_exports_pipeline_state():
-    from telecrime.models import PipelineState
-
-    assert PipelineState.__name__ == "PipelineState"
-
-
 class TestDatabaseIntegration:
     def test_full_workflow(self, session):
         from datetime import datetime

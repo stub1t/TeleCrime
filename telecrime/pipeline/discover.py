@@ -214,7 +214,13 @@ class DiscoverStage(PipelineStage):
             for ext, archive_type in ARCHIVE_EXTENSIONS.items():
                 if filename_lower.endswith(ext):
                     return True, archive_type, None
-            # Generic archive based on MIME
+            # Generic archive based on MIME. application/octet-stream is the
+            # catch-all MIME type — only trust it for reasonably sized files
+            # (1MB-500MB); small octet-stream files are usually not archives.
+            if mime_type == "application/octet-stream":
+                if attachment.size and 1 * 1024 * 1024 < attachment.size < 500 * 1024 * 1024:
+                    return True, "unknown", None
+                return False, None, None
             return True, "unknown", None
 
         # Size heuristic: large files without extension might be archives

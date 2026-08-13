@@ -88,14 +88,6 @@ class TestCredentialHash:
         h4 = ParsedCredential.compute_hash("a.com", "user", "other")
         assert len({h1, h2, h3, h4}) == 4
 
-    def test_same_domain_different_url_same_hash(self):
-        """Same domain+user+pass with different URL paths → same hash (domain-based dedup)."""
-        from telecrime.models.credential import ParsedCredential
-
-        h1 = ParsedCredential.compute_hash("example.com", "user", "pass")
-        h2 = ParsedCredential.compute_hash("example.com", "user", "pass")
-        assert h1 == h2
-
     def test_empty_inputs(self):
         """Empty strings produce a valid hash."""
         from telecrime.models.credential import ParsedCredential

@@ -1,22 +1,8 @@
-# Telecrime - Stealer Log Pipeline
+# Telecrime — Stealer Log Pipeline
 
 A pipeline for processing stealer logs from Telegram channels. It ingests conversations, discovers archive files, downloads them with crash-safe resume, extracts credential files with password inference, parses credentials into searchable structured records, and stores everything in PostgreSQL.
 
-> **⚠️ Important**: This tool processes credential data of potentially criminal origin. Before using it, ensure you have legal authority and a legitimate purpose (incident response, law enforcement, security research). The authors are not responsible for misuse. Credential data and channel lists derived from it must never be published.
-
-## Security Notice
-
-Never commit runtime data or secrets. Keep these local only:
-
-- `.env` and local config files
-- Telegram `*.session` files
-- `data/`, downloaded archives, and extracted files
-- database files, dumps, WAL files, and credential exports
-
-The `channels.txt` / `channels.md` export lists (Telegram links to stealer-log
-channels) are deliberately public: they are committed to the repository and
-pushed by the host cron. Only channels that are both active and accessible are
-included — deleted, banned, or private channels are filtered out.
+> **⚠️ Important**: This tool processes credential data of potentially criminal origin. Before using it, ensure you have legal authority and a legitimate purpose (incident response, law enforcement, security research). The authors are not responsible for misuse. **Never publish credential data.** The `channels.txt` / `channels.md` lists (Telegram links only, no credentials) are the sole exception — they are deliberately public and refreshed by the host cron.
 
 ## Features
 
@@ -29,15 +15,15 @@ included — deleted, banned, or private channels are filtered out.
 - **Duplicate Detection**: Two-stage deduplication via a compact hash-prefix index + exact unique index
 - **Full Idempotency**: Database-backed state ensures no duplicate work
 - **Parallel Parsing**: Large credential files are parsed across worker processes (configurable via `TELECRIME_PARSE_WORKERS`)
+- **Active Channel Lists**: Exported lists contain only active, accessible channels — deleted/private ones are filtered out automatically
 
 ## Installation
 
 ### Docker Compose (recommended for production)
 
 ```bash
-# Replace YOUR_ORG with the actual GitHub owner once the repo is live
-git clone https://github.com/YOUR_ORG/telecrime.git
-cd telecrime
+git clone https://github.com/stub1t/TeleCrime.git
+cd TeleCrime
 
 # Configure secrets
 cp .env.example .env   # fill in Telegram API credentials + Postgres password
@@ -53,6 +39,9 @@ The stack consists of three containers:
 | `db` | PostgreSQL 16 (data lives in the `postgres_data` docker volume) |
 | `web` | FastAPI dashboard with full-text search on port 8000 |
 | `worker` | Scheduler + pipeline (supervised subprocess, watchdog-restarted) |
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for moving the stack (including the encrypted
+database SSD) to new hardware.
 
 ### Local development
 
@@ -83,6 +72,8 @@ Get your Telegram API credentials at https://my.telegram.org/apps
 | `TELECRIME_PARSE_WORKERS` | min(4, cpus-1) | Parallel parse worker processes |
 | `TELECRIME_READY_GROUP_CONCURRENCY` | 3 | Parallel extraction/parse groups |
 | `TELECRIME_PIPELINE_STALE_SECONDS` | 3600 | Watchdog stale threshold |
+| `TELECRIME_CHANNEL_CHECK_BATCH` | 20 | Channels verified per `channel_join` run |
+| `TELECRIME_REPO_URL` | — | Public repo URL used in the channel-list footer |
 
 ## Usage
 
@@ -107,6 +98,9 @@ telecrime retry
 
 # Clean up downloads
 telecrime clean --downloads --force
+
+# Regenerate + push the public channel lists (see scripts/update-channels.sh)
+telecrime channels-export --output-dir . --commit --push
 ```
 
 ## Pipeline Stages
@@ -145,7 +139,17 @@ uv run mypy telecrime/
 
 # Linting
 uv run ruff check telecrime/
+
+# Secret scan (full history)
+gitleaks detect --source . --log-opts="--all" --config .gitleaks.toml
 ```
+
+## Acknowledgements
+
+This project was written almost entirely with the help of AI assistants
+(LLMs such as Claude and OpenAI models), used for implementation,
+refactoring, testing, and debugging. Human review and operations guidance
+were provided throughout.
 
 ## License
 

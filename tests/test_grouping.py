@@ -77,24 +77,26 @@ class TestExtractBaseAndPart:
 
     def test_volume_format(self):
         """Test volume1.zip, vol2.rar formats."""
-        # Volume format detection depends on specific pattern matching
-        # These may not be detected by all implementations
         base, part, total = extract_base_and_part("archive_vol1.zip")
-        # Just verify function runs without error
+        assert base == "archive"
+        assert part == 1
 
         base, part, total = extract_base_and_part("data-volume-2.rar")
-        # Just verify function runs without error
+        assert base == "data-volume-2"
+        assert part is None
 
     def test_xofy_format(self):
         """Test 1of3.zip format."""
-        # XofY format detection depends on specific pattern matching
         base, part, total = extract_base_and_part("archive_1of3.zip")
-        # Just verify function runs without error
-        # Total parts detection is optional
+        assert base == "archive"
+        assert part == 1
+        assert total == 3
 
+        # Regression: the generic .rar pattern must not shadow the XofY match
         base, part, total = extract_base_and_part("data-2of5.rar")
-        # Just verify function runs without error
-
+        assert base == "data"
+        assert part == 2
+        assert total == 5
     def test_no_match(self):
         """Test non-split archive filenames."""
         base, part, total = extract_base_and_part("archive.zip")
@@ -248,11 +250,18 @@ class TestExtractCaptionHints:
         assert hints.password_hint == "secret123"
 
     def test_password_quoted(self):
-        """Test extracting quoted password."""
-        msg = self._make_message(caption="pass: \"my password\"")
+        """Test extracting quoted password with spaces."""
+        msg = self._make_message(caption='pass: "my password"')
         hints = extract_caption_hints(msg)
 
-        assert hints.password_hint == "my"  # Stops at space in current impl
+        assert hints.password_hint == "my password"
+
+    def test_password_unquoted(self):
+        """Test extracting unquoted password stops at whitespace."""
+        msg = self._make_message(caption="password: secret123 extra")
+        hints = extract_caption_hints(msg)
+
+        assert hints.password_hint == "secret123"
 
     def test_no_hints(self):
         """Test message with no hints."""

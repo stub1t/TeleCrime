@@ -1,19 +1,19 @@
 """Tests for CLI module."""
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 from typer.testing import CliRunner
 
 from telecrime import __version__
 from telecrime.cli import app
 from telecrime.database import get_engine, get_session, init_db
-from telecrime.fts import ensure_fts
 from telecrime.models import ArchiveGroup, ExtractionJob, ParsedCredential, PipelineRun
 from telecrime.states import ExtractionStatus, GroupStatus
 
+PG_URL = os.environ.get("TELECRIME_TEST_DATABASE_URL", "")
 runner = CliRunner()
 
 
@@ -356,17 +356,21 @@ class TestCliClean:
 
     def test_clean_asks_confirmation(self, tmp_path):
         """Test clean command asks for confirmation without --force."""
+        downloads_dir = tmp_path / "downloads"
+        downloads_dir.mkdir()
+        (downloads_dir / "test.zip").touch()
+
         with patch("telecrime.cli.get_config_and_engine") as mock_get:
             mock_config = MagicMock()
-            mock_config.downloads_dir = tmp_path / "downloads"
+            mock_config.downloads_dir = downloads_dir
             mock_engine = MagicMock()
             mock_get.return_value = (mock_config, mock_engine)
 
             # Say no to confirmation
             result = runner.invoke(app, ["clean", "--downloads"], input="n\n")
 
-        # Should exit without cleaning
-        assert result.exit_code == 0 or result.exit_code == 1
+        # Declining must abort without deleting the downloads
+        assert result.exit_code != 0 or (downloads_dir / "test.zip").exists()
 
 
 class TestCliRun:
@@ -495,11 +499,8 @@ class TestCliFts:
 class TestCliSearch:
     """Tests for search command."""
 
-    @pytest.mark.skip(reason="exercises removed SQLite FTS5 path; production is PG-only")
-    def test_search_uses_fts_filters(self, tmp_path):
-        db_path = tmp_path / "search.db"
-        engine = get_engine(f"sqlite:///{db_path}")
-        init_db(engine)
+    def test_search_uses_fts_filters(self, pg_engine):
+        engine = pg_engine
 
         with get_session(engine) as session:
             session.add_all(
@@ -531,11 +532,9 @@ class TestCliSearch:
                 ]
             )
 
-        assert ensure_fts(engine, rebuild=True) is True
-
         with patch("telecrime.cli.get_config_and_engine") as mock_get:
             mock_config = MagicMock()
-            mock_config.database_url = f"sqlite:///{db_path}"
+            mock_config.database_url = PG_URL
             mock_get.return_value = (mock_config, engine)
 
             result = runner.invoke(app, ["search", "google", "--domain", "--stealer", "redline"])

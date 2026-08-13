@@ -1,8 +1,6 @@
 """Tests for FTS helpers."""
 
-import pytest
 
-from telecrime.database import get_engine, get_session, init_db
 from telecrime.fts import ensure_fts, fts_available, fts_count, fts_search
 from telecrime.models import ParsedCredential
 
@@ -23,45 +21,40 @@ def _add_credential(
     return cred
 
 
-@pytest.mark.skip(reason="exercises removed SQLite FTS5 path; production is PG-only")
-def test_fts_search_applies_structured_filters(tmp_path):
+def test_fts_search_applies_structured_filters(pg_session):
     """FTS filtering happens in SQL before limiting results."""
-    engine = get_engine(f"sqlite:///{tmp_path / 'fts.db'}")
-    init_db(engine)
+    expected = _add_credential(
+        pg_session,
+        domain="accounts.google.com",
+        username="alice",
+        password="secret",
+        stealer="redline",
+    )
+    _add_credential(
+        pg_session,
+        domain="accounts.google.com",
+        username="bob",
+        password="secret",
+        stealer="vidar",
+    )
+    pg_session.commit()
 
-    with get_session(engine) as session:
-        expected = _add_credential(
-            session,
-            domain="accounts.google.com",
-            username="alice",
-            password="secret",
-            stealer="redline",
-        )
-        _add_credential(
-            session,
-            domain="accounts.google.com",
-            username="bob",
-            password="secret",
-            stealer="vidar",
-        )
+    assert ensure_fts(pg_session.bind) is True
+    assert fts_available(pg_session.bind) is True
 
-    assert ensure_fts(engine, rebuild=True) is True
-    assert fts_available(engine) is True
-
-    with get_session(engine) as session:
-        ids = fts_search(
-            session,
-            "google",
-            columns=["domain"],
-            limit=5,
-            filters={"stealer": "redline"},
-        )
-        total = fts_count(
-            session,
-            "google",
-            columns=["domain"],
-            filters={"stealer": "redline"},
-        )
+    ids = fts_search(
+        pg_session,
+        "google",
+        columns=["domain"],
+        limit=5,
+        filters={"stealer": "redline"},
+    )
+    total = fts_count(
+        pg_session,
+        "google",
+        columns=["domain"],
+        filters={"stealer": "redline"},
+    )
 
     assert ids == [expected.id]
     assert total == 1

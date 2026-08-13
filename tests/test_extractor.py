@@ -292,8 +292,8 @@ Folder = +
         assert "/tmp/test.7z" not in files
         assert "file1.txt" in files
         assert "subdir/file2.epub" in files
-        # Directories (ending with "/") or entries with Folder=+ are excluded
-        assert "subdir" not in files or True  # subdir has no trailing "/" here
+        # Folder entries (Folder = +) must be excluded
+        assert "subdir" not in files
 
     @pytest.mark.asyncio
     async def test_list_contents_excludes_archive_path(self):

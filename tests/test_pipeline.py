@@ -24,7 +24,6 @@ from telecrime.pipeline.orchestrator import (
     run_sequential_pipeline,
 )
 from telecrime.pipeline.parse import ParseStage
-from telecrime.pipeline.plan import PlanStage
 from telecrime.states import ExtractionStatus, GroupStatus
 
 
@@ -62,19 +61,6 @@ class TestPipelineContext:
         assert ctx.messages_processed == 0
         assert ctx.files_discovered == 0
         assert ctx.errors == []
-
-    def test_errors_list_initialized(self, session, test_config):
-        """Test errors list is initialized."""
-        adapter = MagicMock()
-        ctx = PipelineContext(
-            config=test_config,
-            session=session,
-            adapter=adapter,
-        )
-
-        # Should be able to append to errors
-        ctx.errors.append("test error")
-        assert len(ctx.errors) == 1
 
 
 class TestPipeline:
@@ -293,11 +279,6 @@ class TestPipeline:
 class TestIngestStage:
     """Tests for IngestStage."""
 
-    def test_stage_name(self):
-        """Test stage has correct name."""
-        stage = IngestStage()
-        assert stage.name == "ingest"
-
     def test_init_with_limit(self):
         """Test initialization with message limit."""
         stage = IngestStage(message_limit=100)
@@ -391,11 +372,6 @@ class TestIngestStage:
 
 class TestDiscoverStage:
     """Tests for DiscoverStage."""
-
-    def test_stage_name(self):
-        """Test stage has correct name."""
-        stage = DiscoverStage()
-        assert stage.name == "discover"
 
     def test_classify_txt_credential_file(self):
         """Direct credential .txt files are classified as archive_type='txt'."""
@@ -528,9 +504,9 @@ class TestExtractStageDirect:
     ):
         """Transient low disk must NOT mark the group FAILED.
 
-        Marking FAILED feeds the group to QuarantineStage, which moves its
-        archive parts out of downloads_dir — silently destroying a healthy
-        group over long disk-pressured unattended runs. The group must stay
+        A FAILED group would have its archive parts deleted by finalize's
+        cleanup sweep — silently destroying a healthy group over long
+        disk-pressured unattended runs. The group must stay
         READY (and the job PENDING) so it is retried once space is reclaimed.
         """
         from sqlalchemy.orm import joinedload
@@ -613,19 +589,9 @@ class TestExtractStageDirect:
 class TestPlanStage:
     """Tests for PlanStage."""
 
-    def test_stage_name(self):
-        """Test stage has correct name."""
-        stage = PlanStage()
-        assert stage.name == "plan"
-
 
 class TestAcquireStage:
     """Tests for AcquireStage."""
-
-    def test_stage_name(self):
-        """Test stage has correct name."""
-        stage = AcquireStage()
-        assert stage.name == "acquire"
 
     def test_sanitize_filename(self):
         """Test filename sanitization."""

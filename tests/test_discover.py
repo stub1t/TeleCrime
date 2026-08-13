@@ -161,14 +161,20 @@ class TestDiscoverStage:
 
         is_archive, archive_type, part_info = stage._classify_attachment(attachment)
 
-        # Small files without archive extension may or may not match
-        # based on the implementation's heuristics
-        # The key is that octet-stream alone isn't sufficient for small files
-        if is_archive:
-            # If it's detected, archive_type should be set
-            assert archive_type is not None
+        # A small file without an archive extension must NOT be classified as
+        # an archive — octet-stream alone is not sufficient.
+        assert is_archive is False
+        assert archive_type is None
+        assert part_info is None
 
-    def test_stage_name(self):
-        """Test stage has correct name."""
+    def test_classify_huge_octet_stream(self):
+        """Test files over 500MB are not auto-classified as archives."""
         stage = DiscoverStage()
-        assert stage.name == "discover"
+        attachment = self._make_attachment(
+            "video_dump",
+            mime_type="application/octet-stream",
+            size=2 * 1024 * 1024 * 1024  # 2GB
+        )
+
+        is_archive, _, _ = stage._classify_attachment(attachment)
+        assert is_archive is False

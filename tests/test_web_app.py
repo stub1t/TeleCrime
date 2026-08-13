@@ -2,10 +2,9 @@
 
 import asyncio
 import json
+import os
 from datetime import UTC, datetime
 from typing import Any, cast
-
-import pytest
 
 from telecrime.database import get_engine, get_session, init_db
 from telecrime.models import (
@@ -31,68 +30,66 @@ from telecrime.web.app import (
     create_app,
 )
 
+PG_URL = os.environ.get("TELECRIME_TEST_DATABASE_URL", "")
 
-@pytest.mark.skip(reason="exercises removed SQLite FTS5 path; production is PG-only")
-def test_credential_fts_search_applies_filters_before_limit(tmp_path):
+
+def test_credential_fts_search_applies_filters_before_limit(pg_session):
     """FTS credential search applies structured filters in SQL before limiting."""
-    engine = get_engine(f"sqlite:///{tmp_path / 'web-search.db'}")
-    init_db(engine)
-    assert _ensure_search_infra(engine) is True
+    from telecrime.fts import ensure_fts
 
-    with get_session(engine) as session:
-        session.add_all(
-            [
-                ParsedCredential(
-                    url="https://accounts.google.com/login",
-                    domain="accounts.google.com",
-                    username="alice",
-                    password="secret",
-                    stealer_type="redline",
-                    credential_hash=ParsedCredential.compute_hash(
-                        "accounts.google.com", "alice", "secret"
-                    ),
+    ensure_fts(pg_session.bind)
+    pg_session.add_all(
+        [
+            ParsedCredential(
+                url="https://accounts.google.com/login",
+                domain="accounts.google.com",
+                username="alice",
+                password="secret",
+                stealer_type="redline",
+                credential_hash=ParsedCredential.compute_hash(
+                    "accounts.google.com", "alice", "secret"
                 ),
-                ParsedCredential(
-                    url="https://accounts.google.com/login",
-                    domain="accounts.google.com",
-                    username="bob",
-                    password="secret",
-                    stealer_type="vidar",
-                    credential_hash=ParsedCredential.compute_hash(
-                        "accounts.google.com", "bob", "secret"
-                    ),
+            ),
+            ParsedCredential(
+                url="https://accounts.google.com/login",
+                domain="accounts.google.com",
+                username="bob",
+                password="secret",
+                stealer_type="vidar",
+                credential_hash=ParsedCredential.compute_hash(
+                    "accounts.google.com", "bob", "secret"
                 ),
-            ]
-        )
+            ),
+        ]
+    )
+    pg_session.commit()
 
-    with get_session(engine) as session:
-        ids = _credential_ids_via_fts(
-            session,
-            terms="google",
-            filters={"stealer": ["redline"]},
-            exclude_conversation_ids=set(),
-            limit=1,
-        )
-        results = _search_for_export(
-            session,
-            "google",
-            {"stealer": ["redline"]},
-            False,
-            True,
-            set(),
-            set(),
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-        )
+    ids = _credential_ids_via_fts(
+        pg_session,
+        terms="google",
+        filters={"stealer": ["redline"]},
+        exclude_conversation_ids=set(),
+        limit=1,
+    )
+    results = _search_for_export(
+        pg_session,
+        "google",
+        {"stealer": ["redline"]},
+        False,
+        True,
+        set(),
+        set(),
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+    )
 
     assert len(ids) == 1
-    assert len(results.credentials) == 1
-    assert results.credentials[0].username == "alice"
+    assert results.credentials and results.credentials[0].username == "alice"
 
 
 def test_heavy_web_work_pauses_while_pipeline_running(monkeypatch):
@@ -125,15 +122,12 @@ def test_preferred_table_estimate_keeps_larger_fast_count():
     assert _preferred_table_estimate(-1, None) == 0
 
 
-@pytest.mark.skip(reason="watchlist incremental was SQLite-based; PG path needs new fixture")
-def test_watchlist_incremental_check_counts_only_new_rows(tmp_path):
+def test_watchlist_incremental_check_counts_only_new_rows(pg_engine):
     """Watchlist can keep updating cheaply while ingestion is active."""
-    db_path = tmp_path / "watchlist-incremental.db"
-    engine = get_engine(f"sqlite:///{db_path}")
-    init_db(engine)
+    from telecrime.database import get_session as _gs
 
     checked_at = datetime(2026, 4, 26, 7, 0, tzinfo=UTC)
-    with get_session(engine) as session:
+    with _gs(pg_engine) as session:
         session.add(
             WatchlistItem(
                 label="sec-consult",
@@ -178,9 +172,9 @@ def test_watchlist_incremental_check_counts_only_new_rows(tmp_path):
             ]
         )
 
-    _check_watchlist(engine, incremental_only=True)
+    _check_watchlist(pg_engine, incremental_only=True)
 
-    with get_session(engine) as session:
+    with _gs(pg_engine) as session:
         item = session.query(WatchlistItem).one()
         assert item.new_count == 3
         assert item.last_known_count == 2
@@ -188,14 +182,11 @@ def test_watchlist_incremental_check_counts_only_new_rows(tmp_path):
         assert item.last_checked_at.replace(tzinfo=UTC) > checked_at
 
 
-@pytest.mark.skip(reason="exercises removed SQLite FTS5 path; production is PG-only")
-def test_message_fts_search_preserves_order_and_exclusions(tmp_path):
+def test_message_fts_search_preserves_order_and_exclusions(pg_engine):
     """Message FTS helper returns ordered IDs and respects exclusions."""
-    engine = get_engine(f"sqlite:///{tmp_path / 'web-messages.db'}")
-    init_db(engine)
-    assert _ensure_search_infra(engine) is True
+    from telecrime.database import get_session as _gs
 
-    with get_session(engine) as session:
+    with _gs(pg_engine) as session:
         session.add_all(
             [
                 Conversation(platform_id=1, conversation_type="channel"),
@@ -224,7 +215,7 @@ def test_message_fts_search_preserves_order_and_exclusions(tmp_path):
             ],
         )
 
-    with get_session(engine) as session:
+    with _gs(pg_engine) as session:
         ids = _message_ids_via_fts(
             session,
             terms="google",
@@ -293,15 +284,11 @@ def test_triage_payload_includes_recent_failures(tmp_path):
     assert payload["failed_extractions"][0].group.base_name == "sample.zip"
 
 
-@pytest.mark.skip(reason="exercises removed SQLite FTS5 path; production is PG-only")
-def test_search_count_endpoint_returns_total_matches(tmp_path):
+def test_search_count_endpoint_returns_total_matches(pg_engine):
     """Dashboard search count endpoint returns the soft-deduped credential match count."""
-    db_path = tmp_path / "search-count.db"
-    engine = get_engine(f"sqlite:///{db_path}")
-    init_db(engine)
-    assert _ensure_search_infra(engine) is True
+    from telecrime.database import get_session as _gs
 
-    with get_session(engine) as session:
+    with _gs(pg_engine) as session:
         session.add_all(
             [
                 ParsedCredential(
@@ -331,7 +318,7 @@ def test_search_count_endpoint_returns_total_matches(tmp_path):
             ]
         )
 
-    app = create_app(f"sqlite:///{db_path}")
+    app = create_app(PG_URL)
     route = cast(Any, next(r for r in app.routes if getattr(r, "path", None) == "/search/count"))
     response = route.endpoint(q="google", regex=False)
 

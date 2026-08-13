@@ -134,7 +134,7 @@ class TestApplyEnvVars:
     """Tests for _apply_env_vars function."""
 
     def test_database_url_from_env(self):
-        """Test SAD_DATABASE_URL environment variable."""
+        """Test TELECRIME_DATABASE_URL environment variable."""
         config = Config()
 
         with patch.dict(os.environ, {"TELECRIME_DATABASE_URL": "sqlite:///custom.db"}):
@@ -143,7 +143,7 @@ class TestApplyEnvVars:
         assert config.database_url == "sqlite:///custom.db"
 
     def test_data_dir_from_env(self):
-        """Test SAD_DATA_DIR environment variable."""
+        """Test TELECRIME_DATA_DIR environment variable."""
         config = Config()
 
         with patch.dict(os.environ, {"TELECRIME_DATA_DIR": "/custom/data"}):
@@ -152,7 +152,7 @@ class TestApplyEnvVars:
         assert config.data_dir == Path("/custom/data")
 
     def test_telegram_api_id_from_env(self):
-        """Test SAD_TELEGRAM_API_ID environment variable."""
+        """Test TELECRIME_TELEGRAM_API_ID environment variable."""
         config = Config()
 
         with patch.dict(os.environ, {"TELECRIME_TELEGRAM_API_ID": "12345"}):
@@ -161,7 +161,7 @@ class TestApplyEnvVars:
         assert config.telegram.api_id == 12345
 
     def test_telegram_api_hash_from_env(self):
-        """Test SAD_TELEGRAM_API_HASH environment variable."""
+        """Test TELECRIME_TELEGRAM_API_HASH environment variable."""
         config = Config()
 
         with patch.dict(os.environ, {"TELECRIME_TELEGRAM_API_HASH": "TEST_API_HASH_0123456789abcdef"}):
@@ -170,7 +170,7 @@ class TestApplyEnvVars:
         assert config.telegram.api_hash == "TEST_API_HASH_0123456789abcdef"
 
     def test_target_extensions_from_env(self):
-        """Test SAD_TARGET_EXTENSIONS environment variable."""
+        """Test TELECRIME_TARGET_EXTENSIONS environment variable."""
         config = Config()
 
         with patch.dict(os.environ, {"TELECRIME_TARGET_EXTENSIONS": ".mobi, .azw3, .fb2"}):

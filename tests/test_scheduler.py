@@ -161,33 +161,14 @@ def test_worker_run_now_returns_false_for_unknown_job(status_file):
         worker.stop()
 
 
-@pytest.mark.skip(reason="VACUUM behavior is PG-only now; needs PG fixture")
-def test_vacuum_job_executes_vacuum(status_file):
-    """_run_vacuum_job calls VACUUM on the engine connection."""
-    from unittest.mock import MagicMock, patch
-
+def test_vacuum_job_executes_vacuum(pg_engine):
+    """_run_vacuum_job runs the cleanup DELETE and VACUUM ANALYZE on PG."""
     from telecrime.scheduler import _run_vacuum_job
 
-    engine = MagicMock()
-    engine.dialect.name = "sqlite"
-    conn = MagicMock()
-    engine.connect.return_value.__enter__ = MagicMock(return_value=conn)
-    engine.connect.return_value.__exit__ = MagicMock(return_value=False)
-
-    mock_result = MagicMock()
-    mock_result.rowcount = 0
-
-    mock_session = MagicMock()
-    mock_session.__enter__ = MagicMock(return_value=mock_session)
-    mock_session.__exit__ = MagicMock(return_value=False)
-    mock_session.execute.return_value = mock_result
-
-    with patch("telecrime.database.get_session", return_value=mock_session):
-        result = _run_vacuum_job(engine)
+    result = _run_vacuum_job(pg_engine)
 
     assert "VACUUM" in result
-    # SQLite path: PRAGMA optimize + VACUUM (2 calls)
-    assert conn.execute.call_count == 2
+    assert "completed" in result.lower() or "done" in result.lower()
 
 
 def test_reparse_stealers_in_job_defs():

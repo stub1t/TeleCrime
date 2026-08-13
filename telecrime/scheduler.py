@@ -829,19 +829,22 @@ def _run_vacuum_job(engine) -> str:
     import sqlalchemy as _sa
 
     from telecrime.database import get_session
+    from telecrime.states import GroupStatus
 
     # Prune extracted_output rows for already-CLEANED groups.
     # New groups are pruned at finalize time; this catches rows that
     # accumulated before that cleanup was added.
+    # NB: the PostgreSQL enum stores the member NAME ("CLEANED"), not the
+    # lowercase .value — a raw 'cleaned' literal raises InvalidTextRepresentation.
     with get_session(engine) as session:
         result = session.execute(_sa.text("""
             DELETE FROM extracted_outputs
             WHERE job_id IN (
                 SELECT ej.id FROM extraction_jobs ej
                 JOIN archive_groups ag ON ag.id = ej.group_id
-                WHERE ag.status = 'cleaned'
+                WHERE ag.status = :cleaned_status
             )
-        """))
+        """), {"cleaned_status": GroupStatus.CLEANED.name})
         pruned = cast(CursorResult[Any], result).rowcount
         session.commit()
 

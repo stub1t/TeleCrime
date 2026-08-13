@@ -26,6 +26,9 @@ SPLIT_PATTERNS = [
     (re.compile(r"^(.+?)\.part(\d+)\.rar$", re.IGNORECASE), 1, 2),
     # .r00, .r01, .r02 (RAR old style)
     (re.compile(r"^(.+?)\.r(\d{2,})$", re.IGNORECASE), 1, 2),
+    # archive_1of3.zip, archive_2of3.zip — must come BEFORE the generic
+    # .rar/.zip match below, otherwise part numbers are never extracted.
+    (re.compile(r"^(.+?)[-_]?(\d+)of(\d+)\.(zip|rar|7z)$", re.IGNORECASE), 1, 2),
     # archive.rar (main) - matches with .r00 series
     (re.compile(r"^(.+?)\.rar$", re.IGNORECASE), 1, None),
     # .7z.001, .7z.002
@@ -38,8 +41,6 @@ SPLIT_PATTERNS = [
     (re.compile(r"^(.+?)\.(\d{3})$"), 1, 2),
     # volume1.zip, volume2.zip
     (re.compile(r"^(.+?)[-_]?(?:vol|volume)[-_]?(\d+)\.(zip|rar|7z)$", re.IGNORECASE), 1, 2),
-    # archive_1of3.zip, archive_2of3.zip
-    (re.compile(r"^(.+?)[-_]?(\d+)of(\d+)\.(zip|rar|7z)$", re.IGNORECASE), 1, 2),
 ]
 
 

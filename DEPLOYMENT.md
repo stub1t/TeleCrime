@@ -47,8 +47,8 @@ df -h /mnt/telecrime
 ### 3. Get the code
 
 ```bash
-git clone https://github.com/YOUR_ORG/telecrime.git
-cd telecrime
+git clone https://github.com/stub1t/TeleCrime.git
+cd TeleCrime
 ```
 
 ### 4. Configure secrets

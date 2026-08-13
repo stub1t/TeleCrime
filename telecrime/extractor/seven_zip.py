@@ -246,14 +246,19 @@ class SevenZipExtractor(ArchiveExtractor):
             #   ...
             # Then each member is in its own section separated by "----------".
             # We skip any Path entry that equals the archive's own path to avoid
-            # treating it as an unsafe member.
+            # treating it as an unsafe member, and any section marked as a
+            # folder (trailing "/" or "Folder = +").
             files = []
             stdout_text = stdout.decode("utf-8", errors="replace")
             archive_path_str = str(archive_path)
 
-            for match in re.finditer(r"^Path = (.+)$", stdout_text, re.MULTILINE):
-                path = match.group(1).strip()
-                if path and path != archive_path_str and not path.endswith("/"):
+            for block in re.split(r"\n--+\n", stdout_text):
+                block_path = re.search(r"^Path = (.+)$", block, re.MULTILINE)
+                if not block_path:
+                    continue
+                path = block_path.group(1).strip()
+                is_folder = path.endswith("/") or "Folder = +" in block
+                if path and path != archive_path_str and not is_folder:
                     files.append(path)
 
             return files

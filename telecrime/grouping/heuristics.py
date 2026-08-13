@@ -45,14 +45,17 @@ def extract_caption_hints(message: Message) -> CaptionHint:
 
     # Look for password hints
     password_patterns = [
-        r"(?:password|pass|pwd|pw)[:\s]+[\"']?([^\s\"']+)[\"']?",
-        r"[\"']([^\s\"']+)[\"']\s*(?:is\s+)?(?:the\s+)?(?:password|pass)",
+        # Quoted password: capture everything inside the quotes (may contain spaces).
+        r"(?:password|pass|pwd|pw)[:\s]+[\"']([^\"']+)[\"']",
+        # Unquoted password: capture up to the next whitespace.
+        r"(?:password|pass|pwd|pw)[:\s]+([^\s\"']+)",
+        r"[\"']([^\"']+)[\"']\s*(?:is\s+)?(?:the\s+)?(?:password|pass)",
     ]
 
     for pattern in password_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            hint.password_hint = match.group(1)
+            hint.password_hint = match.group(1).strip()
             break
 
     return hint
