@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-intro">
+  <div class="page-intro-copy">
+    <h2>Conversations</h2>
+    <p>All ingested channels, groups, and DMs ranked by credential yield</p>
+  </div>
+</div>
+
+<div class="stats-row">
+  <div class="stat-chip">
+    <span class="stat-label">Conversations</span>
+    <span class="stat-value">{{ stats.total_convs }}</span>
+  </div>
+  <div class="stat-chip">
+    <span class="stat-label">Messages</span>
+    <span class="stat-value">{{ "{:,}".format(stats.total_msgs) }}</span>
+  </div>
+  <div class="stat-chip">
+    <span class="stat-label">Credentials</span>
+    <span class="stat-value">{{ "{:,}".format(stats.total_creds) }}</span>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <h2>All Conversations</h2>
+    <span class="mini-note">Sorted by credential count ↓ · click headers to re-sort</span>
+  </div>
+  <div class="table-wrap">
+    <table data-sortable>
+      <thead>
+        <tr>
+          <th>Title / Username</th>
+          <th>Type</th>
+          <th>Member</th>
+          <th>Messages</th>
+          <th>Credentials</th>
+          <th>Last Ingested</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in conversations %}
+        {% set c = row.conv %}
+        <tr>
+          <td>
+            <a href="/conversation/{{ c.id }}">{{ c.title or c.username or ("Conversation #" ~ c.id) }}</a>
+            {% if c.username and c.title %}
+              <span style="color:var(--muted);font-size:11px"> @{{ c.username }}</span>
+            {% endif %}
+          </td>
+          <td>{{ c.conversation_type }}</td>
+          <td>
+            {% if c.is_member %}<span style="color:var(--accent)">Yes</span>
+            {% else %}<span style="color:var(--muted)">No</span>{% endif %}
+          </td>
+          <td>{{ "{:,}".format(row.msg_count) }}</td>
+          <td>
+            {% if row.cred_count > 0 %}
+              <span style="color:var(--accent);font-weight:600">{{ "{:,}".format(row.cred_count) }}</span>
+            {% else %}
+              <span style="color:var(--muted)">0</span>
+            {% endif %}
+          </td>
+          <td style="white-space:nowrap;font-size:0.85em">
+            {% if c.last_ingested_at %}{{ c.last_ingested_at.strftime('%Y-%m-%d %H:%M') }}
+            {% else %}<span style="color:var(--muted)">—</span>{% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="6" style="text-align:center;color:var(--muted);padding:32px">No conversations found</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if pages > 1 %}
+<div class="pw-pagination">
+  {% if page > 1 %}
+  <a class="pw-page-btn" href="?limit={{ limit }}&page={{ page - 1 }}">← Prev</a>
+  {% endif %}
+  {% for p in range([1, page - 2]|max, [pages + 1, page + 3]|min) %}
+  <a class="pw-page-btn {% if p == page %}active{% endif %}"
+     href="?limit={{ limit }}&page={{ p }}">{{ p }}</a>
+  {% endfor %}
+  {% if page < pages %}
+  <a class="pw-page-btn" href="?limit={{ limit }}&page={{ page + 1 }}">Next →</a>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+
+{% block content %}
+<style>
+  .wl-add-form {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    padding: 18px 20px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--panel);
+    margin-bottom: 20px;
+  }
+  .wl-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .wl-field label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+  }
+  .wl-field input, .wl-field select {
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel-alt);
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .wl-field input:focus, .wl-field select:focus {
+    border-color: var(--accent);
+  }
+  .wl-field.grow { flex: 1; min-width: 160px; }
+  .wl-add-btn {
+    padding: 10px 20px;
+    border-radius: 8px;
+    border: none;
+    background: var(--accent);
+    color: #06161a;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.2s;
+  }
+  .wl-add-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px rgba(79, 209, 197, 0.3);
+  }
+  .wl-new-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    height: 22px;
+    padding: 0 6px;
+    border-radius: 999px;
+    background: var(--danger);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
+    animation: pulse-badge 2s ease-in-out infinite;
+  }
+  .wl-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .wl-btn {
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
+    transition: border-color 0.2s, color 0.2s;
+    text-decoration: none;
+  }
+  .wl-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .wl-btn.danger:hover {
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+  .wl-toggle {
+    width: 38px;
+    height: 20px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--panel-alt);
+    cursor: pointer;
+    position: relative;
+    transition: background 0.2s, border-color 0.2s;
+    flex-shrink: 0;
+  }
+  .wl-toggle.on {
+    background: rgba(79, 209, 197, 0.2);
+    border-color: var(--accent);
+  }
+  .wl-toggle::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--muted);
+    transition: transform 0.2s, background 0.2s;
+  }
+  .wl-toggle.on::after {
+    transform: translateX(18px);
+    background: var(--accent);
+  }
+  .match-type-pill {
+    display: inline-block;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 6px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+</style>
+
+<div class="page-intro">
+  <div class="page-intro-copy">
+    <h2>Watchlist</h2>
+    <p>Monitor queries and get alerts when new credentials match.</p>
+  </div>
+  {% if total_new > 0 %}
+  <span class="mini-note" style="border-color: var(--danger); color: var(--danger)">
+    {{ total_new }} new matches
+  </span>
+  {% endif %}
+</div>
+
+<form class="wl-add-form" id="addForm"
+      x-data="{ query: '', submitting: false }"
+      hx-post="/api/watchlist"
+      hx-target="#wl-section"
+      hx-swap="outerHTML"
+      @submit="submitting = true"
+      @htmx:after-request="submitting = false; query = ''; $el.reset()">
+  <div class="wl-field grow">
+    <label>Query</label>
+    <input type="text" name="query" x-model="query"
+           placeholder="e.g. paypal.com, admin@gmail.com"
+           @keydown.enter.prevent="$el.closest('form').requestSubmit()" />
+  </div>
+  <div class="wl-field grow">
+    <label>Label (optional)</label>
+    <input type="text" name="label" placeholder="Friendly name" />
+  </div>
+  <div class="wl-field">
+    <label>Match type</label>
+    <select name="match_type">
+      <option value="any">Any field</option>
+      <option value="domain">Domain</option>
+      <option value="user">Username</option>
+      <option value="url">URL</option>
+    </select>
+  </div>
+  <button class="wl-add-btn" type="submit" :disabled="!query.trim() || submitting"
+          x-text="submitting ? 'Adding…' : 'Add Watch'"></button>
+</form>
+
+{% include "partials/watchlist_section.html" %}
+{% endblock %}

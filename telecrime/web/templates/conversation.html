@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+
+{% block content %}
+<style>
+  .conv-meta-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .conv-stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 18px;
+    text-align: center;
+  }
+  .conv-stat-value { font-size: 26px; font-weight: 700; color: var(--accent); }
+  .conv-stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-top: 4px; }
+  .msg-row { border-bottom: 1px solid var(--border); padding: 10px 0; }
+  .msg-row:last-child { border-bottom: none; }
+  .msg-ts { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .msg-text { font-size: 13px; margin-top: 4px; white-space: pre-wrap; word-break: break-word; max-height: 80px; overflow: hidden; }
+  .msg-fwd { font-size: 11px; color: var(--muted); font-style: italic; }
+</style>
+
+<div class="page-intro">
+  <div class="page-intro-copy">
+    <h2>{{ conv.title or conv.username or ("Conversation #" ~ conv.id) }}</h2>
+    <p>
+      {% if conv.username %}<a href="https://t.me/{{ conv.username }}" target="_blank" rel="noopener" style="color:var(--accent)">@{{ conv.username }}</a> &nbsp;·&nbsp; {% endif %}
+      {{ conv.conversation_type }}
+      {% if not conv.is_accessible %} &nbsp;·&nbsp; <span style="color:var(--danger)">inaccessible</span>{% endif %}
+      {% if not conv.is_member %} &nbsp;·&nbsp; <span style="color:var(--muted)">not a member</span>{% endif %}
+    </p>
+  </div>
+  <a href="/search?q=&source_conv={{ conv.id }}" style="color:var(--accent);font-size:13px;text-decoration:none">Search credentials →</a>
+</div>
+
+<!-- Stats -->
+<div class="conv-meta-grid">
+  <div class="conv-stat">
+    <div class="conv-stat-value">{{ msg_count }}</div>
+    <div class="conv-stat-label">Messages</div>
+  </div>
+  <div class="conv-stat">
+    <div class="conv-stat-value">{{ attachment_count }}</div>
+    <div class="conv-stat-label">Attachments</div>
+  </div>
+  <div class="conv-stat">
+    <div class="conv-stat-value">{{ cred_count }}</div>
+    <div class="conv-stat-label">Credentials</div>
+  </div>
+</div>
+
+<!-- Metadata -->
+<div class="section">
+  <h2>Details</h2>
+  <div class="table-wrap">
+  <table>
+    <tbody>
+      <tr><th>ID</th><td>{{ conv.id }}</td></tr>
+      <tr><th>Platform ID</th><td class="code">{{ conv.platform_id }}</td></tr>
+      {% if conv.title %}<tr><th>Title</th><td>{{ conv.title }}</td></tr>{% endif %}
+      {% if conv.username %}<tr><th>Username</th><td class="code">@{{ conv.username }}</td></tr>{% endif %}
+      <tr><th>Type</th><td>{{ conv.conversation_type }}</td></tr>
+      <tr><th>Member</th><td>{{ "Yes" if conv.is_member else "No" }}</td></tr>
+      <tr><th>Accessible</th><td>{{ "Yes" if conv.is_accessible else "No" }}</td></tr>
+      {% if conv.last_ingested_at %}
+      <tr><th>Last Ingested</th><td class="muted">{{ conv.last_ingested_at.strftime('%Y-%m-%d %H:%M') }}</td></tr>
+      {% endif %}
+      {% if conv.notes %}<tr><th>Notes</th><td>{{ conv.notes }}</td></tr>{% endif %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<!-- Recent credentials -->
+{% if recent_creds %}
+<div class="section">
+  <div class="section-header">
+    <h2>Recent Credentials</h2>
+    <a href="/search?q=&source_conv={{ conv.id }}" style="color:var(--accent);font-size:13px;text-decoration:none">View all {{ cred_count }} →</a>
+  </div>
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>Domain</th><th>Username</th><th>Stealer</th><th>Archive</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for c in recent_creds %}
+      <tr>
+        <td class="code">{{ c.domain or "-" }}</td>
+        <td class="code">{{ c.username or "-" }}</td>
+        <td>{% if c.stealer_type %}<span class="pill">{{ c.stealer_type }}</span>{% else %}-{% endif %}</td>
+        <td class="code" style="font-size:12px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ c.source_archive or '' }}">{{ c.source_archive or "-" }}</td>
+        <td><a href="/credential/{{ c.id }}" style="color:var(--accent);font-size:12px">detail →</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endif %}
+
+<!-- Recent messages -->
+<div class="section">
+  <div class="section-header">
+    <h2>Messages</h2>
+    <span class="mini-note">{{ msg_count }} total · showing {{ recent_messages | length }}</span>
+  </div>
+  {% if recent_messages %}
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 16px">
+    {% for msg in recent_messages %}
+    <div class="msg-row">
+      <div style="display:flex;gap:12px;align-items:baseline">
+        <span class="msg-ts">{{ msg.platform_timestamp.strftime('%Y-%m-%d %H:%M') if msg.platform_timestamp else '-' }}</span>
+        {% if msg.is_forwarded %}<span class="msg-fwd">↷ forwarded{% if msg.forwarded_from_name %} from {{ msg.forwarded_from_name }}{% endif %}</span>{% endif %}
+      </div>
+      {% set body = msg.text or msg.caption %}
+      {% if body %}
+      <div class="msg-text">{{ body[:300] }}{% if body | length > 300 %}…{% endif %}</div>
+      {% else %}
+      <div class="msg-text" style="color:var(--muted)">(no text)</div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% if msg_count > msg_limit %}
+  <div style="text-align:center;margin-top:12px">
+    <a href="?msg_limit={{ [msg_limit * 2, 500] | min }}" style="color:var(--accent);font-size:13px">Load more messages ↓</a>
+  </div>
+  {% endif %}
+  {% else %}
+  <div class="empty">No messages recorded.</div>
+  {% endif %}
+</div>
+
+{% endblock %}

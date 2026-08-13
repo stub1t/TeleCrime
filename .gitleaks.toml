@@ -1,0 +1,20 @@
+# Gitleaks configuration for the Telecrime repository.
+#
+# Used by the CI secret-scan (see .github/workflows/secrets.yml) and for local
+# scans:  gitleaks detect --source . --log-opts="--all"
+#
+# The only allowed "secrets" in this repository are obvious test fixtures.
+# Everything else triggers a failure.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Explicit test fixtures — fake values used only in unit tests"
+paths = [
+    '''tests/test_config\.py''',
+    '''tests/test_stealer\.py''',
+]
+regexes = [
+    '''TEST_API_HASH_0123456789abcdef''',
+    '''TEST_PASSWORD_123''',
+]

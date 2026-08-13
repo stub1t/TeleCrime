@@ -1,0 +1,145 @@
+{% set status_label = "● RUNNING" if is_running else "○ IDLE" %}
+{% set status_color = "#00ff9f" if is_running else "#4a7c60" %}
+<div id="home-ops-panel"
+     hx-get="/api/home/ops-fragment"
+     hx-trigger="every {% if is_running %}30{% else %}5{% endif %}s"
+     hx-swap="outerHTML"
+     style="border:1px solid var(--border-strong);background:var(--panel);padding:0;font-family:inherit;">
+
+  {# ── Header bar ─────────────────────────────────────────────────────────── #}
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);background:var(--panel-alt);">
+    <span style="color:var(--muted);font-size:11px;letter-spacing:0.12em;text-transform:uppercase;">TELECRIME // OPS</span>
+    <span style="font-size:11px;font-weight:700;color:{{ status_color }};">{{ status_label }}{% if current_stage %} · {{ current_stage | upper }}{% endif %}</span>
+  </div>
+
+  <div style="padding:14px 14px 10px 14px;display:flex;flex-direction:column;gap:16px;">
+
+    {% if runtime_note %}
+      {% set note_color = "#ffcc00" if runtime_note_kind == "telegram_reconnect" else "var(--accent-2)" %}
+      <div style="padding:10px 12px;border:1px solid {{ note_color }};color:{{ note_color }};font-size:12px;">
+        {{ runtime_note }}
+      </div>
+    {% endif %}
+
+    {% if progress_stale %}
+      <div style="padding:10px 12px;border:1px solid #ffcc00;color:#ffcc00;font-size:12px;line-height:1.4;">
+        Progress heartbeat is stale ({{ progress_age_seconds // 60 }}m old). The worker may still be active; DB saw
+        <span style="color:var(--text);">{{ "{:,}".format(live_creds_10m) }}</span>
+        new credentials in the last 10m{% if latest_credential_at %}, latest at {{ latest_credential_at.strftime("%H:%M:%S") }}{% endif %}.
+      </div>
+    {% endif %}
+
+    {% if progress_counter_stale %}
+      <div style="padding:10px 12px;border:1px solid #ffcc00;color:#ffcc00;font-size:12px;line-height:1.4;">
+        Run counters are lagging behind the active download. The pipeline is still moving; DB saw
+        <span style="color:var(--text);">{{ "{:,}".format(live_creds_10m) }}</span>
+        new credentials in the last 10m{% if latest_credential_at %}, latest at {{ latest_credential_at.strftime("%H:%M:%S") }}{% endif %}.
+      </div>
+    {% endif %}
+
+    {# ── Queue depth ─────────────────────────────────────────────────────── #}
+    <div>
+      <div style="font-size:11px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;">QUEUE</div>
+      {% set statuses = [
+        ("incomplete", "PENDING",   "#c8e8d8"),
+        ("ready",      "READY",     "#00ff9f"),
+        ("extracting", "ACTIVE",    "#00ccff"),
+        ("extracted",  "EXTRACTED", "#ffcc00"),
+        ("cleaned",    "CLEANED",   "#4a7c60"),
+        ("failed",     "FAILED",    "#ff4f4f"),
+        ("failed_terminal", "DEAD", "#993333"),
+      ] %}
+      {% set max_count = namespace(v=1) %}
+      {% for key, label, color in statuses %}
+        {% set n = queue.get(key, 0) %}
+        {% if n > max_count.v %}{% set max_count.v = n %}{% endif %}
+      {% endfor %}
+      {% for key, label, color in statuses %}
+        {% set n = queue.get(key, 0) %}
+        {% if n > 0 %}
+          {% set bar_width = ((n / max_count.v) * 120) | int %}
+          <div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px;">
+            <span style="color:var(--muted);width:70px;font-size:11px;">{{ label }}</span>
+            <span style="display:inline-block;height:6px;width:{{ bar_width }}px;background:{{ color }};min-width:2px;"></span>
+            <span style="color:{{ color }};font-size:12px;">{{ "{:,}".format(n) }}</span>
+          </div>
+        {% endif %}
+      {% endfor %}
+      {% if archive_total > 0 %}
+        <div style="font-size:11px;color:var(--muted);margin-top:6px;">{{ archive_index }}/{{ archive_total }} this run</div>
+        {% if progress_stale or progress_counter_stale %}
+          <div style="font-size:10px;color:#ffcc00;margin-top:3px;">progress counters may lag worker logs</div>
+        {% endif %}
+      {% endif %}
+    </div>
+
+    {# ── Active download ─────────────────────────────────────────────────── #}
+    {% if downloading or (is_running and current_archive) %}
+      <div>
+        <div style="font-size:11px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;">DOWNLOAD</div>
+        {% set fname = downloading.filename if downloading else current_archive %}
+        {% set fsize = downloading.size if downloading else 0 %}
+        <div style="font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:6px;">
+          {{ fname | truncate(60, True, '…') }}{% if fsize %} <span style="color:var(--muted);">({{ "%.0f" | format(fsize / 1048576) }} MB)</span>{% endif %}
+        </div>
+        {% if dl_pct > 0 %}
+          {% set filled = (dl_pct / 5) | int %}
+          {% set empty = 20 - filled %}
+          <div style="font-family:inherit;font-size:12px;color:var(--accent);">
+            [<span style="color:var(--accent);">{{ "█" * filled }}</span><span style="color:var(--border-strong);">{{ "░" * empty }}</span>]
+            <span style="color:var(--text);"> {{ dl_pct }}%</span>
+            {% if dl_speed %}<span style="color:var(--muted);"> · {{ "%.1f" | format(dl_speed) }} MB/s</span>{% endif %}
+          </div>
+        {% endif %}
+      </div>
+    {% endif %}
+
+    {# ── Recent results from progress file ─────────────────────────────── #}
+    {# recent_results is a list of strings like "archive.rar: +1,234 new, 567 dups" #}
+    {% if recent_results %}
+      <div>
+        <div style="font-size:11px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;">RECENT ACTIVITY</div>
+        {% for r in recent_results[:6] %}
+          <div style="display:flex;gap:8px;font-size:12px;margin:3px 0;align-items:baseline;">
+            <span style="color:var(--accent-2);flex-shrink:0;font-size:10px;">▸</span>
+            <span style="color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ r }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    {% elif recent %}
+      <div>
+        <div style="font-size:11px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;">RECENT (CLEANED)</div>
+        {% for row in recent %}
+          <div style="display:flex;gap:10px;font-size:12px;margin:3px 0;align-items:baseline;">
+            <span style="color:var(--muted);flex-shrink:0;">{% if row.updated_at %}{{ row.updated_at.strftime("%H:%M") }}{% endif %}</span>
+            <span style="color:var(--accent-2);flex-shrink:0;">CLEANED</span>
+            {% if row.creds > 0 %}
+              <span style="color:var(--warn);flex-shrink:0;">{{ "{:,}".format(row.creds) }} creds</span>
+            {% endif %}
+            <span style="color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ row.base_name | truncate(35, True, '…') }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    {# ── Channel stats ───────────────────────────────────────────────────── #}
+    <div style="font-size:12px;color:var(--muted);border-top:1px solid var(--border);padding-top:10px;">
+      <span style="color:var(--text);">{{ "{:,}".format(ch_subscribed) }}</span> subscribed ·
+      <span style="color:var(--text);">{{ "{:,}".format(ch_active) }}</span> active
+      {% if ch_joined_today > 0 %}
+        · <span style="color:var(--accent);">+{{ ch_joined_today }} today</span>
+      {% endif %}
+    </div>
+
+  </div>
+
+  {# ── Bottom stats strip ──────────────────────────────────────────────────── #}
+  <div style="padding:8px 14px;border-top:1px solid var(--border);background:var(--panel-alt);display:flex;gap:20px;font-size:11px;color:var(--muted);flex-wrap:wrap;">
+    <span><span style="color:var(--text);">~{{ "{:,}".format(total_creds) }}</span> creds total</span>
+    <span><span style="color:var(--text);">~{{ "{:,}".format(total_msgs) }}</span> msgs</span>
+    {% if run_creds > 0 %}
+    <span><span style="color:var(--accent);">+{{ "{:,}".format(run_creds) }}</span> this run{% if progress_counter_stale %} checkpoint{% endif %}</span>
+    {% endif %}
+  </div>
+
+</div>

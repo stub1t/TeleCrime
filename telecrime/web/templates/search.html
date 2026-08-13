@@ -1,0 +1,563 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <style>
+    .hl { background: rgba(79,209,197,0.18); color: var(--accent); border-radius: 2px; padding: 0 2px; font-style: normal; }
+    .pagination { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+    .page-btn { padding: 7px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); text-decoration: none; font-size: 13px; font-weight: 500; transition: border-color 0.2s, color 0.2s; }
+    .page-btn:hover { border-color: var(--accent); color: var(--accent); }
+  </style>
+  {% if query %}
+  <form class="search-bar" id="searchForm" action="/search" method="get">
+    <input type="text" name="q" placeholder="Search credentials, messages, files..." value="{{ query }}" autofocus />
+    <input type="hidden" name="limit" value="{{ limit }}" />
+    <input type="hidden" name="page" value="1" />
+    {% if no_markdown %}<input type="hidden" name="no_markdown" value="1" />{% endif %}
+    <button type="submit">Search</button>
+  </form>
+  {% endif %}
+  <div class="search-loading" id="searchLoading">
+    <div class="spinner"></div>
+    <span>Searching...</span>
+  </div>
+
+  {% if search_reduced %}
+  <div style="margin: 10px 0 18px; padding: 12px 14px; border-radius: 8px; border: 1px solid #d68a00; background: rgba(255,196,0,0.08); color: var(--text); font-size: 13px; line-height: 1.4;">
+    <strong style="color: #d68a00;">⚠ Search reduced</strong> — credential search hit the per-query time limit while the pipeline is parsing and returned no matches. This is temporary: re-run the search, or narrow your query with filters (<code>stealer:</code>, <code>app:</code>, <code>email_domain:</code>, <code>source:</code>) so the index can answer it faster.
+  </div>
+  {% elif pipeline_busy and query %}
+  <div style="margin: 10px 0 18px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--muted); font-size: 12px;">
+    <strong style="color: var(--accent);">●</strong> Pipeline is parsing — credential search is bounded to protect bulk-INSERT throughput. Results are live but may be slower than usual.
+  </div>
+  {% endif %}
+
+  {% if query %}
+  <div class="search-meta">
+    {% if fts_enabled %}
+      <span class="pill">FTS</span>
+    {% endif %}
+    {% if fts_used %}
+      <span class="muted">Full-text search active</span>
+    {% endif %}
+    {% if regex %}
+      <span class="muted">Regex filtering active</span>
+    {% endif %}
+    <button class="advanced-toggle" type="button" onclick="document.getElementById('advOpts').classList.toggle('open')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      Filters
+    </button>
+  </div>
+  {% endif %}
+
+  <form id="advOpts" class="adv-panel" action="/search" method="get">
+    <input type="hidden" name="q" value="{{ query }}" />
+    <input type="hidden" name="page" value="1" />
+    <div class="adv-section">
+      <div class="adv-section-title">Result limits</div>
+      <div class="adv-grid">
+        <label class="adv-field">
+          <span class="adv-label">Page size</span>
+          <input type="number" name="page_size" min="1" max="100" value="{{ page_size }}" />
+        </label>
+        <label class="adv-field">
+          <span class="adv-label">Messages</span>
+          <input type="number" name="limit_messages" min="0" max="100" value="{{ limit_messages }}" />
+        </label>
+        <label class="adv-field">
+          <span class="adv-label">Attachments</span>
+          <input type="number" name="limit_attachments" min="0" max="100" value="{{ limit_attachments }}" />
+        </label>
+        <label class="adv-field">
+          <span class="adv-label">Archives</span>
+          <input type="number" name="limit_archives" min="0" max="100" value="{{ limit_archives }}" />
+        </label>
+        <label class="adv-field">
+          <span class="adv-label">Extracted</span>
+          <input type="number" name="limit_extracted" min="0" max="100" value="{{ limit_extracted }}" />
+        </label>
+        <label class="adv-field">
+          <span class="adv-label">Conversations</span>
+          <input type="number" name="limit_conversations" min="0" max="100" value="{{ limit_conversations }}" />
+        </label>
+        <label class="adv-field">
+          <span class="adv-label">Channels</span>
+          <input type="number" name="limit_channels" min="0" max="100" value="{{ limit_channels }}" />
+        </label>
+      </div>
+    </div>
+    <div class="adv-section">
+      <div class="adv-section-title">Options</div>
+      <div class="adv-toggles">
+        <label class="adv-chip{% if facets_enabled %} active{% endif %}">
+          <input type="checkbox" name="facets" value="1" {% if facets_enabled %}checked{% endif %} />
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z"/></svg>
+          Facets
+        </label>
+        <label class="adv-chip{% if regex %} active{% endif %}">
+          <input type="checkbox" name="regex" value="1" {% if regex %}checked{% endif %} />
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3v10"/><circle cx="17" cy="17" r="4"/><path d="M7 3v4l5 4-5 4v4"/></svg>
+          Regex
+        </label>
+        <label class="adv-chip{% if no_markdown %} active{% endif %}">
+          <input type="checkbox" name="no_markdown" value="1" {% if no_markdown %}checked{% endif %} />
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16"/><path d="M4 12h10"/><path d="M4 17h7"/><path d="M18 10l2 2-2 2"/></svg>
+          Plain exports
+        </label>
+      </div>
+    </div>
+    <div class="adv-actions">
+      <button type="submit" class="adv-apply">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        Apply filters
+      </button>
+      <button type="button" class="adv-reset" onclick="document.getElementById('advOpts').classList.remove('open')">Cancel</button>
+    </div>
+  </form>
+
+  {% if active_filters or terms or source_conv %}
+    <div class="filter-bar">
+      {% if terms %}
+        <span class="filter-pill">Query: "{{ terms }}"</span>
+      {% endif %}
+      {% for filter in active_filters %}
+        <a class="filter-pill" href="/search?q={{ filter.query }}">× {{ filter.label }}</a>
+      {% endfor %}
+      {% if source_conv %}
+        <a class="filter-pill" href="/search?q={{ query }}">× Channel: {{ source_conv_name or source_conv }}</a>
+      {% endif %}
+      {% if active_filters or source_conv %}
+        <a class="filter-pill" href="/search?q={{ terms }}">Clear filters</a>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {% if query and (facets_enabled or saved_searches) %}
+    <div class="search-panels">
+      {% if saved_searches or query %}
+        <div class="panel">
+          <h3>Saved Searches</h3>
+          {% if saved_searches %}
+            <ul>
+              {% for saved in saved_searches %}
+                <li><a href="/search?q={{ saved.query }}">{{ saved.name }}</a></li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+          {% if query %}
+            <form class="save-form" action="/search/save" method="post">
+              <input type="hidden" name="query" value="{{ query }}" />
+              <input type="text" name="name" placeholder="Save this search as..." />
+              <button type="submit">Save</button>
+            </form>
+          {% endif %}
+        </div>
+      {% endif %}
+      {% if facets_enabled %}
+        <div class="panel" id="facetPanel">
+          <h3>Facets <span id="facetSpinner" class="muted" style="font-size:0.8em">(loading...)</span></h3>
+          <div id="facetContent"></div>
+        </div>
+      {% endif %}
+    </div>
+  {% elif not query and saved_searches %}
+    <div class="search-panels">
+      <div class="panel">
+        <h3>Saved Searches</h3>
+        <ul>
+          {% for saved in saved_searches %}
+            <li><a href="/search?q={{ saved.query }}">{{ saved.name }}</a></li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  {% endif %}
+
+  {% if not query and not source_conv %}
+    <div class="hero-search">
+      <p class="hero-heading">Search credentials</p>
+      <p class="hero-sub">Query domains, usernames, URLs, and stealer metadata</p>
+      <form class="hero-form" id="searchForm" action="/search" method="get">
+        <input type="text" name="q" placeholder="domain, username, URL…" autofocus />
+        <button type="submit">Search</button>
+      </form>
+      <div class="hero-hints">
+        <span>Try:</span>
+        <a href="/search?q=paypal">paypal</a>
+        <a href="/search?q=google.com">google.com</a>
+        <a href="/search?q=gmail">gmail</a>
+        <a href="/search?q=admin">admin</a>
+        <a href="/search?q=facebook">facebook</a>
+      </div>
+      <div class="hero-hints" style="margin-top:8px">
+        <span>Recent:</span>
+        <a href="/search?q=since:24h">last 24h</a>
+        <a href="/search?q=since:7d">last 7d</a>
+        <a href="/search?q=since:30d">last 30d</a>
+        <a href="/search?q=google.com+since:24h">google · 24h</a>
+        <a href="/search?q=since:24h+stealer:redline">redline · 24h</a>
+      </div>
+    </div>
+  {% else %}
+    <div class="section">
+      <div class="section-header">
+        <h2>
+          <span class="pill">Credentials</span>
+          {% if total_credentials is not none %}
+            <span class="muted" style="font-size:14px;font-weight:400;margin-left:8px">{{ "{:,}".format(total_credentials) }} results · page {{ page }}</span>
+          {% elif has_more %}
+            <span class="muted" style="font-size:14px;font-weight:400;margin-left:8px">{{ page_size }}+ results · page {{ page }}</span>
+          {% else %}
+            <span class="muted" style="font-size:14px;font-weight:400;margin-left:8px">page {{ page }}</span>
+          {% endif %}
+        </h2>
+        <div class="export-bar">
+          <a class="export-btn" href="/search/credentials.csv?q={{ query }}&limit=50000{% if regex %}&regex=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}" title="Export CSV">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            CSV
+          </a>
+          <a class="export-btn" href="/search/export.json?q={{ query }}{% if regex %}&regex=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}" title="Export JSON">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            JSON
+          </a>
+          <a class="export-btn" href="/search/export.md?q={{ query }}{% if regex %}&regex=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}" title="Export Markdown">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16v12H4z"/><path d="M7 15V9l3 3 3-3v6"/><path d="M15 15V9l2.5 3L20 9v6"/></svg>
+            Markdown
+          </a>
+          <a class="export-btn" href="/search/export.xlsx?q={{ query }}{% if regex %}&regex=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}" title="Export XLSX">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            XLSX
+          </a>
+        </div>
+      </div>
+      <div class="muted" style="margin-bottom:10px">
+        Showing {{ result_counts.credentials }} credential rows<span id="totalMatchMeta">{% if total_credentials is not none %} out of {{ "{:,}".format(total_credentials) }} total matches{% elif not regex %} · counting total matches...{% endif %}</span>.
+      </div>
+      {% if results.credentials %}
+        <div class="table-wrap">
+        <table class="cred-table">
+          <thead>
+            <tr>
+              <th>Domain</th>
+              <th>URL</th>
+              <th>Username</th>
+              <th>Password</th>
+              <th>Stealer</th>
+              <th>Channel</th>
+              <th>Archive</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for cred in results.credentials %}
+            <tr>
+              <td><a href="/credential/{{ cred.id }}">{{ cred.domain or "-" }}</a></td>
+              <td class="code" title="{{ cred.url or '' }}">{{ cred.url[:60] if cred.url and cred.url|length > 60 else (cred.url or "-") }}{% if cred.url and cred.url|length > 60 %}…{% endif %}</td>
+              <td class="cred-cell">
+                <span class="code">{{ cred.username or "-" }}</span>
+                {% if cred.username %}<button class="cred-copy-sm" title="Copy"
+                  x-data="{ ok: false }"
+                  data-copy="{{ cred.username | trim | e }}"
+                  @click="copyToClipboard($el.dataset.copy); ok=true; setTimeout(()=>ok=false,1500)"
+                  :title="ok ? 'Copied!' : 'Copy'"
+                  x-html="ok ? '✓' : '<svg viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'currentColor\' stroke-width=\'2\' stroke-linecap=\'round\' stroke-linejoin=\'round\'><rect x=\'9\' y=\'9\' width=\'13\' height=\'13\' rx=\'2\'/><path d=\'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1\'/></svg>'"></button>{% endif %}
+              </td>
+              <td class="cred-cell">
+                <span class="code">{{ cred.password or "-" }}</span>
+                {% if cred.password %}<button class="cred-copy-sm" title="Copy"
+                  x-data="{ ok: false }"
+                  data-copy="{{ cred.password | trim | e }}"
+                  @click="copyToClipboard($el.dataset.copy); ok=true; setTimeout(()=>ok=false,1500)"
+                  :title="ok ? 'Copied!' : 'Copy'"
+                  x-html="ok ? '✓' : '<svg viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'currentColor\' stroke-width=\'2\' stroke-linecap=\'round\' stroke-linejoin=\'round\'><rect x=\'9\' y=\'9\' width=\'13\' height=\'13\' rx=\'2\'/><path d=\'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1\'/></svg>'"></button>{% endif %}
+              </td>
+              <td>{% if cred.stealer_type %}<span class="stealer-badge">{{ cred.stealer_type }}</span>{% else %}-{% endif %}</td>
+              <td class="code">{% if cred.source_conversation_id %}<a href="/conversation/{{ cred.source_conversation_id }}" style="color:var(--accent);text-decoration:none" title="View conversation">{{ channel_map.get(cred.source_conversation_id, cred.source_conversation_id) }}</a>{% else %}-{% endif %}</td>
+              <td class="code" title="{{ cred.source_archive or '' }}">{{ cred.source_archive or "-" }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        </div>
+        <div class="pagination">
+          {% if page > 1 %}
+            <a class="page-btn" href="javascript:history.back()">← Prev</a>
+          {% endif %}
+          <span class="muted">Page {{ page }}</span>
+          {% if has_more %}
+            <a class="page-btn" href="/search?q={{ query }}&page={{ page + 1 }}&page_size={{ page_size }}&after_id={{ last_id }}&limit={{ limit }}&limit_messages={{ limit_messages }}&limit_attachments={{ limit_attachments }}&limit_archives={{ limit_archives }}&limit_extracted={{ limit_extracted }}&limit_conversations={{ limit_conversations }}&limit_channels={{ limit_channels }}{% if regex %}&regex=1{% endif %}{% if facets_enabled %}&facets=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}{% if source_conv %}&source_conv={{ source_conv }}{% endif %}">Next →</a>
+          {% endif %}
+        </div>
+      {% else %}
+        <div class="empty">No credential matches.</div>
+      {% endif %}
+    </div>
+
+    {% if results.messages %}
+    <div class="section">
+      <div class="section-header">
+        <h2><span class="pill">Messages</span></h2>
+        <div class="export-bar">
+          <a class="export-btn" href="/search/messages.csv?q={{ query }}&limit=50000{% if regex %}&regex=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}" title="Export CSV">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            CSV
+          </a>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Conversation</th>
+            <th>Timestamp</th>
+            <th>Text</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for msg in results.messages %}
+          <tr>
+            <td class="code">{{ msg.conversation_id }}</td>
+            <td class="muted">{{ msg.platform_timestamp }}</td>
+            <td>{{ msg.text or msg.caption or "-" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    {% if results.attachments %}
+    <div class="section">
+      <div class="section-header">
+        <h2><span class="pill">Attachments</span></h2>
+        <div class="export-bar">
+          <a class="export-btn" href="/search/attachments.csv?q={{ query }}&limit=50000{% if regex %}&regex=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}" title="Export CSV">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            CSV
+          </a>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Filename</th>
+            <th>MIME</th>
+            <th>Message</th>
+            <th>Archive</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for att in results.attachments %}
+          <tr>
+            <td class="code">{{ att.filename or "-" }}</td>
+            <td>{{ att.mime_type or "-" }}</td>
+            <td class="code">{{ att.message_id }}</td>
+            <td>{{ "yes" if att.is_archive_candidate else "no" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    {% if results.archives %}
+    <div class="section">
+      <div class="section-header">
+        <h2><span class="pill">Archives</span></h2>
+        <div class="export-bar">
+          <a class="export-btn" href="/search/archives.csv?q={{ query }}&limit=50000{% if regex %}&regex=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}" title="Export CSV">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            CSV
+          </a>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Local Path</th>
+            <th>Attachment</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for arch in results.archives %}
+          <tr>
+            <td>{{ arch.status }}</td>
+            <td class="code">{{ arch.local_path or arch.temp_path or "-" }}</td>
+            <td class="code">{{ arch.attachment_id }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    {% if results.extracted %}
+    <div class="section">
+      <div class="section-header">
+        <h2><span class="pill">Extracted Outputs</span></h2>
+        <div class="export-bar">
+          <a class="export-btn" href="/search/extracted.csv?q={{ query }}&limit=50000{% if regex %}&regex=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}" title="Export CSV">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            CSV
+          </a>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Filename</th>
+            <th>Path</th>
+            <th>Job</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for out in results.extracted %}
+          <tr>
+            <td class="code">{{ out.output_filename }}</td>
+            <td class="code">{{ out.output_path }}</td>
+            <td class="code">{{ out.job_id }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    {% if results.conversations %}
+    <div class="section">
+      <div class="section-header">
+        <h2><span class="pill">Conversations</span></h2>
+        <div class="export-bar">
+          <a class="export-btn" href="/search/conversations.csv?q={{ query }}&limit=50000{% if regex %}&regex=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}" title="Export CSV">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            CSV
+          </a>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Title</th>
+            <th>Username</th>
+            <th>Type</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for conv in results.conversations %}
+          <tr>
+            <td>{{ conv.title or "-" }}</td>
+            <td class="code">{{ conv.username or "-" }}</td>
+            <td>{{ conv.conversation_type }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    {% if results.channels %}
+    <div class="section">
+      <div class="section-header">
+        <h2><span class="pill">Channels</span></h2>
+        <div class="export-bar">
+          <a class="export-btn" href="/search/channels.csv?q={{ query }}&limit=50000{% if regex %}&regex=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}" title="Export CSV">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            CSV
+          </a>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Handle</th>
+            <th>Title</th>
+            <th>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for chan in results.channels %}
+          <tr>
+            <td class="code">{{ chan.username or "-" }}</td>
+            <td>{{ chan.title or "-" }}</td>
+            <td>{{ chan.source }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  {% endif %}
+  <script>
+  (function() {
+    var form = document.getElementById('searchForm');
+    var loading = document.getElementById('searchLoading');
+    if (form && loading) {
+      form.addEventListener('submit', function() {
+        loading.classList.add('active');
+        form.querySelector('button[type="submit"]').disabled = true;
+      });
+    }
+    // Toggle active class on adv-chip labels
+    document.querySelectorAll('.adv-chip input[type="checkbox"]').forEach(function(cb) {
+      cb.addEventListener('change', function() {
+        this.closest('.adv-chip').classList.toggle('active', this.checked);
+      });
+    });
+    // Highlight query terms in credential table
+    {% if query %}
+    (function() {
+      var q = {{ query|tojson }};
+      if (!q) return;
+      var terms = q.trim().split(/\s+/).filter(Boolean);
+      if (!terms.length) return;
+      var pattern = new RegExp('(' + terms.map(function(t) { return t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }).join('|') + ')', 'gi');
+      document.querySelectorAll('.cred-table td').forEach(function(td) {
+        // Only highlight text nodes to avoid breaking links/buttons
+        if (td.querySelector('a,button')) return;
+        var html = td.innerHTML;
+        td.innerHTML = html.replace(pattern, '<mark class="hl">$1</mark>');
+      });
+    })();
+    {% endif %}
+    // Async facets loading
+    var facetPanel = document.getElementById('facetPanel');
+    if (facetPanel) {
+      var q = {{ query|tojson }};
+      fetch('/search/facets?q=' + encodeURIComponent(q))
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          var html = '';
+          var titles = {domain: 'Domain', stealer_type: 'Stealer Type', application: 'Application', email_domain: 'Email Domain'};
+          ['domain', 'stealer_type', 'application', 'email_domain'].forEach(function(key) {
+            var items = data[key] || [];
+            html += '<div class="facet-group"><div class="facet-title">' + titles[key] + '</div>';
+            items.forEach(function(item) {
+              html += '<div class="facet-row"><a href="/search?q=' + encodeURIComponent(item.query) + '">' + item.value + '</a> <span class="muted">(' + item.count + ')</span></div>';
+            });
+            html += '</div>';
+          });
+          document.getElementById('facetContent').innerHTML = html;
+          document.getElementById('facetSpinner').style.display = 'none';
+        })
+        .catch(function() {
+          document.getElementById('facetSpinner').textContent = '(failed)';
+        });
+    }
+    var totalMatchMeta = document.getElementById('totalMatchMeta');
+    if (totalMatchMeta && !{{ regex|tojson }} && {{ total_credentials is none|tojson }}) {
+      var q = {{ query|tojson }};
+      fetch('/search/count?q=' + encodeURIComponent(q))
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (typeof data.total_credentials === 'number') {
+            var countStr = data.capped ? '10,000+' : data.total_credentials.toLocaleString();
+            totalMatchMeta.textContent = ' out of ' + countStr + ' total matches';
+          } else {
+            totalMatchMeta.textContent = '';
+          }
+        })
+        .catch(function() {
+          totalMatchMeta.textContent = '';
+        });
+    }
+  })();
+  </script>
+{% endblock %}

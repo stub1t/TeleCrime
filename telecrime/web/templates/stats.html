@@ -1,0 +1,869 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <div class="page-intro">
+    <div class="page-intro-copy">
+      <h2>Pipeline Analytics</h2>
+      <p>Track message throughput, credential growth, archive funnel health, and channel quality.</p>
+    </div>
+    {% if last_updated %}
+      <span class="mini-note">Updated {{ last_updated }}</span>
+    {% else %}
+      <span class="mini-note">Cached operator view</span>
+    {% endif %}
+  </div>
+
+  <form class="search-bar" action="/stats" method="get">
+    <label>
+      Window
+      <select name="days">
+        {% for preset in stats_presets %}
+          <option value="{{ preset[0] }}" {% if preset[0] == days %}selected{% endif %}>
+            {% if preset[0] == 0 %}All time{% else %}Last {{ preset[0] }} days{% endif %}
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+    <input type="hidden" name="limit" value="{{ limit }}" />
+    <button type="submit">Apply</button>
+  </form>
+
+  {% if stats_note %}
+    <div class="empty">{{ stats_note }}</div>
+  {% endif %}
+  <div class="section">
+    <h2>Trends</h2>
+    {% if daily_messages or daily_credentials %}
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+        <div class="card" style="height:260px"><canvas id="chartMsgsDay"></canvas></div>
+        <div class="card" style="height:260px"><canvas id="chartCredsDay"></canvas></div>
+      </div>
+    {% endif %}
+    <div class="search-panels">
+      <div class="panel">
+        <h3>Messages per Day</h3>
+        {% if daily_messages %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Count</th>
+                <th>Trend</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in daily_messages %}
+              <tr>
+                <td class="code">{{ row.day }}</td>
+                <td class="code">{{ row.count }}</td>
+                <td>
+                  <div class="bar"><div class="bar-fill" style="width: {{ row.pct }}%"></div></div>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Credentials per Day</h3>
+        {% if daily_credentials %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Count</th>
+                <th>Trend</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in daily_credentials %}
+              <tr>
+                <td class="code">{{ row.day }}</td>
+                <td class="code">{{ row.count }}</td>
+                <td>
+                  <div class="bar"><div class="bar-fill" style="width: {{ row.pct }}%"></div></div>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Domains and Stealers</h2>
+    {% if top_domains or top_stealers %}
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+        <div class="card" style="height:300px"><canvas id="chartDomains"></canvas></div>
+        <div class="card" style="height:300px"><canvas id="chartStealers"></canvas></div>
+      </div>
+    {% endif %}
+    <div class="search-panels">
+      <div class="panel">
+        <h3>Top Domains</h3>
+        {% if top_domains %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Domain</th>
+                <th>Count</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in top_domains %}
+              <tr>
+                <td class="code">{{ row.domain }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Top Stealer Types</h3>
+        {% if top_stealers %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Stealer</th>
+                <th>Count</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in top_stealers %}
+              <tr>
+                <td class="code">{{ row.stealer_type }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      {% if top_countries %}
+      <div class="panel">
+        <h3>Top Countries <span style="font-size:0.8em;color:#888">(from SystemInfo)</span></h3>
+        <table data-sortable>
+          <thead><tr><th>Country</th><th>Systems</th></tr></thead>
+          <tbody>
+            {% for country, count in top_countries %}
+            <tr>
+              <td>{{ country or "(unknown)" }}</td>
+              <td class="code">{{ "{:,}".format(count) }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Channel Activity</h2>
+    {% if top_by_messages or top_by_credentials %}
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+        <div class="card" style="height:300px"><canvas id="chartChanMsgs"></canvas></div>
+        <div class="card" style="height:300px"><canvas id="chartChanCreds"></canvas></div>
+      </div>
+    {% endif %}
+    <div class="search-panels">
+      <div class="panel">
+        <h3>Messages</h3>
+        {% if top_by_messages %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Count</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in top_by_messages %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Attachments</h3>
+        {% if top_by_attachments %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Count</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in top_by_attachments %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Archive Candidates</h3>
+        {% if top_by_archives %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Count</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in top_by_archives %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Credentials</h3>
+        {% if top_by_credentials %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Count</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in top_by_credentials %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Download Funnel (Archive Candidates)</h2>
+    {% if funnel %}
+      <div class="card" style="height:300px;margin-bottom:16px"><canvas id="chartFunnel"></canvas></div>
+      <table data-sortable>
+        <thead>
+          <tr>
+            <th>Channel</th>
+            <th>Discovered</th>
+            <th>Downloaded</th>
+            <th>Extracted</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in funnel %}
+          <tr>
+            <td>{{ row.title or row.username or row.id }}</td>
+            <td class="code">{{ row.discovered }}</td>
+            <td class="code">{{ row.downloaded }}</td>
+            <td class="code">{{ row.extracted }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="empty">No data.</div>
+    {% endif %}
+  </div>
+
+  <div class="section">
+    <h2>Forwarding</h2>
+    <div class="search-panels">
+      <div class="panel">
+        <h3>Top Forwarded Sources</h3>
+        {% if top_forwarded_sources %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Count</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in top_forwarded_sources %}
+              <tr>
+                <td>{{ row.title or row.username or row.platform_id }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Top Forwarding Channels</h3>
+        {% if top_forwarding_channels %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Forwarded Count</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in top_forwarding_channels %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Most Diverse Sources</h3>
+        {% if most_diverse_sources %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Distinct Sources</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in most_diverse_sources %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Top Amplified Sources</h3>
+        {% if top_amplified_sources %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Forwarded By Others</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in top_amplified_sources %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Forwarding Matrix</h2>
+    {% if forwarding_matrix %}
+      <table data-sortable>
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th>Destination</th>
+            <th>Count</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in forwarding_matrix %}
+          <tr>
+            <td>{{ row.source_title or row.source_username or row.source_platform_id }}</td>
+            <td>{{ row.dest_title or row.dest_username or row.dest_id }}</td>
+            <td class="code">{{ row.count }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="empty">No data.</div>
+    {% endif %}
+  </div>
+
+  <div class="section">
+    <h2>Archive Success Rates</h2>
+    {% if archive_stats %}
+      <table data-sortable>
+        <thead>
+          <tr>
+            <th>Channel</th>
+            <th>Archives</th>
+            <th>Downloads</th>
+            <th>Extractions</th>
+            <th>Download Rate</th>
+            <th>Extraction Rate</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in archive_stats %}
+          <tr>
+            <td>{{ row.title or row.username or row.id }}</td>
+            <td class="code">{{ row.archives }}</td>
+            <td class="code">{{ row.downloads }}</td>
+            <td class="code">{{ row.extractions }}</td>
+            <td>{{ row.download_rate }}%</td>
+            <td>{{ row.extraction_rate }}%</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="empty">No data.</div>
+    {% endif %}
+  </div>
+
+  <div class="section">
+    <h2>Repost Rates</h2>
+    <div class="search-panels">
+      <div class="panel">
+        <h3>Downloads</h3>
+        {% if repost_downloads %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Total</th>
+                <th>Reposts</th>
+                <th>Rate</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in repost_downloads %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.total }}</td>
+                <td class="code">{{ row.reposts }}</td>
+                <td>{{ row.rate }}%</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Extracted Outputs</h3>
+        {% if repost_extracted %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Total</th>
+                <th>Reposts</th>
+                <th>Rate</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in repost_extracted %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.total }}</td>
+                <td class="code">{{ row.reposts }}</td>
+                <td>{{ row.rate }}%</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Operational Health</h2>
+    <div class="search-panels">
+      <div class="panel">
+        <h3>Failed Downloads</h3>
+        {% if failed_downloads %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Failures</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in failed_downloads %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Failed Extractions</h3>
+        {% if failed_extractions %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Failures</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in failed_extractions %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ row.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Avg Download Latency (hrs)</h3>
+        {% if avg_download_latency %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Hours</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in avg_download_latency %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ "%.2f"|format(row.hours or 0) }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Avg Extraction Latency (hrs)</h3>
+        {% if avg_extraction_latency %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>Hours</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in avg_extraction_latency %}
+              <tr>
+                <td>{{ row.title or row.username or row.id }}</td>
+                <td class="code">{{ "%.2f"|format(row.hours or 0) }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Channel Bursts</h2>
+    {% if bursty_channels %}
+      <table data-sortable>
+        <thead>
+          <tr>
+            <th>Channel</th>
+            <th>Max Day</th>
+            <th>Avg Day</th>
+            <th>Spike Ratio</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in bursty_channels %}
+          <tr>
+            <td>{{ row.title or row.username or row.id }}</td>
+            <td class="code">{{ row.max_day }}</td>
+            <td class="code">{{ row.avg_day }}</td>
+            <td class="code">{{ row.ratio }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="empty">No bursty channels detected.</div>
+    {% endif %}
+  </div>
+
+  <div class="section">
+    <h2>Telegram Channel Lifecycle</h2>
+    <div class="search-panels">
+      <div class="panel">
+        <h3>Recently Seen Channels (All-Time)</h3>
+        {% if channel_insights %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>First Seen</th>
+                <th>Last Checked</th>
+                <th>Active</th>
+                <th>Accessible</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in channel_insights %}
+              <tr>
+                <td>{{ row.title or row.username or row.platform_id }}</td>
+                <td class="code">{{ row.discovered_at }}</td>
+                <td class="code">{{ row.last_checked or "-" }}</td>
+                <td>{{ "yes" if row.is_active else "no" }}</td>
+                <td>{{ "yes" if row.is_accessible else "no" }}</td>
+                <td class="code">{{ row.source }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No data.</div>
+        {% endif %}
+      </div>
+      <div class="panel">
+        <h3>Deleted / Inactive Channels</h3>
+        {% if deleted_channels %}
+          <table data-sortable>
+            <thead>
+              <tr>
+                <th>Channel</th>
+                <th>First Seen</th>
+                <th>Last Checked</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in deleted_channels %}
+              <tr>
+                <td>{{ row.title or row.username or row.platform_id }}</td>
+                <td class="code">{{ row.discovered_at }}</td>
+                <td class="code">{{ row.last_checked or "-" }}</td>
+                <td class="muted">{{ row.check_error or "-" }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No deleted channels tracked.</div>
+        {% endif %}
+      </div>
+      {% if dork_channels %}
+      <div class="panel">
+        <h3>Channels Found via Dorking</h3>
+        <table data-sortable>
+          <thead><tr><th>Invite Link</th><th>Keyword</th><th>Discovered</th></tr></thead>
+          <tbody>
+            {% for ch in dork_channels %}
+            <tr>
+              <td class="code">{{ ch.invite_link or ch.username or "(unknown)" }}</td>
+              <td>{{ ch.discovered_from or "" }}</td>
+              <td class="code">{{ ch.discovered_at.strftime('%Y-%m-%d') if ch.discovered_at else "" }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <script>
+  (function() {
+    if (!window.Chart) return;
+    const c = tcChartColors();
+    const defs = tcChartDefaults();
+
+    function lineChart(id, labels, datasets) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      new Chart(el, {
+        type: 'line',
+        data: { labels: labels, datasets: datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { labels: { color: c.muted } } },
+          scales: {
+            x: { ticks: { color: c.muted, maxRotation: 45 }, grid: { color: c.border } },
+            y: { ticks: { color: c.muted }, grid: { color: c.border }, beginAtZero: true },
+          },
+        }
+      });
+    }
+
+    function hbarChart(id, labels, data, color) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      new Chart(el, {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: [{ data: data, backgroundColor: color + '99', borderColor: color, borderWidth: 1 }]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: c.muted }, grid: { color: c.border }, beginAtZero: true },
+            y: { ticks: { color: c.muted, font: { size: 11 } }, grid: { display: false } },
+          },
+        }
+      });
+    }
+
+    // Trends: Messages per Day
+    var msgsDay = {{ daily_messages | tojson }};
+    if (msgsDay && msgsDay.length) {
+      lineChart('chartMsgsDay',
+        msgsDay.map(function(d){ return d.day; }),
+        [{
+          label: 'Messages',
+          data: msgsDay.map(function(d){ return d.count; }),
+          borderColor: c.accent2, backgroundColor: c.accent2 + '22',
+          fill: true, tension: 0.3, pointRadius: 2, borderWidth: 2,
+        }]
+      );
+    }
+
+    // Trends: Credentials per Day
+    var credsDay = {{ daily_credentials | tojson }};
+    if (credsDay && credsDay.length) {
+      lineChart('chartCredsDay',
+        credsDay.map(function(d){ return d.day; }),
+        [{
+          label: 'Credentials',
+          data: credsDay.map(function(d){ return d.count; }),
+          borderColor: c.accent, backgroundColor: c.accent + '22',
+          fill: true, tension: 0.3, pointRadius: 2, borderWidth: 2,
+        }]
+      );
+    }
+
+    // Top Domains
+    var domains = {{ top_domains | tojson }};
+    if (domains && domains.length) {
+      hbarChart('chartDomains',
+        domains.map(function(d){ return d.domain; }),
+        domains.map(function(d){ return d.count; }),
+        c.accent2
+      );
+    }
+
+    // Top Stealers
+    var stealers = {{ top_stealers | tojson }};
+    if (stealers && stealers.length) {
+      hbarChart('chartStealers',
+        stealers.map(function(d){ return d.stealer_type; }),
+        stealers.map(function(d){ return d.count; }),
+        c.accent
+      );
+    }
+
+    // Channel Activity: Messages
+    var chanMsgs = {{ top_by_messages | tojson }};
+    if (chanMsgs && chanMsgs.length) {
+      hbarChart('chartChanMsgs',
+        chanMsgs.map(function(d){ return d.title || d.username || d.id; }),
+        chanMsgs.map(function(d){ return d.count; }),
+        c.accent2
+      );
+    }
+
+    // Channel Activity: Credentials
+    var chanCreds = {{ top_by_credentials | tojson }};
+    if (chanCreds && chanCreds.length) {
+      hbarChart('chartChanCreds',
+        chanCreds.map(function(d){ return d.title || d.username || d.id; }),
+        chanCreds.map(function(d){ return d.count; }),
+        c.accent
+      );
+    }
+
+    // Download Funnel - stacked bar
+    var funnel = {{ funnel | tojson }};
+    if (funnel && funnel.length) {
+      var funnelEl = document.getElementById('chartFunnel');
+      if (funnelEl) {
+        new Chart(funnelEl, {
+          type: 'bar',
+          data: {
+            labels: funnel.map(function(d){ return d.title || d.username || d.id; }),
+            datasets: [
+              { label: 'Discovered', data: funnel.map(function(d){ return d.discovered; }), backgroundColor: c.accent2 + '99' },
+              { label: 'Downloaded', data: funnel.map(function(d){ return d.downloaded; }), backgroundColor: c.accent + '99' },
+              { label: 'Extracted', data: funnel.map(function(d){ return d.extracted; }), backgroundColor: c.danger + '99' },
+            ]
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: c.muted } } },
+            scales: {
+              x: { ticks: { color: c.muted, maxRotation: 45, font: { size: 11 } }, grid: { color: c.border }, stacked: true },
+              y: { ticks: { color: c.muted }, grid: { color: c.border }, stacked: true, beginAtZero: true },
+            },
+          }
+        });
+      }
+    }
+  })();
+  </script>
+{% endblock %}

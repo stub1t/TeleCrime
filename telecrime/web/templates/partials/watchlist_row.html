@@ -1,0 +1,34 @@
+<tr id="wl-row-{{ item.id }}">
+  <td>
+    <div class="wl-toggle {{ 'on' if item.enabled else '' }}"
+         hx-patch="/api/watchlist/{{ item.id }}"
+         hx-vals='{"enabled": {{ 0 if item.enabled else 1 }}}'
+         hx-target="closest tr"
+         hx-swap="outerHTML"
+         title="Toggle enabled"
+         style="cursor:pointer"></div>
+  </td>
+  <td>{{ item.label }}</td>
+  <td class="code">{{ item.query }}</td>
+  <td><span class="match-type-pill">{{ item.match_type }}</span></td>
+  <td class="code">{{ "{:,}".format(item.last_known_count) }}</td>
+  <td>
+    {% if item.new_count > 0 %}
+      <span class="wl-new-badge">+{{ "{:,}".format(item.new_count) }}</span>
+    {% else %}
+      <span class="muted">0</span>
+    {% endif %}
+  </td>
+  <td class="muted">{{ item.last_checked_at[:19].replace("T"," ") if item.last_checked_at else "—" }}</td>
+  <td>
+    <div class="wl-actions">
+      <a href="/search?q={{ item.query | urlencode }}" class="wl-btn"
+         onclick="fetch('/api/watchlist/{{ item.id }}/viewed',{method:'POST'})">View</a>
+      <button class="wl-btn danger"
+              hx-delete="/api/watchlist/{{ item.id }}"
+              hx-target="closest tr"
+              hx-swap="outerHTML swap:0.3s"
+              hx-confirm="Delete this watchlist item?">Delete</button>
+    </div>
+  </td>
+</tr>

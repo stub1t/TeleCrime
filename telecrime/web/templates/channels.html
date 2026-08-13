@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-intro">
+  <div class="page-intro-copy">
+    <h2>Discovered Channels</h2>
+    <p>All Telegram channels found via subscriptions, forwards, mentions, and links</p>
+  </div>
+</div>
+
+<div class="stats-row">
+  <div class="stat-chip">
+    <span class="stat-label">Total Channels</span>
+    <span class="stat-value">{{ "{:,}".format(stats.total) }}</span>
+  </div>
+  <div class="stat-chip">
+    <span class="stat-label">Subscribed</span>
+    <span class="stat-value">{{ stats.subscribed }}</span>
+  </div>
+  <div class="stat-chip">
+    <span class="stat-label">Active</span>
+    <span class="stat-value">{{ stats.active }}</span>
+  </div>
+  <div class="stat-chip">
+    <span class="stat-label">Credentials Extracted</span>
+    <span class="stat-value">{{ "{:,}".format(stats.total_creds) }}</span>
+  </div>
+</div>
+
+<!-- Filters -->
+<div class="section" style="padding:12px 16px">
+  <form method="get" action="/channels" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+    <select name="subscribed" onchange="this.form.submit()" style="background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px 10px;font-size:12px">
+      <option value="" {% if not filter_subscribed %}selected{% endif %}>All subscription states</option>
+      <option value="1" {% if filter_subscribed == "1" %}selected{% endif %}>Subscribed</option>
+      <option value="0" {% if filter_subscribed == "0" %}selected{% endif %}>Not subscribed</option>
+    </select>
+    <select name="active" onchange="this.form.submit()" style="background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px 10px;font-size:12px">
+      <option value="" {% if not filter_active %}selected{% endif %}>All activity states</option>
+      <option value="1" {% if filter_active == "1" %}selected{% endif %}>Active</option>
+      <option value="0" {% if filter_active == "0" %}selected{% endif %}>Inactive / deleted</option>
+    </select>
+    <select name="source" onchange="this.form.submit()" style="background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px 10px;font-size:12px">
+      <option value="" {% if not filter_source %}selected{% endif %}>All sources</option>
+      {% for s in sources %}
+      <option value="{{ s }}" {% if filter_source == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+    {% if filter_subscribed or filter_active or filter_source %}
+    <a href="/channels" style="color:var(--muted);font-size:12px">× clear</a>
+    {% endif %}
+    <span class="mini-note">{{ "{:,}".format(stats.total) }} results</span>
+  </form>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <h2>Channels</h2>
+    <span class="mini-note">Sorted by credentials extracted ↓</span>
+  </div>
+  <div class="table-wrap">
+    <table data-sortable>
+      <thead>
+        <tr>
+          <th>Channel</th>
+          <th>Source</th>
+          <th>Subscribed</th>
+          <th>Active</th>
+          <th>Members</th>
+          <th>Archives</th>
+          <th>Credentials</th>
+          <th>Discovered</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ch in channels %}
+        <tr>
+          <td>
+            {% if ch.telegram_link %}
+              <a href="{{ ch.telegram_link }}" target="_blank" rel="noopener" style="color:var(--accent)">{{ ch.display_name }}</a>
+            {% else %}
+              <span class="code">{{ ch.display_name }}</span>
+            {% endif %}
+            {% if ch.title and ch.username %}
+              <span style="color:var(--muted);font-size:11px;display:block">{{ ch.title }}</span>
+            {% endif %}
+          </td>
+          <td><span class="pill">{{ ch.source }}</span></td>
+          <td>
+            {% if ch.is_subscribed %}<span style="color:var(--accent)">Yes</span>
+            {% else %}<span style="color:var(--muted)">No</span>{% endif %}
+          </td>
+          <td>
+            {% if ch.is_active %}<span style="color:var(--accent)">Yes</span>
+            {% elif not ch.is_accessible %}<span style="color:var(--danger)">Gone</span>
+            {% else %}<span style="color:var(--muted)">No</span>{% endif %}
+          </td>
+          <td>{{ "{:,}".format(ch.member_count) if ch.member_count else "—" }}</td>
+          <td>{{ ch.archives_seen or 0 }}</td>
+          <td>
+            {% if ch.credentials_extracted > 0 %}
+              <span style="color:var(--accent);font-weight:600">{{ "{:,}".format(ch.credentials_extracted) }}</span>
+            {% else %}
+              <span style="color:var(--muted)">0</span>
+            {% endif %}
+          </td>
+          <td style="white-space:nowrap;font-size:0.85em">
+            {% if ch.discovered_at %}{{ ch.discovered_at.strftime('%Y-%m-%d') }}{% else %}—{% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="8" style="text-align:center;color:var(--muted);padding:32px">No channels found</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if pages > 1 %}
+<div class="pw-pagination">
+  {% if page > 1 %}
+  <a class="pw-page-btn" href="?subscribed={{ filter_subscribed }}&active={{ filter_active }}&source={{ filter_source }}&limit={{ limit }}&page={{ page - 1 }}">← Prev</a>
+  {% endif %}
+  {% for p in range([1, page - 2]|max, [pages + 1, page + 3]|min) %}
+  <a class="pw-page-btn {% if p == page %}active{% endif %}"
+     href="?subscribed={{ filter_subscribed }}&active={{ filter_active }}&source={{ filter_source }}&limit={{ limit }}&page={{ p }}">{{ p }}</a>
+  {% endfor %}
+  {% if page < pages %}
+  <a class="pw-page-btn" href="?subscribed={{ filter_subscribed }}&active={{ filter_active }}&source={{ filter_source }}&limit={{ limit }}&page={{ page + 1 }}">Next →</a>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

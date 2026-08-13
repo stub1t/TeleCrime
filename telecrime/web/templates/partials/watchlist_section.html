@@ -1,0 +1,29 @@
+<div id="wl-section">
+{% if items %}
+<div class="table-wrap">
+  <table data-sortable>
+    <thead>
+      <tr>
+        <th>Enabled</th>
+        <th>Label</th>
+        <th>Query</th>
+        <th>Type</th>
+        <th>Total</th>
+        <th>New</th>
+        <th>Last Checked</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="wlBody">
+      {% for item in items %}
+      {% include "partials/watchlist_row.html" %}
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="section">
+  <div class="empty">No watchlist items yet. Add a query above to start monitoring.</div>
+</div>
+{% endif %}
+</div>

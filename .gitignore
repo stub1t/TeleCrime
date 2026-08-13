@@ -1,0 +1,222 @@
+# =============================================================================
+# Telecrime Project .gitignore
+# =============================================================================
+
+# Test leak: when a test passes a MagicMock as `data_dir` to pipeline_run_lock,
+# Path coercion creates `MagicMock/mock.data_dir/<id>/pipeline.lock` in the
+# repo root. Tolerated until tests are tightened.
+MagicMock/
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# -----------------------------------------------------------------------------
+# Virtual Environments
+# -----------------------------------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+.env/
+
+# -----------------------------------------------------------------------------
+# uv
+# -----------------------------------------------------------------------------
+# uv creates .venv by default, already covered above
+# uv.lock is committed (it's the lockfile)
+
+# -----------------------------------------------------------------------------
+# Testing
+# -----------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+pytestdebug.log
+
+# -----------------------------------------------------------------------------
+# Type Checking
+# -----------------------------------------------------------------------------
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# -----------------------------------------------------------------------------
+# IDEs and Editors
+# -----------------------------------------------------------------------------
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Vim / Editor backup files
+*~
+*.swp
+*.swo
+*.swn
+.netrwhist
+
+# Emacs
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Spyder
+.spyderproject
+.spyproject
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# -----------------------------------------------------------------------------
+# Operating System
+# -----------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
+
+# -----------------------------------------------------------------------------
+# Project-Specific: Runtime Data (NEVER COMMIT)
+# -----------------------------------------------------------------------------
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Telegram session files
+*.session
+*.session-journal
+
+# Data directories
+data/
+/data/
+
+# Downloaded files
+/downloads/
+
+# Extracted files
+/extracted/
+
+# -----------------------------------------------------------------------------
+# Project-Specific: Configuration with Secrets
+# -----------------------------------------------------------------------------
+# Config files may contain API keys
+config.toml
+config.local.toml
+.env
+.env.local
+.env.*.local
+secrets.toml
+credentials.json
+
+# -----------------------------------------------------------------------------
+# Logs
+# -----------------------------------------------------------------------------
+*.log
+logs/
+*.log.*
+
+# -----------------------------------------------------------------------------
+# Temporary Files
+# -----------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.backup
+.tmp/
+tmp/
+temp/
+
+# -----------------------------------------------------------------------------
+# Documentation Build
+# -----------------------------------------------------------------------------
+docs/_build/
+site/
+
+# -----------------------------------------------------------------------------
+# Claude Code
+# -----------------------------------------------------------------------------
+.claude/
+
+# Codex
+.codex
+
+# Local planning/runbooks
+tasks/
+
+# Local dumps
+*.dump
+
+# Alembic
+# -----------------------------------------------------------------------------
+# Don't ignore alembic/versions/ - migrations should be committed
+# But ignore any SQLite databases that might end up there
+alembic/*.db

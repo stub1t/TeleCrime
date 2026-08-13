@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+
+{% block content %}
+<style>
+  .retry-btn {
+    padding: 3px 10px;
+    border-radius: 5px;
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    white-space: nowrap;
+  }
+  .retry-btn:hover { background: var(--accent); color: #06161a; }
+  .retry-btn:disabled { opacity: 0.4; cursor: default; }
+  .retry-done { font-size: 11px; color: #a8e6cf; font-weight: 600; }
+  .retry-err  { font-size: 11px; color: var(--danger); }
+</style>
+  <div class="hero-search">
+    <p class="hero-kicker">Operational Health</p>
+    <h2 class="hero-heading">Failure Triage</h2>
+    <p class="hero-sub">Recent failed downloads and extractions with retry context</p>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-chip">
+      <span class="stat-label">Download Failures</span>
+      <span class="stat-value">{{ summary.download_failures }}</span>
+    </div>
+    <div class="stat-chip">
+      <span class="stat-label">Extraction Failures</span>
+      <span class="stat-value">{{ summary.extraction_failures }}</span>
+    </div>
+    <div class="stat-chip">
+      <span class="stat-label">Terminal Downloads</span>
+      <span class="stat-value">{{ summary.terminal_downloads }}</span>
+    </div>
+    <div class="stat-chip">
+      <span class="stat-label">Terminal Extractions</span>
+      <span class="stat-value">{{ summary.terminal_extractions }}</span>
+    </div>
+    <div class="stat-chip">
+      <span class="stat-label">Password Needed</span>
+      <span class="stat-value">{{ summary.password_needed }}</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <h2>Failed Downloads</h2>
+      <span class="mini-note">Most recent acquisition issues</span>
+    </div>
+    {% if failed_downloads %}
+      <div class="table-wrap">
+      <table data-sortable>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>When</th>
+            <th>Status</th>
+            <th>File</th>
+            <th>Error</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for artifact in failed_downloads %}
+          <tr>
+            <td>{{ artifact.id }}</td>
+            <td style="white-space:nowrap;font-size:0.85em" title="{{ artifact.updated_at }}">
+              {% if artifact.updated_at %}
+                {{ artifact.updated_at.strftime('%Y-%m-%d %H:%M') }}
+              {% else %}-{% endif %}
+            </td>
+            <td>{{ artifact.status.value }}</td>
+            <td class="code">{{ artifact.attachment.filename if artifact.attachment and artifact.attachment.filename else (artifact.attachment.platform_file_id if artifact.attachment else '-') }}</td>
+            <td>{{ artifact.error_message or '-' }}</td>
+            <td><button class="retry-btn" onclick="retryItem(this,'download',{{ artifact.id }})">↻ Retry</button></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <div class="empty">No failed downloads.</div>
+    {% endif %}
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <h2>Failed Extractions</h2>
+      <span class="mini-note">Archive/password processing issues</span>
+    </div>
+    {% if failed_extractions %}
+      <div class="table-wrap">
+      <table data-sortable>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>When</th>
+            <th>Status</th>
+            <th>Archive</th>
+            <th>Attempts</th>
+            <th>Passwords Tried</th>
+            <th>Error Code</th>
+            <th>Error</th>
+            <th>Message</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for job in failed_extractions %}
+          {% set pwds = passwords_by_job.get(job.id, []) %}
+          <tr>
+            <td>{{ job.id }}</td>
+            <td style="white-space:nowrap;font-size:0.85em" title="{{ job.updated_at }}">
+              {% if job.updated_at %}
+                {{ job.updated_at.strftime('%Y-%m-%d %H:%M') }}
+              {% else %}-{% endif %}
+            </td>
+            <td>{{ job.status.value }}</td>
+            <td class="code">{{ job.group.base_name if job.group and job.group.base_name else ('group_' ~ job.group_id) }}</td>
+            <td style="text-align:center">{{ job.password_attempts }}</td>
+            <td style="max-width:250px">
+              {% if pwds %}
+                <div style="display:flex;flex-wrap:wrap;gap:4px">
+                  {% for pw in pwds[:10] %}
+                    <code style="font-size:0.8em;padding:1px 4px;background:var(--panel-alt);border:1px solid var(--border);border-radius:3px;word-break:break-all">{{ pw }}</code>
+                  {% endfor %}
+                  {% if pwds|length > 10 %}
+                    <span style="font-size:0.8em;color:var(--muted)">+{{ pwds|length - 10 }} more</span>
+                  {% endif %}
+                </div>
+              {% else %}
+                <span style="color:var(--muted)">none</span>
+              {% endif %}
+            </td>
+            <td>{{ job.last_error_code or '-' }}</td>
+            <td>{{ job.last_error_message or '-' }}</td>
+            <td style="max-width:400px;white-space:pre-wrap;font-size:0.85em">{{ extraction_message_texts.get(job.id) or '-' }}</td>
+            <td>
+              <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-start">
+                <button class="retry-btn" onclick="retryItem(this,'extraction',{{ job.id }})">↻ Retry</button>
+                <button class="retry-btn" style="border-color:var(--muted);color:var(--muted)" onclick="togglePwForm(this,{{ job.id }})">+ Password</button>
+                <div id="pw-form-{{ job.id }}" style="display:none;margin-top:4px">
+                  <input id="pw-input-{{ job.id }}" type="text" placeholder="enter password…"
+                    style="background:var(--panel-alt);border:1px solid var(--border);color:var(--text);padding:3px 6px;font-size:11px;width:140px;font-family:inherit" />
+                  <button class="retry-btn" style="margin-top:4px" onclick="submitPassword(this,{{ job.id }})">↻ Add + Retry</button>
+                </div>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <div class="empty">No failed extractions.</div>
+    {% endif %}
+  </div>
+<script>
+function togglePwForm(btn, id) {
+  var form = document.getElementById('pw-form-' + id);
+  var hidden = form.style.display === 'none';
+  form.style.display = hidden ? 'block' : 'none';
+  if (hidden) document.getElementById('pw-input-' + id).focus();
+}
+function submitPassword(btn, id) {
+  var input = document.getElementById('pw-input-' + id);
+  var pw = input.value.trim();
+  if (!pw) { input.focus(); return; }
+  btn.disabled = true;
+  btn.textContent = '…';
+  var body = new FormData();
+  body.append('password', pw);
+  fetch('/triage/add-password/' + id, {method: 'POST', body: body})
+    .then(r => r.json())
+    .then(data => {
+      if (data.ok) {
+        btn.closest('div').innerHTML = '<span class="retry-done">✓ Added + Queued</span>';
+      } else {
+        btn.disabled = false;
+        btn.textContent = '↻ Add + Retry';
+        btn.insertAdjacentHTML('afterend', '<span class="retry-err" style="margin-left:4px">' + (data.error || 'Error') + '</span>');
+      }
+    })
+    .catch(() => { btn.disabled = false; btn.textContent = '↻ Add + Retry'; });
+}
+function retryItem(btn, type, id) {
+  btn.disabled = true;
+  btn.textContent = '…';
+  fetch('/triage/retry/' + type + '/' + id, {method: 'POST'})
+    .then(r => r.json())
+    .then(data => {
+      if (data.ok) {
+        btn.outerHTML = '<span class="retry-done">✓ Queued</span>';
+      } else {
+        btn.outerHTML = '<span class="retry-err">' + (data.error || 'Error') + '</span>';
+      }
+    })
+    .catch(() => {
+      btn.outerHTML = '<span class="retry-err">Network error</span>';
+    });
+}
+</script>
+{% endblock %}

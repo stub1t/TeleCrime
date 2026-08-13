@@ -1,0 +1,97 @@
+<div id="scheduler-jobs"
+     hx-get="/scheduler/jobs-fragment"
+     hx-trigger="every 30s"
+     hx-swap="outerHTML">
+
+{% if flash %}
+<div class="flash{% if flash_type == 'error' %} err{% endif %}">{{ flash }}</div>
+{% endif %}
+
+<div class="job-grid">
+{% for job in jobs %}
+  {% if job.running %}
+    {% set card_cls = "job-card running" %}
+    {% set badge_cls = "job-badge badge-running" %}
+    {% set badge_txt = "Running…" %}
+  {% elif not job.enabled %}
+    {% set card_cls = "job-card" %}
+    {% set badge_cls = "job-badge badge-disabled" %}
+    {% set badge_txt = "Disabled" %}
+  {% elif job.last_error %}
+    {% set card_cls = "job-card error" %}
+    {% set badge_cls = "job-badge badge-error" %}
+    {% set badge_txt = "Error" %}
+  {% elif job.last_result %}
+    {% set card_cls = "job-card" %}
+    {% set badge_cls = "job-badge badge-ok" %}
+    {% set badge_txt = "OK" %}
+  {% else %}
+    {% set card_cls = "job-card" %}
+    {% set badge_cls = "job-badge badge-pending" %}
+    {% set badge_txt = "Pending" %}
+  {% endif %}
+  <div class="{{ card_cls }}">
+    <div class="job-header">
+      <span class="job-name">{{ job.name.replace("_", " ").title() }}</span>
+      <span class="{{ badge_cls }}">
+        {% if job.running %}<span class="spinner-inline"></span> {% endif %}
+        {{ badge_txt }}
+      </span>
+    </div>
+    <div class="job-desc">{{ job.description }}</div>
+    <div class="job-meta">
+      <div class="meta-row">
+        <span class="meta-label">Interval</span>
+        <span class="meta-value">
+          <span class="interval-badge">every {{ job.interval_hours }}h</span>
+          {% if job.requires_telegram %}<span class="interval-badge" style="margin-left:4px">requires Telegram</span>{% endif %}
+        </span>
+      </div>
+      {% if job.last_run %}
+      <div class="meta-row">
+        <span class="meta-label">Last run</span>
+        <span class="meta-value">{{ job.last_run[:19].replace("T"," ") }} UTC</span>
+      </div>
+      {% endif %}
+      {% if job.last_result %}
+      <div class="meta-row">
+        <span class="meta-label">Result</span>
+        <span class="meta-value ok">{{ job.last_result }}</span>
+      </div>
+      {% endif %}
+      {% if job.last_error %}
+      <div class="meta-row">
+        <span class="meta-label">Error</span>
+        <span class="meta-value err">{{ job.last_error[:200] }}</span>
+      </div>
+      {% endif %}
+      {% if job.next_run %}
+      <div class="meta-row">
+        <span class="meta-label">Next run</span>
+        <span class="meta-value">{{ job.next_run[:19].replace("T"," ") }} UTC</span>
+      </div>
+      {% endif %}
+    </div>
+    {% if job.enabled %}
+    <form hx-post="/scheduler/run/{{ job.name }}"
+          hx-target="#scheduler-jobs"
+          hx-swap="outerHTML"
+          style="margin:0">
+      <button type="submit" class="trigger-btn" {% if job.running %}disabled{% endif %}>
+        ▶ Run Now
+      </button>
+    </form>
+    {% endif %}
+  </div>
+{% endfor %}
+</div>
+
+<div class="section" style="margin-top:32px">
+  <p class="muted" style="font-size:12px">
+    The worker process (<code>telecrime worker</code>) must be running for scheduled jobs to execute automatically.
+    If no worker is running, use "Run Now" or <code>telecrime run</code> / <code>telecrime channels --subscribe</code> from the CLI.
+    This panel refreshes every 30s.
+  </p>
+</div>
+
+</div>

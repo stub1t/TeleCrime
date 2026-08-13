@@ -1,0 +1,86 @@
+services:
+  db:
+    image: postgres:16-alpine
+    command: >
+      postgres
+      -c shared_buffers=8GB
+      -c effective_cache_size=14GB
+      -c work_mem=64MB
+      -c random_page_cost=2.0
+      -c autovacuum_vacuum_scale_factor=0.05
+      -c autovacuum_work_mem=1GB
+      -c max_wal_size=8GB
+      -c min_wal_size=1GB
+      -c wal_buffers=64MB
+      -c checkpoint_completion_target=0.7
+      -c maintenance_work_mem=512MB
+      -c effective_io_concurrency=200
+      -c statement_timeout=5min
+      -c lock_timeout=30s
+      -c idle_in_transaction_session_timeout=10min
+    environment:
+      POSTGRES_DB: telecrime
+      POSTGRES_USER: telecrime
+      POSTGRES_PASSWORD: ${TELECRIME_POSTGRES_PASSWORD:-telecrime}
+    ports:
+      - "5432:5432"
+    shm_size: 1g
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telecrime"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    command: >
+      sh -c "uv run alembic upgrade head &&
+             uv run python -m telecrime dashboard --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - /mnt/telecrime/data:/app/data
+    environment:
+      TELECRIME_DATABASE_URL: "postgresql://telecrime:${TELECRIME_POSTGRES_PASSWORD:-telecrime}@db:5432/telecrime"
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/').status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  worker:
+    build: .
+    command: ["uv", "run", "python", "-m", "telecrime", "worker"]
+    stop_grace_period: 24h
+    volumes:
+      - /mnt/telecrime/data:/app/data
+    environment:
+      TELECRIME_DATABASE_URL: "postgresql://telecrime:${TELECRIME_POSTGRES_PASSWORD:-telecrime}@db:5432/telecrime"
+      # Bumped from default 1200s — orphan EXTRACTED groups can contain
+      # multi-GB credential text files (e.g. ULP dumps) that legitimately
+      # take 25-40 min of pure-Python regex parsing per file. Watchdog
+      # still detects truly dead subprocesses via the PID-liveness check.
+      TELECRIME_PIPELINE_STALE_SECONDS: "3600"
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    external: true
+    name: telecrime_postgres_data_restored
