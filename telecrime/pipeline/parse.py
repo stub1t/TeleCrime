@@ -153,6 +153,34 @@ def _is_dup_batch(new_count: int, dup_count: int, batch_size: int) -> bool:
     return total >= batch_size // 2 and (dup_count / total) >= 0.95
 
 
+def _hash64_expr(alias: str) -> str:
+    """SQL expression for the compact 64-bit credential-hash fingerprint.
+
+    First 16 hex chars of the SHA256 credential_hash cast to bigint. Matches
+    the ix_pc_hash64 expression index exactly.
+    """
+    return f"CAST((CAST((chr(120) || substring({alias}.credential_hash, 1, 16)) AS bit(64))) AS bigint)"
+
+
+_HAS_HASH64: bool | None = None  # resolved lazily against the live schema
+
+
+def _has_hash64_index(engine) -> bool:
+    """True when ix_pc_hash64 (compact dedup index) exists on parsed_credentials."""
+    global _HAS_HASH64
+    if _HAS_HASH64 is not None:
+        return _HAS_HASH64
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT 1 FROM pg_indexes WHERE tablename='parsed_credentials' AND indexname='ix_pc_hash64'")
+            ).fetchone()
+        _HAS_HASH64 = row is not None
+    except Exception:
+        _HAS_HASH64 = False
+    return _HAS_HASH64
+
+
 class ParseStage(PipelineStage):
     """Parse extracted stealer logs for credentials."""
 
@@ -864,26 +892,36 @@ class ParseStage(PipelineStage):
                         )
 
                         # Two-stage dedup:
-                        #  1. NOT EXISTS against the compact 128-bit prefix index
-                        #     (ix_pc_credential_hash_prefix, ~16GB vs 33GB) — the
-                        #     bulk of duplicates are rejected here, in a much
-                        #     smaller, more cache-friendly index tree.
+                        #  1. Anti-join against a compact hash index to reject
+                        #     the bulk of duplicates in one pass. The 64-bit
+                        #     expression index (ix_pc_hash64, ~5GB) is far more
+                        #     cache-resident than the 128-bit prefix index
+                        #     (ix_pc_credential_hash_prefix, ~16GB), so per-row
+                        #     probes hit shared_buffers instead of disk.
                         #  2. ON CONFLICT (credential_hash) stays as the exact
-                        #     correctness backstop for prefix collisions (risk
-                        #     ~2^-64 per pair, negligible at 299M rows).
-                        # NULL credential_hashes are passed straight through
-                        # (exactly as plain ON CONFLICT treated them before).
-                        cursor.execute(
-                            f"INSERT INTO parsed_credentials ({col_list}) "
-                            f"SELECT {col_list} FROM _pc_staging s "
-                            "WHERE s.credential_hash IS NULL "
-                            "OR NOT EXISTS ("
-                            "  SELECT 1 FROM parsed_credentials p "
-                            "  WHERE left(p.credential_hash, 32) = left(s.credential_hash, 32)"
-                            ") "
-                            "ON CONFLICT (credential_hash) DO NOTHING "
-                            "RETURNING credential_hash, domain"
-                        )
+                        #     correctness backstop for hash collisions (risk
+                        #     ~2^-62 per pair, negligible at 299M rows).
+                        # NULL credential_hashes pass straight through.
+                        if _has_hash64_index(ctx.session.get_bind()):
+                            cursor.execute(
+                                f"INSERT INTO parsed_credentials ({col_list}) "
+                                f"SELECT {col_list} FROM _pc_staging s "
+                                "LEFT JOIN parsed_credentials p "
+                                f"  ON {_hash64_expr('p')} = {_hash64_expr('s')} "
+                                "WHERE s.credential_hash IS NULL OR p.id IS NULL "
+                                "ON CONFLICT (credential_hash) DO NOTHING "
+                                "RETURNING credential_hash, domain"
+                            )
+                        else:
+                            cursor.execute(
+                                f"INSERT INTO parsed_credentials ({col_list}) "
+                                f"SELECT {col_list} FROM _pc_staging s "
+                                "LEFT JOIN parsed_credentials p "
+                                "  ON left(p.credential_hash, 32) = left(s.credential_hash, 32) "
+                                "WHERE s.credential_hash IS NULL OR p.id IS NULL "
+                                "ON CONFLICT (credential_hash) DO NOTHING "
+                                "RETURNING credential_hash, domain"
+                            )
                         rows_returned = cursor.fetchall()
                     finally:
                         cursor.close()

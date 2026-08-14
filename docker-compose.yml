@@ -72,6 +72,12 @@ services:
       # take 25-40 min of pure-Python regex parsing per file. Watchdog
       # still detects truly dead subprocesses via the PID-liveness check.
       TELECRIME_PIPELINE_STALE_SECONDS: "3600"
+      # Sequential group processing: every READY group inserts into the same
+      # 196GB parsed_credentials table, so parallel inserts only contend for
+      # the same dedup indexes (34GB exact + 16GB prefix + 38GB trgm) and
+      # multiply the I/O wait. One focused insert stream beats N competing
+      # ones on this disk-bound workload.
+      TELECRIME_READY_GROUP_CONCURRENCY: "1"
     env_file:
       - path: .env
         required: false
