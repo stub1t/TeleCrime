@@ -2,77 +2,77 @@
 
 {% block content %}
 
-<div class="page-head">
+<div class="topbar">
   <div>
+    <div class="kicker">Signal Console</div>
     <h1>Overview</h1>
-    <p>Live pipeline status, recent activity, and credential growth</p>
   </div>
   {% if last_run %}
-    <span class="mini-note">
-      Last run: {{ last_run.started_at.strftime("%Y-%m-%d %H:%M") if last_run.started_at else "—" }}
-      · {{ "running" if last_run.status == "running" else last_run.status }}
-    </span>
+    <div class="topbar-note">
+      last run <span>{{ last_run.started_at.strftime("%Y-%m-%d %H:%M") if last_run.started_at else "—" }}</span>
+      · status <span class="{% if last_run.status == 'running' %}live{% else %}muted{% endif %}">{{ last_run.status }}</span>
+    </div>
   {% endif %}
 </div>
 
-{# ── KPI cards ──────────────────────────────────────────────────────────── #}
-<div class="kpi-grid">
-  <div class="kpi">
-    <div class="kpi-label">Credentials</div>
-    <div class="kpi-value accent">{{ "{:,}".format(stats.credentials | default(0)) }}</div>
-    <div class="kpi-sub">parsed credentials in DB</div>
+{# ── Instrument readouts ────────────────────────────────────────────────── #}
+<div class="readouts">
+  <div class="readout">
+    <div class="ro-label"><span class="lamp on"></span> Credentials</div>
+    <div class="ro-value signal">{{ "{:,}".format(stats.credentials | default(0)) }}</div>
+    <div class="ro-sub">parsed and stored</div>
   </div>
-  <div class="kpi">
-    <div class="kpi-label">Channels</div>
-    <div class="kpi-value accent2">{{ "{:,}".format(stats.channels | default(0)) }}</div>
-    <div class="kpi-sub">tracked channels</div>
+  <div class="readout">
+    <div class="ro-label">Channels</div>
+    <div class="ro-value">{{ "{:,}".format(stats.channels | default(0)) }}</div>
+    <div class="ro-sub">tracked</div>
   </div>
-  <div class="kpi">
-    <div class="kpi-label">Messages</div>
-    <div class="kpi-value">{{ "{:,}".format(stats.messages | default(0)) }}</div>
-    <div class="kpi-sub">ingested messages</div>
+  <div class="readout">
+    <div class="ro-label">Messages</div>
+    <div class="ro-value">{{ "{:,}".format(stats.messages | default(0)) }}</div>
+    <div class="ro-sub">ingested</div>
   </div>
-  <div class="kpi">
-    <div class="kpi-label">Archives</div>
-    <div class="kpi-value">{{ "{:,}".format(stats.archives | default(0)) }}</div>
-    <div class="kpi-sub">archives processed</div>
+  <div class="readout">
+    <div class="ro-label">Archives</div>
+    <div class="ro-value">{{ "{:,}".format(stats.archives | default(0)) }}</div>
+    <div class="ro-sub">processed</div>
   </div>
-  <div class="kpi">
-    <div class="kpi-label">Conversations</div>
-    <div class="kpi-value">{{ "{:,}".format(stats.conversations | default(0)) }}</div>
-    <div class="kpi-sub">chats &amp; groups</div>
+  <div class="readout">
+    <div class="ro-label">Conversations</div>
+    <div class="ro-value">{{ "{:,}".format(stats.conversations | default(0)) }}</div>
+    <div class="ro-sub">chats and groups</div>
   </div>
-  <div class="kpi">
-    <div class="kpi-label">Attachments</div>
-    <div class="kpi-value">{{ "{:,}".format(stats.attachments | default(0)) }}</div>
-    <div class="kpi-sub">files seen</div>
+  <div class="readout">
+    <div class="ro-label">Attachments</div>
+    <div class="ro-value">{{ "{:,}".format(stats.attachments | default(0)) }}</div>
+    <div class="ro-sub">files seen</div>
   </div>
 </div>
 
-<div style="display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:18px;align-items:start;">
-  <div style="display:flex;flex-direction:column;gap:18px;min-width:0;">
+<div class="ops-grid">
+  <div class="stack">
 
-    {# ── Live pipeline ops (HTMX) ─────────────────────────────────────────── #}
+    {# ── Live pipeline ops ────────────────────────────────────────────────── #}
     <div hx-get="/api/home/ops-fragment" hx-trigger="load" hx-swap="outerHTML">
-      <div class="panel" style="color:var(--muted);font-size:13px;">Loading pipeline status…</div>
+      <div class="panel" style="color:var(--ink-faint);font-size:13px;">Polling pipeline status…</div>
     </div>
 
-    {# ── Credential growth chart ──────────────────────────────────────────── #}
+    {# ── Credential growth ────────────────────────────────────────────────── #}
     {% if daily_credentials_14d %}
     <div class="card">
-      <div class="section-header">
-        <h3>Credential growth — last 14 days</h3>
+      <div class="section-head">
+        <h3>Credential growth · last 14 days</h3>
       </div>
-      <div style="height:220px"><canvas id="chartCredTrend"></canvas></div>
+      <div style="height:210px"><canvas id="chartCredTrend"></canvas></div>
     </div>
     {% endif %}
 
     {# ── Recent runs ──────────────────────────────────────────────────────── #}
     {% if recent_runs %}
     <div class="card">
-      <div class="section-header">
-        <h3>Recent pipeline runs</h3>
-        <a href="/scheduler" style="font-size:12px;">View scheduler →</a>
+      <div class="section-head">
+        <h3>Recent runs</h3>
+        <a href="/scheduler" style="font-size:11px;font-family:var(--mono);">scheduler →</a>
       </div>
       <div class="table-wrap">
         <table data-sortable>
@@ -90,13 +90,11 @@
             {% for run in recent_runs %}
             <tr>
               <td class="code">#{{ run.id }}</td>
-              <td><span class="pill">{{ run.mode }}</span></td>
+              <td><span class="tag">{{ run.mode }}</span></td>
               <td class="code">{{ run.started_at.strftime("%Y-%m-%d %H:%M") if run.started_at else "—" }}</td>
-              <td class="code">
-                {% if run.duration_seconds %}{{ "{:.0f}".format(run.duration_seconds // 60) }}m{% else %}—{% endif %}
-              </td>
+              <td class="code">{% if run.duration_seconds %}{{ "{:.0f}".format(run.duration_seconds // 60) }}m{% else %}—{% endif %}</td>
               <td class="code">{{ "{:,}".format(run.credentials_parsed | default(0)) }}</td>
-              <td class="code">{% if run.error_count %}<span style="color:var(--danger)">{{ run.error_count }}</span>{% else %}<span style="color:var(--muted)">0</span>{% endif %}</td>
+              <td class="code">{% if run.error_count %}<span style="color:var(--bad)">{{ run.error_count }}</span>{% else %}<span class="muted">0</span>{% endif %}</td>
             </tr>
             {% endfor %}
           </tbody>
@@ -108,9 +106,9 @@
     {# ── Recent credentials ───────────────────────────────────────────────── #}
     {% if recent_credentials %}
     <div class="card">
-      <div class="section-header">
-        <h3>Recently parsed credentials</h3>
-        <a href="/search" style="font-size:12px;">Search →</a>
+      <div class="section-head">
+        <h3>Recently parsed</h3>
+        <a href="/search" style="font-size:11px;font-family:var(--mono);">search →</a>
       </div>
       <div class="table-wrap">
         <table data-sortable>
@@ -127,7 +125,7 @@
             <tr>
               <td><a href="/search?q={{ cred.domain | urlencode }}">{{ cred.domain or cred.url }}</a></td>
               <td class="code">{{ cred.username | truncate(40, True, '…') }}</td>
-              <td>{% if cred.stealer_type %}<span class="stealer-badge">{{ cred.stealer_type }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+              <td>{% if cred.stealer_type %}<span class="tag signal">{{ cred.stealer_type }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
               <td class="code muted">{{ cred.created_at.strftime("%H:%M:%S") if cred.created_at else "—" }}</td>
             </tr>
             {% endfor %}
@@ -139,8 +137,8 @@
 
   </div>
 
-  {# ── Right column: quick search + watchlist alerts ──────────────────────── #}
-  <div style="display:flex;flex-direction:column;gap:18px;">
+  {# ── Side column ───────────────────────────────────────────────────────── #}
+  <div class="stack">
 
     <div class="card">
       <h3>Quick search</h3>
@@ -159,9 +157,9 @@
 
     {% if watchlist_alerts %}
     <div class="card">
-      <div class="section-header">
+      <div class="section-head">
         <h3>Watchlist alerts</h3>
-        <span class="pill" style="background:color-mix(in srgb, var(--danger) 15%, transparent);color:var(--danger);">{{ watchlist_alerts | length }}</span>
+        <span class="tag bad">{{ watchlist_alerts | length }}</span>
       </div>
       <div class="watchlist-alert-grid">
         {% for item in watchlist_alerts %}
@@ -194,10 +192,9 @@
       datasets: [{
         label: 'Credentials',
         data: data.map(function(d) { return d.count; }),
-        backgroundColor: c.accent + '66',
+        backgroundColor: c.accent + '44',
         borderColor: c.accent,
-        borderWidth: 1.5,
-        borderRadius: 4,
+        borderWidth: 1,
       }]
     },
     options: {
