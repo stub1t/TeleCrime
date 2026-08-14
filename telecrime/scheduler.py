@@ -1760,6 +1760,14 @@ class TelecrimeWorker:
     def start(self) -> None:
         from apscheduler.schedulers.background import BackgroundScheduler
 
+        # PIDs written by a previous worker container refer to that container's
+        # PID namespace. After a container restart they are meaningless (a PID
+        # may even alias an unrelated process), so the watchdog could see a
+        # healthy newly spawned pipeline as "disappeared" and kill it. Drop the
+        # stale PID before the watchdog runs; the pipeline job rewrites it on
+        # the next spawn.
+        _clear_pipeline_pid()
+
         self._scheduler = BackgroundScheduler()
         has_tg = self._has_telegram()
 
