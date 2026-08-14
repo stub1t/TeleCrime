@@ -2,88 +2,166 @@
 
 {% block content %}
 
-<style>
-  .ops-layout {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 340px;
-    gap: 20px;
-    align-items: start;
-  }
-  .watchlist-alert-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 10px;
-  }
-  .watchlist-alert-card {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 12px 14px;
-    border: 1px solid var(--danger);
-    background: transparent;
-    text-decoration: none;
-    color: var(--text);
-    transition: background 0.15s;
-  }
-  .watchlist-alert-card:hover {
-    background: rgba(255, 79, 79, 0.06);
-  }
-  .watchlist-alert-count {
-    font-size: 20px;
-    font-weight: 700;
-    color: var(--danger);
-  }
-  .watchlist-alert-label {
-    font-size: 13px;
-    font-weight: 600;
-  }
-  .watchlist-alert-query {
-    font-size: 11px;
-    color: var(--muted);
-  }
-  @media (max-width: 900px) {
-    .ops-layout { grid-template-columns: 1fr; }
-  }
-</style>
-
-<div class="ops-layout">
-
-  {# ── Left: live ops panel (HTMX, refreshes every 5s) ─────────────────── #}
+<div class="page-head">
   <div>
+    <h1>Overview</h1>
+    <p>Live pipeline status, recent activity, and credential growth</p>
+  </div>
+  {% if last_run %}
+    <span class="mini-note">
+      Last run: {{ last_run.started_at.strftime("%Y-%m-%d %H:%M") if last_run.started_at else "—" }}
+      · {{ "running" if last_run.status == "running" else last_run.status }}
+    </span>
+  {% endif %}
+</div>
+
+{# ── KPI cards ──────────────────────────────────────────────────────────── #}
+<div class="kpi-grid">
+  <div class="kpi">
+    <div class="kpi-label">Credentials</div>
+    <div class="kpi-value accent">{{ "{:,}".format(stats.credentials | default(0)) }}</div>
+    <div class="kpi-sub">parsed credentials in DB</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Channels</div>
+    <div class="kpi-value accent2">{{ "{:,}".format(stats.channels | default(0)) }}</div>
+    <div class="kpi-sub">tracked channels</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Messages</div>
+    <div class="kpi-value">{{ "{:,}".format(stats.messages | default(0)) }}</div>
+    <div class="kpi-sub">ingested messages</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Archives</div>
+    <div class="kpi-value">{{ "{:,}".format(stats.archives | default(0)) }}</div>
+    <div class="kpi-sub">archives processed</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Conversations</div>
+    <div class="kpi-value">{{ "{:,}".format(stats.conversations | default(0)) }}</div>
+    <div class="kpi-sub">chats &amp; groups</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Attachments</div>
+    <div class="kpi-value">{{ "{:,}".format(stats.attachments | default(0)) }}</div>
+    <div class="kpi-sub">files seen</div>
+  </div>
+</div>
+
+<div style="display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:18px;align-items:start;">
+  <div style="display:flex;flex-direction:column;gap:18px;min-width:0;">
+
+    {# ── Live pipeline ops (HTMX) ─────────────────────────────────────────── #}
     <div hx-get="/api/home/ops-fragment" hx-trigger="load" hx-swap="outerHTML">
-      <div style="border:1px solid var(--border);background:var(--panel);padding:20px;color:var(--muted);font-size:12px;">
-        [ LOADING… ]
+      <div class="panel" style="color:var(--muted);font-size:13px;">Loading pipeline status…</div>
+    </div>
+
+    {# ── Credential growth chart ──────────────────────────────────────────── #}
+    {% if daily_credentials_14d %}
+    <div class="card">
+      <div class="section-header">
+        <h3>Credential growth — last 14 days</h3>
+      </div>
+      <div style="height:220px"><canvas id="chartCredTrend"></canvas></div>
+    </div>
+    {% endif %}
+
+    {# ── Recent runs ──────────────────────────────────────────────────────── #}
+    {% if recent_runs %}
+    <div class="card">
+      <div class="section-header">
+        <h3>Recent pipeline runs</h3>
+        <a href="/scheduler" style="font-size:12px;">View scheduler →</a>
+      </div>
+      <div class="table-wrap">
+        <table data-sortable>
+          <thead>
+            <tr>
+              <th>Run</th>
+              <th>Mode</th>
+              <th>Started</th>
+              <th>Duration</th>
+              <th>Credentials</th>
+              <th>Errors</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for run in recent_runs %}
+            <tr>
+              <td class="code">#{{ run.id }}</td>
+              <td><span class="pill">{{ run.mode }}</span></td>
+              <td class="code">{{ run.started_at.strftime("%Y-%m-%d %H:%M") if run.started_at else "—" }}</td>
+              <td class="code">
+                {% if run.duration_seconds %}{{ "{:.0f}".format(run.duration_seconds // 60) }}m{% else %}—{% endif %}
+              </td>
+              <td class="code">{{ "{:,}".format(run.credentials_parsed | default(0)) }}</td>
+              <td class="code">{% if run.error_count %}<span style="color:var(--danger)">{{ run.error_count }}</span>{% else %}<span style="color:var(--muted)">0</span>{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
       </div>
     </div>
+    {% endif %}
+
+    {# ── Recent credentials ───────────────────────────────────────────────── #}
+    {% if recent_credentials %}
+    <div class="card">
+      <div class="section-header">
+        <h3>Recently parsed credentials</h3>
+        <a href="/search" style="font-size:12px;">Search →</a>
+      </div>
+      <div class="table-wrap">
+        <table data-sortable>
+          <thead>
+            <tr>
+              <th>Domain</th>
+              <th>Username</th>
+              <th>Stealer</th>
+              <th>When</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for cred in recent_credentials %}
+            <tr>
+              <td><a href="/search?q={{ cred.domain | urlencode }}">{{ cred.domain or cred.url }}</a></td>
+              <td class="code">{{ cred.username | truncate(40, True, '…') }}</td>
+              <td>{% if cred.stealer_type %}<span class="stealer-badge">{{ cred.stealer_type }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+              <td class="code muted">{{ cred.created_at.strftime("%H:%M:%S") if cred.created_at else "—" }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+
   </div>
 
-  {# ── Right: watchlist alerts + quick search ───────────────────────────── #}
-  <div style="display:flex;flex-direction:column;gap:16px;">
+  {# ── Right column: quick search + watchlist alerts ──────────────────────── #}
+  <div style="display:flex;flex-direction:column;gap:18px;">
 
-    {# Quick search #}
-    <div style="border:1px solid var(--border);background:var(--panel);padding:14px;">
-      <div style="font-size:11px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px;">SEARCH</div>
-      <form action="/search" method="get" style="display:flex;gap:0;">
-        <input type="text" name="q" placeholder="domain, user, URL…"
-               style="flex:1;padding:8px 10px;border:1px solid var(--border);border-right:none;background:var(--bg);color:var(--text);font-family:inherit;font-size:12px;outline:none;" />
-        <button type="submit"
-                style="padding:8px 14px;border:1px solid var(--accent);background:var(--accent);color:#06161a;font-family:inherit;font-size:12px;font-weight:600;cursor:pointer;">GO</button>
+    <div class="card">
+      <h3>Quick search</h3>
+      <form action="/search" method="get" class="hero-form" style="max-width:none;margin:0;">
+        <input type="text" name="q" placeholder="domain, user, URL…" />
+        <button type="submit">Search</button>
       </form>
-      <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;">
-        <a href="/search?q=google.com" style="font-size:11px;color:var(--muted);text-decoration:none;border:1px solid var(--border);padding:2px 7px;">google.com</a>
-        <a href="/search?q=stealer:redline" style="font-size:11px;color:var(--muted);text-decoration:none;border:1px solid var(--border);padding:2px 7px;">stealer:redline</a>
-        <a href="/search?q=domain:paypal.com" style="font-size:11px;color:var(--muted);text-decoration:none;border:1px solid var(--border);padding:2px 7px;">domain:paypal.com</a>
-        <a href="/search?q=since:24h" style="font-size:11px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:2px 7px;">since:24h</a>
-        <a href="/search?q=since:7d" style="font-size:11px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:2px 7px;">since:7d</a>
+      <div class="hero-hints" style="justify-content:flex-start;margin-top:12px;">
+        <a href="/search?q=google.com">google.com</a>
+        <a href="/search?q=stealer:redline">stealer:redline</a>
+        <a href="/search?q=domain:paypal.com">domain:paypal.com</a>
+        <a href="/search?q=since:24h">since:24h</a>
+        <a href="/search?q=since:7d">since:7d</a>
       </div>
     </div>
 
-    {# Watchlist alerts #}
     {% if watchlist_alerts %}
-    <div style="border:1px solid var(--border);background:var(--panel);padding:14px;">
-      <div style="font-size:11px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px;">
-        WATCHLIST ALERTS
-        <span style="color:var(--danger);margin-left:6px;">{{ watchlist_alerts | length }}</span>
+    <div class="card">
+      <div class="section-header">
+        <h3>Watchlist alerts</h3>
+        <span class="pill" style="background:color-mix(in srgb, var(--danger) 15%, transparent);color:var(--danger);">{{ watchlist_alerts | length }}</span>
       </div>
       <div class="watchlist-alert-grid">
         {% for item in watchlist_alerts %}
@@ -98,30 +176,41 @@
     </div>
     {% endif %}
 
-    {# Stat chips #}
-    <div style="border:1px solid var(--border);background:var(--panel);padding:14px;">
-      <div style="font-size:11px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px;">DATABASE</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <div style="padding:10px 12px;background:var(--panel-alt);border:1px solid var(--border);">
-          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Credentials</div>
-          <div style="font-size:18px;font-weight:700;color:var(--accent);margin-top:4px;">{{ "{:,}".format(stats.credentials | default(0)) }}</div>
-        </div>
-        <div style="padding:10px 12px;background:var(--panel-alt);border:1px solid var(--border);">
-          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Channels</div>
-          <div style="font-size:18px;font-weight:700;color:var(--accent-2);margin-top:4px;">{{ "{:,}".format(stats.channels | default(0)) }}</div>
-        </div>
-        <div style="padding:10px 12px;background:var(--panel-alt);border:1px solid var(--border);">
-          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Messages</div>
-          <div style="font-size:18px;font-weight:700;color:var(--text);margin-top:4px;">{{ "{:,}".format(stats.messages | default(0)) }}</div>
-        </div>
-        <div style="padding:10px 12px;background:var(--panel-alt);border:1px solid var(--border);">
-          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Archives</div>
-          <div style="font-size:18px;font-weight:700;color:var(--text);margin-top:4px;">{{ "{:,}".format(stats.archives | default(0)) }}</div>
-        </div>
-      </div>
-    </div>
-
   </div>
 </div>
+
+<script>
+(function() {
+  if (!window.Chart) return;
+  var data = {{ daily_credentials_14d | tojson }};
+  if (!data || !data.length) return;
+  var el = document.getElementById('chartCredTrend');
+  if (!el) return;
+  var c = tcChartColors();
+  new Chart(el, {
+    type: 'bar',
+    data: {
+      labels: data.map(function(d) { return d.day; }),
+      datasets: [{
+        label: 'Credentials',
+        data: data.map(function(d) { return d.count; }),
+        backgroundColor: c.accent + '66',
+        borderColor: c.accent,
+        borderWidth: 1.5,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: c.muted, maxRotation: 45, font: { size: 11 } }, grid: { display: false } },
+        y: { ticks: { color: c.muted }, grid: { color: c.border }, beginAtZero: true },
+      },
+    }
+  });
+})();
+</script>
 
 {% endblock %}

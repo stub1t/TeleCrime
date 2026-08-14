@@ -2693,6 +2693,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         if debug:
             print(f"search: saved_searches {(time.time() - t0) * 1000:.1f} ms")
 
+        cred_search_degraded = False
         if query or source_conv > 0:
             with get_session(engine) as session:
                 excluded_conversations, excluded_channels = _get_exclusions(session)
@@ -2706,7 +2707,6 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 credential_ids: list[int] | None = None
                 filter_clause = _credential_filter_clause(filters)
                 fts_available = app.state.fts_enabled and terms
-                cred_search_degraded = False
 
                 if fts_available:
                     # For regex mode, fetch more candidates from FTS then filter in Python
