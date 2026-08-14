@@ -1073,6 +1073,7 @@ class TestParseStageChunkedInsert:
 
         # 1-row chunks so we can target the middle chunk precisely.
         monkeypatch.setattr(parse_mod, "_INSERT_CHUNK_SIZE", 1)
+        monkeypatch.setattr(parse_mod, "_INSERT_CHUNK_SIZE_SQLITE", 1)
 
         def _row(host: str) -> dict:
             return {
@@ -1474,3 +1475,19 @@ class TestFinalizeStageCredentialCount:
         session.refresh(group)
         assert group.credential_count == 3
         assert group.status.value == "cleaned"
+
+
+class TestParseEarlyDupSkip:
+    """Tests for the duplicate-heavy file early-exit heuristic."""
+
+    def test_dup_ratio_detection(self):
+        """_is_dup_batch correctly flags batches at/above the 95% threshold."""
+        from telecrime.pipeline.parse import _is_dup_batch
+
+        # Total below half the batch size never triggers (not enough signal).
+        assert _is_dup_batch(1, 1, 20000) is False
+        # 95%+ duplicates in a full batch triggers.
+        assert _is_dup_batch(500, 19500, 20000) is True
+        assert _is_dup_batch(1000, 19000, 20000) is True
+        # 94% does not.
+        assert _is_dup_batch(1200, 18800, 20000) is False

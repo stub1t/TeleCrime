@@ -116,7 +116,13 @@ def _save_system_info(session, job_id: int, sysinfo) -> None:
 
 
 _BATCH_SIZE = 20_000
-_INSERT_CHUNK_SIZE = 10_000
+# COPY+INSERT chunk size. Larger chunks amortize the staging-table DDL and
+# COPY round-trip over more rows; the two-stage dedup then filters the bulk
+# of duplicates in one pass before the exact unique-index check.
+# PostgreSQL handles 50K rows easily; SQLite (test fixtures) is capped by its
+# 999 SQL-variable limit, so the values path keeps the smaller size.
+_INSERT_CHUNK_SIZE = 50_000
+_INSERT_CHUNK_SIZE_SQLITE = 10_000
 
 
 def _apply_pg_bulk_settings(session) -> None:
@@ -139,6 +145,12 @@ def _reset_pg_bulk_settings(session) -> None:
         session.execute(text("SET maintenance_work_mem = DEFAULT"))
     except Exception:
         pass
+
+
+def _is_dup_batch(new_count: int, dup_count: int, batch_size: int) -> bool:
+    """True when a batch is dominated by duplicates (early-skip signal)."""
+    total = new_count + dup_count
+    return total >= batch_size // 2 and (dup_count / total) >= 0.95
 
 
 class ParseStage(PipelineStage):
@@ -610,6 +622,16 @@ class ParseStage(PipelineStage):
                 return new_count, dup_count
 
             batches_since_commit = 0
+            # Early-exit heuristic for duplicate-heavy files: stealer logs are
+            # reposted across channels, so a file whose first batches are
+            # ~all duplicates is almost certainly content we already parsed.
+            # Aborting after a few high-dup batches avoids spending minutes on
+            # per-row index lookups against the 34GB credential_hash index
+            # for rows that will all be rejected anyway.
+            dup_batches_seen = 0
+            dup_confirm_batches = 3  # consecutive batches above the threshold
+            file_skipped_as_dup = False
+
             # Large files (>20MB) are parsed in parallel worker processes via
             # _iter_parallel_credentials; small files keep the sequential path
             # (lower overhead, and the tests exercise that path directly).
@@ -624,6 +646,8 @@ class ParseStage(PipelineStage):
                     file_path, str(file_path), workers
                 )
                 async for tup in credential_iter:
+                    if file_skipped_as_dup:
+                        break
                     url, username, password, application, profile = tup
                     cred = Credential(
                         url=url,
@@ -655,8 +679,21 @@ class ParseStage(PipelineStage):
                             batches_since_commit = 0
                         # Yield to event loop between batches so downloads can progress
                         await asyncio.sleep(0)
+
+                        if _is_dup_batch(new, dups, _BATCH_SIZE):
+                            dup_batches_seen += 1
+                            if dup_batches_seen >= dup_confirm_batches:
+                                file_skipped_as_dup = True
+                                logger.info(
+                                    "Early-skip %s: %d consecutive batches at %.0f%% duplicates",
+                                    file_path.name, dup_batches_seen, (dups / (new + dups)) * 100,
+                                )
+                        else:
+                            dup_batches_seen = 0
             else:
                 for cred in iter_credentials_file(file_path):
+                    if file_skipped_as_dup:
+                        break
                     batch.append(cred)
                     file_cred_count += 1
 
@@ -679,6 +716,17 @@ class ParseStage(PipelineStage):
                             batches_since_commit = 0
                         # Yield to event loop between batches so downloads can progress
                         await asyncio.sleep(0)
+
+                        if _is_dup_batch(new, dups, _BATCH_SIZE):
+                            dup_batches_seen += 1
+                            if dup_batches_seen >= dup_confirm_batches:
+                                file_skipped_as_dup = True
+                                logger.info(
+                                    "Early-skip %s: %d consecutive batches at %.0f%% duplicates",
+                                    file_path.name, dup_batches_seen, (dups / (new + dups)) * 100,
+                                )
+                        else:
+                            dup_batches_seen = 0
 
             # Flush any remaining credentials
             new, dups = await _flush_batch(batch)
@@ -876,8 +924,9 @@ class ParseStage(PipelineStage):
         inserted: list[dict[str, object]] = []
         dialect_insert = get_dialect_insert(ctx.session)
 
-        for i in range(0, len(rows), _INSERT_CHUNK_SIZE):
-            chunk = rows[i : i + _INSERT_CHUNK_SIZE]
+        # SQLite has a 999 SQL-variable limit per statement; keep chunks small.
+        for i in range(0, len(rows), _INSERT_CHUNK_SIZE_SQLITE):
+            chunk = rows[i : i + _INSERT_CHUNK_SIZE_SQLITE]
             insert_stmt = (
                 dialect_insert(ParsedCredential)
                 .values(chunk)
