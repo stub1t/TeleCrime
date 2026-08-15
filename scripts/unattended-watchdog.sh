@@ -58,16 +58,19 @@ except Exception:
 " 2>/dev/null || echo 9999)
 fi
 
-# --- 3. Progress signature (counters + current archive) -----------------
+# --- 3. Progress signature (counters + current archive + download) --------
 # The heartbeat can stay fresh while the main loop is deadlocked, so we also
 # track whether the *work* is moving. Signature = creds|dups|archive_index|
-# current_archive. Two consecutive identical signatures with no DB activity
-# => hung.
+# current_archive|dl_pct. Two consecutive identical signatures with no DB
+# activity => hung.
+# Note: during a download (stage=acquire) creds/dups/archive_index stay
+# frozen while dl_pct advances; including dl_pct avoids false kills of a
+# healthy download. A stalled download (dl_pct frozen) is still caught.
 SIG=$(python3 -c "
 import json, sys
 try:
     d = json.load(open('$PROGRESS'))
-    print(f\"{d.get('credentials',0)}|{d.get('duplicates',0)}|{d.get('archive_index',0)}|{(d.get('current_archive') or '')[:60]}\")
+    print(f\"{d.get('credentials',0)}|{d.get('duplicates',0)}|{d.get('archive_index',0)}|{(d.get('current_archive') or '')[:60]}|{int(d.get('dl_pct') or 0)}\")
 except Exception:
     print('')
 " 2>/dev/null || echo "")
@@ -80,6 +83,25 @@ if [ -n "$SIG" ] && [ -f "$SNAP" ]; then
   fi
 fi
 echo "$SIG" > "$SNAP"
+
+# Active download? A download is network I/O (no DB query) and keeps the
+# creds/dups/archive counters frozen while dl_pct advances — a frozen
+# signature during an active download is normal, not a hang.
+DL_ACTIVE=0
+DL_OK=$(timeout 10 python3 -c "
+import json, sys
+try:
+    d = json.load(open('$PROGRESS'))
+    if d.get('dl_active') and (d.get('dl_speed') or 0) > 0:
+        print(1)
+    else:
+        print(0)
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
+if [ "$DL_OK" = "1" ]; then
+  DL_ACTIVE=1
+fi
 
 # --- 4. Active DB query (pipeline doing real work)? ---
 DB_ACTIVE=0
@@ -94,7 +116,7 @@ if [ -n "$DB_Q" ] && [ "$DB_Q" != "9999" ] && [ "$DB_Q" -lt "$NO_DB_ACTIVITY_SEC
   DB_ACTIVE=1
 fi
 
-log "check: pipeline_pid=$PIPELINE_PID alive=$PIPELINE_ALIVE heartbeat_age=${HEARTBEAT_AGE}s db_active=$DB_ACTIVE frozen=$FROZEN sig=$SIG"
+log "check: pipeline_pid=$PIPELINE_PID alive=$PIPELINE_ALIVE heartbeat_age=${HEARTBEAT_AGE}s db_active=$DB_ACTIVE dl_active=$DL_ACTIVE frozen=$FROZEN sig=$SIG"
 
 # --- Heal logic ---
 NEED_HEAL=0
@@ -108,12 +130,12 @@ elif [ "$HEARTBEAT_AGE" -gt "$STALE_HEARTBEAT_SEC" ] && [ "$DB_ACTIVE" = "0" ]; 
   # Heartbeat stale AND no DB work → hung (e.g. deadlock in I/O)
   NEED_HEAL=1
   REASON="hung pipeline (heartbeat ${HEARTBEAT_AGE}s old, no DB activity)"
-elif [ "$FROZEN" = "1" ] && [ "$DB_ACTIVE" = "0" ]; then
-  # Fresh heartbeat but the counters/archive have not moved between two
-  # consecutive checks AND there is no DB query running → the main loop is
-  # deadlocked while the heartbeat thread keeps ticking.
+elif [ "$FROZEN" = "1" ] && [ "$DB_ACTIVE" = "0" ] && [ "$DL_ACTIVE" = "0" ]; then
+  # Fresh heartbeat but the counters/archive/download have not moved between
+  # two consecutive checks AND there is no DB query running AND no active
+  # download → the main loop is deadlocked while the heartbeat thread ticks.
   NEED_HEAL=1
-  REASON="hung pipeline (progress frozen for two checks, no DB activity)"
+  REASON="hung pipeline (progress frozen for two checks, no DB or download activity)"
 fi
 
 if [ "$NEED_HEAL" = "1" ]; then
