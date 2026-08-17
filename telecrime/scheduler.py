@@ -475,18 +475,47 @@ def _run_pipeline_job(config, engine) -> str:
     )
     _write_pipeline_pid(proc.pid)
 
-    # Drain stderr in a background thread so the pipe never blocks.
+    # Drain stderr in a background thread so the pipe never blocks. Also tee
+    # the lines to data_dir/pipeline_run.log so pipeline logs are inspectable
+    # WHILE the run is active — previously they were buffered in memory and
+    # only surfaced if the subprocess exited non-zero, which made diagnosing
+    # slow/stuck runs (e.g. the 17h download-restart loop) nearly impossible.
     stderr_lines: list[str] = []
+    _log_file = config.data_dir / "pipeline_run.log"
+    try:
+        # Truncate before the subprocess starts: each run starts fresh, and the
+        # drain thread below opens append-mode so no first lines are lost.
+        _log_file.open("wb").close()
+    except Exception:
+        _log_file = None
 
     def _drain_stderr() -> None:
         stderr = getattr(proc, "stderr", None)
         if stderr is None:
             return
-        for raw in stderr:
-            line = raw.decode(errors="replace").rstrip()
-            stderr_lines.append(line)
-            if len(stderr_lines) > 200:
-                stderr_lines.pop(0)
+        lf = None
+        if _log_file is not None:
+            try:
+                lf = open(_log_file, "ab", buffering=0)
+            except Exception:
+                lf = None
+        try:
+            for raw in stderr:
+                line = raw.decode(errors="replace").rstrip()
+                stderr_lines.append(line)
+                if len(stderr_lines) > 200:
+                    stderr_lines.pop(0)
+                if lf is not None:
+                    try:
+                        lf.write(raw)
+                    except Exception:
+                        pass
+        finally:
+            if lf is not None:
+                try:
+                    lf.close()
+                except Exception:
+                    pass
 
     import threading
     _stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)

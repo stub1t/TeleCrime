@@ -84,6 +84,21 @@ if [ -n "$SIG" ] && [ -f "$SNAP" ]; then
 fi
 echo "$SIG" > "$SNAP"
 
+# Pipeline stage — the extract phase (7z/unrar subprocess) is a legitimate
+# long-running state: a multi-GB archive with 50k+ files can take 1-2 h,
+# during which the signature, DB queries and downloads are all quiet.
+# Extraction is self-protected by _extraction_timeout (proportional to size),
+# so a truly stuck extraction fails on its own instead of needing the
+# watchdog — treating it as "hung" kills healthy long extracts and loops
+# forever (2026-08-17: worker restarted every ~10 min on 92k-file RAR5s).
+STAGE=$(python3 -c "
+import json, sys
+try:
+    print(json.load(open('$PROGRESS')).get('current_stage') or '')
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+
 # Active download? A download is network I/O (no DB query) and keeps the
 # creds/dups/archive counters frozen while dl_pct advances — a frozen
 # signature during an active download is normal, not a hang.
@@ -134,8 +149,12 @@ elif [ "$FROZEN" = "1" ] && [ "$DB_ACTIVE" = "0" ] && [ "$DL_ACTIVE" = "0" ]; th
   # Fresh heartbeat but the counters/archive/download have not moved between
   # two consecutive checks AND there is no DB query running AND no active
   # download → the main loop is deadlocked while the heartbeat thread ticks.
-  NEED_HEAL=1
-  REASON="hung pipeline (progress frozen for two checks, no DB or download activity)"
+  # EXCEPT during the extract phase (long subprocess, see STAGE above) —
+  # extraction failures/timeouts are handled by the pipeline itself.
+  if [ "$STAGE" != "extract" ]; then
+    NEED_HEAL=1
+    REASON="hung pipeline (progress frozen for two checks, no DB or download activity)"
+  fi
 fi
 
 if [ "$NEED_HEAL" = "1" ]; then
