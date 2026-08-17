@@ -16,6 +16,7 @@ from telecrime.pipeline.discover import DiscoverStage
 from telecrime.pipeline.extract import ExtractStage
 from telecrime.pipeline.ingest import IngestStage
 from telecrime.pipeline.lock import pipeline_run_lock
+from telecrime.pipeline.plan import PlanStage
 from telecrime.pipeline.orchestrator import (
     Pipeline,
     PipelineContext,
@@ -25,6 +26,7 @@ from telecrime.pipeline.orchestrator import (
 )
 from telecrime.pipeline.parse import ParseStage
 from telecrime.states import ExtractionStatus, GroupStatus
+from sqlalchemy import select
 
 
 class MockStage(PipelineStage):
@@ -585,9 +587,198 @@ class TestExtractStageDirect:
         assert group.status == GroupStatus.READY
         assert session.get(ExtractionJob, job_id).status == ExtractionStatus.PENDING
 
+    @pytest.mark.asyncio
+    async def test_password_protected_listing_empty_does_not_crash(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """list_contents returning [] (password-protected archive) must NOT
+        raise UnboundLocalError on `matching_files`.
+
+        Regression: `matching_files` was only assigned inside `if all_contents:`;
+        the password-fallback path referenced it unconditionally, so every
+        password-protected archive crashed the group ("cannot access local
+        variable 'matching_files'") and never reached password testing.
+        """
+        from sqlalchemy.orm import joinedload
+
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            ExtractionJob,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.pipeline.extract import _extraction_timeout
+
+        conv = Conversation(platform_id=299, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=2,
+            platform_timestamp=datetime.now(UTC),
+            text="archive drop",
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id,
+            platform_file_id="protected-file",
+            filename="protected.zip",
+            archive_type="zip",
+        )
+        session.add(attachment)
+        session.flush()
+
+        dl_path = tmp_path / "downloads" / "protected.zip"
+        dl_path.parent.mkdir(parents=True, exist_ok=True)
+        dl_path.write_bytes(b"PK\x03\x04 not really a zip")
+
+        artifact = DownloadArtifact(attachment_id=attachment.id, local_path=str(dl_path))
+        session.add(artifact)
+        session.flush()
+        group = ArchiveGroup(
+            fingerprint="protected-group",
+            base_name="protected.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.READY,
+        )
+        session.add(group)
+        session.flush()
+        session.add(ArchiveGroupPart(group_id=group.id, artifact_id=artifact.id, part_index=0))
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.PENDING)
+        session.add(job)
+        session.flush()
+        session.commit()
+
+        group = session.get(
+            ArchiveGroup,
+            group.id,
+            options=[
+                joinedload(ArchiveGroup.parts)
+                .joinedload(ArchiveGroupPart.artifact)
+                .joinedload(DownloadArtifact.attachment)
+            ],
+        )
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        stage = ExtractStage()
+        monkeypatch.setattr(stage, "_has_sufficient_disk", lambda _ctx: True)
+        extractor = MagicMock()
+        # Password-protected: listing without a password returns [].
+        extractor.list_contents = AsyncMock(return_value=[])
+        extractor.extract = AsyncMock(
+            return_value=SimpleNamespace(success=False, requires_password=True)
+        )
+        extractor.test_password = AsyncMock(return_value=False)
+        extractor.available = MagicMock(return_value=True)
+        # RAR5 check: force the plain path (not .rar).
+        monkeypatch_extract = None
+
+        result = await stage._extract_group(ctx, group, extractor)
+
+        # Must not raise; password path must be reached (extract attempted).
+        extractor.extract.assert_awaited()
+        assert group.status in (GroupStatus.FAILED, GroupStatus.EXTRACTING)
+
 
 class TestPlanStage:
     """Tests for PlanStage."""
+
+    @pytest.mark.asyncio
+    async def test_repost_links_artifacts_to_existing_group(
+        self, session, test_config
+    ):
+        """A re-posted archive (same Telegram file ID) must link its new
+        artifact to the existing group instead of orphaning it.
+
+        Regression: the existing-group path returned without linking, leaving
+        the artifact PENDING and group-less forever — _next_pending_artifact
+        only picks artifacts WITH a group, so the file never downloaded even
+        when the original post was deleted (the repost was the only copy).
+        """
+        from telecrime.grouping.patterns import GroupingResult
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus, GroupStatus
+
+        conv = Conversation(platform_id=399, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+
+        def _attach(msg_pid, file_id):
+            msg = Message(
+                conversation_id=conv.id,
+                platform_id=msg_pid,
+                platform_timestamp=datetime.now(UTC),
+            )
+            session.add(msg)
+            session.flush()
+            att = FileAttachment(
+                message_id=msg.id,
+                platform_file_id=str(file_id),
+                platform_file_unique_id="same_doc_123",
+                filename="logs.part1.zip",
+                size=1000,
+                is_archive_candidate=True,
+                archive_type="zip",
+                detected_base_name="logs",
+                detected_part_number=1,
+            )
+            session.add(att)
+            session.flush()
+            return att
+
+        # First post → creates the group.
+        att1 = _attach(1, 111)
+        session.commit()
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        stage = PlanStage()
+        art1 = DownloadArtifact(attachment_id=att1.id, status=DownloadStatus.PENDING)
+        session.add(art1)
+        session.flush()
+        result1 = GroupingResult(
+            base_name="logs.part1.zip",
+            attachments=[att1],
+            expected_parts=1,
+            part_numbers={att1.id: 0},
+        )
+        group = await stage._create_or_update_group(ctx, result1, {att1.id: art1})
+        session.commit()
+        assert group is not None and group.status == GroupStatus.INCOMPLETE
+
+        # Repost in a second message → same fingerprint → existing group.
+        att2 = _attach(2, 222)
+        session.commit()
+        art2 = DownloadArtifact(attachment_id=att2.id, status=DownloadStatus.PENDING)
+        session.add(art2)
+        session.flush()
+        result2 = GroupingResult(
+            base_name="logs.part1.zip",
+            attachments=[att2],
+            expected_parts=1,
+            part_numbers={att2.id: 0},
+        )
+        stage = PlanStage()
+        returned = await stage._create_or_update_group(ctx, result2, {att2.id: art2})
+        session.commit()
+        assert returned is not None and returned.id == group.id
+
+        # The new artifact MUST be linked to the existing group.
+        linked = session.execute(
+            select(ArchiveGroupPart).where(ArchiveGroupPart.artifact_id == art2.id)
+        ).scalar_one_or_none()
+        assert linked is not None, "reposted artifact was orphaned"
+        assert linked.group_id == group.id
 
 
 class TestAcquireStage:
@@ -1491,3 +1682,82 @@ class TestParseEarlyDupSkip:
         assert _is_dup_batch(1000, 19000, 20000) is True
         # 94% does not.
         assert _is_dup_batch(1200, 18800, 20000) is False
+
+
+class TestFinalizeStageNoDeleteRetryable:
+    """Finalize must not delete archives of transiently-FAILED groups."""
+
+    @pytest.mark.asyncio
+    async def test_run_group_skips_transient_failed(self, session, test_config, monkeypatch):
+        """run_group() must NOT finalize (delete) a transient FAILED group —
+        those are retried by startup recovery. Only FAILED_TERMINAL is cleaned.
+
+        Regression: FAILED/EXTRACTING groups were collected and deleted, so a
+        transiently-failing extraction lost its downloaded archives forever.
+        """
+        from telecrime.models import ArchiveGroup, ExtractionJob
+        from telecrime.pipeline.finalize import FinalizeStage
+        from telecrime.states import ExtractionStatus, GroupStatus
+
+        group = ArchiveGroup(
+            fingerprint="f-failed-group",
+            base_name="f-failed.rar",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.FAILED,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.FAILED)
+        session.add(job)
+        session.flush()
+        session.commit()
+
+        stage = FinalizeStage()
+        deleted = []
+        async def _fake_cleanup_archives(ctx, group):
+            deleted.append(group.id)
+        monkeypatch.setattr(stage, "_cleanup_archives", _fake_cleanup_archives)
+        monkeypatch.setattr(stage, "_cleanup_extracted_files", _fake_cleanup_archives)
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        ok = await stage.run_group(ctx, group.id)
+
+        assert ok is False
+        assert deleted == [], "transient FAILED group must not be cleaned"
+        assert session.get(ArchiveGroup, group.id).status == GroupStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_run_group_cleans_terminal_failed(self, session, test_config, monkeypatch):
+        """FAILED_TERMINAL groups are still cleaned up (disk reclamation)."""
+        from telecrime.models import ArchiveGroup, ExtractionJob
+        from telecrime.pipeline.finalize import FinalizeStage
+        from telecrime.states import ExtractionStatus, GroupStatus
+
+        group = ArchiveGroup(
+            fingerprint="f-term-group",
+            base_name="f-term.rar",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.FAILED_TERMINAL,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.FAILED_TERMINAL)
+        session.add(job)
+        session.flush()
+        session.commit()
+
+        stage = FinalizeStage()
+        cleaned = []
+        async def _fake_cleanup(ctx, group):
+            cleaned.append(group.id)
+        monkeypatch.setattr(stage, "_cleanup_archives", _fake_cleanup)
+        monkeypatch.setattr(stage, "_cleanup_extracted_files", _fake_cleanup)
+        monkeypatch.setattr(stage, "_record_first_seen", None)
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        ok = await stage.run_group(ctx, group.id)
+
+        assert ok is True
+        assert cleaned.count(group.id) == 2  # archives + extracted files cleanup
+        assert session.get(ArchiveGroup, group.id).status == GroupStatus.CLEANED

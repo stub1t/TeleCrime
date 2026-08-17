@@ -392,3 +392,37 @@ Folder = +
 
         assert result.success is False
         assert result.error_code == "TIMEOUT"
+
+
+class TestExtractionTimeoutHelper:
+    """Tests for extract._extraction_timeout (size-proportional timeout)."""
+
+    def test_small_archive_uses_config_floor(self, tmp_path):
+        from telecrime.config import Config
+        from telecrime.pipeline.extract import _extraction_timeout
+
+        archive = tmp_path / "small.zip"
+        archive.write_bytes(b"x" * (100 * 1024 * 1024))  # 100 MB
+        ctx = MagicMock()
+        ctx.config.extraction.max_extraction_seconds = 600
+
+        assert _extraction_timeout(ctx, archive) == 600
+
+    def test_large_archive_scales_with_size(self, tmp_path):
+        from telecrime.config import Config
+        from telecrime.pipeline.extract import _extraction_timeout
+
+        archive = tmp_path / "big.zip"
+        archive.write_bytes(b"x" * (2 * 1024 * 1024 * 1024))  # 2 GB
+        ctx = MagicMock()
+        ctx.config.extraction.max_extraction_seconds = 600
+
+        # 2048 MiB * 3 = 6144s, above the 600s config floor.
+        assert _extraction_timeout(ctx, archive) == 6144
+
+    def test_missing_archive_uses_floor(self, tmp_path):
+        from telecrime.pipeline.extract import _extraction_timeout
+
+        ctx = MagicMock()
+        ctx.config.extraction.max_extraction_seconds = 600
+        assert _extraction_timeout(ctx, tmp_path / "missing.zip") == 600

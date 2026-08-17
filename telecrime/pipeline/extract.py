@@ -10,6 +10,22 @@ from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
 from telecrime.extractor.interface import ExtractionResult
+
+
+def _extraction_timeout(ctx, archive: Path) -> int:
+    """Extraction timeout proportional to archive size.
+
+    A fixed cap (config max_extraction_seconds=600) kills legitimately slow
+    extractions of multi-GB archives (tens of thousands of small files take
+    30-60+ min on this hardware), failing the job and retrying in a loop that
+    never completes — same bug class as the fixed 300s download budget.
+    """
+    size_mb = 0
+    try:
+        size_mb = archive.stat().st_size / (1024 * 1024)
+    except OSError:
+        pass
+    return max(ctx.config.extraction.max_extraction_seconds, int(size_mb * 3))
 from telecrime.extractor.seven_zip import SevenZipExtractor
 from telecrime.extractor.unrar import UnrarExtractor
 from telecrime.logging_utils import log_context
@@ -227,6 +243,12 @@ class ExtractStage(PipelineStage):
 
         # Whether to do a two-pass extraction (outer → nested archives → txt)
         do_nested = False
+        # Must be initialized BEFORE the `if all_contents:` block: list_contents
+        # returns [] for password-protected archives (or listing failures), and
+        # `matching_files[0]` below would otherwise raise UnboundLocalError,
+        # skipping the password-fallback path entirely (regression: "cannot
+        # access local variable 'matching_files'" in pipeline logs).
+        matching_files: list[str] = []
         if all_contents:
             # Listing succeeded — check for matching extensions
             normalized_exts = {ext.lower().lstrip(".") for ext in target_exts}
@@ -455,7 +477,7 @@ class ExtractStage(PipelineStage):
                     nested_out,
                     password=password,
                     target_extensions=target_exts,
-                    timeout_seconds=ctx.config.extraction.max_extraction_seconds,
+                    timeout_seconds=_extraction_timeout(ctx, nested),
                 )
                 if result.success:
                     txt_files.extend(result.extracted_files)
@@ -501,7 +523,7 @@ class ExtractStage(PipelineStage):
                 output_dir,
                 target_extensions=target_exts,
                 password=None,
-                timeout_seconds=ctx.config.extraction.max_extraction_seconds,
+                timeout_seconds=_extraction_timeout(ctx, main_archive),
             )
 
         if result.requires_password:
@@ -527,7 +549,7 @@ class ExtractStage(PipelineStage):
                     output_dir,
                     target_extensions=target_exts,
                     password=pwd_candidate.value,
-                    timeout_seconds=ctx.config.extraction.max_extraction_seconds,
+                    timeout_seconds=_extraction_timeout(ctx, main_archive),
                 )
 
                 if result.success:

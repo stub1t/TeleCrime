@@ -54,8 +54,8 @@ ARCHIVE_MIME_TYPES = {
 
 # Regex patterns for split archive detection
 SPLIT_PATTERNS = [
-    # .part1.rar, .part01.rar, .part001.rar
-    (r"^(.+?)\.part(\d+)\.rar$", "rar"),
+    # .part1.rar, .part1.zip, .part01.7z
+    (r"^(.+?)\.part(\d+)\.(zip|rar|7z)$", "split"),
     # .r00, .r01, .r02
     (r"^(.+?)\.r(\d{2,})$", "rar"),
     # .7z.001, .7z.002
@@ -196,6 +196,11 @@ class DiscoverStage(PipelineStage):
             if match:
                 base_name = match.group(1)
                 part_number = int(match.group(2))
+                # For the generic .partN pattern the real type is in the
+                # filename extension (zip/rar/7z), not the fixed type tag.
+                if archive_type == "split":
+                    _m = re.search(r"\.(zip|rar|7z)$", filename_lower)
+                    archive_type = _m.group(1) if _m else "unknown"
                 return True, archive_type, (base_name, part_number)
 
         # Check extension

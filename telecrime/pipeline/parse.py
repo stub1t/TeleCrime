@@ -882,7 +882,20 @@ class ParseStage(PipelineStage):
                         buf = io.StringIO()
                         write = buf.write
                         esc = self._copy_escape
+                        # In-chunk dedup: repeated credential_hash rows (the
+                        # same victim's log line appearing twice in one file)
+                        # violate _pc_staging_hash during COPY — PostgreSQL
+                        # treats a COPY constraint violation as a hard error
+                        # that discards the WHOLE chunk. Deduplicating here
+                        # keeps the batch intact; dropped rows still count as
+                        # duplicates in the caller (dup_count = rows - new).
+                        _seen_hashes: set[str] = set()
                         for row in chunk:
+                            _h = row.get("credential_hash")
+                            if _h is not None:
+                                if _h in _seen_hashes:
+                                    continue
+                                _seen_hashes.add(_h)
                             write("\t".join(esc(row.get(f)) for f in fields))
                             write("\n")
                         buf.seek(0)
@@ -902,23 +915,34 @@ class ParseStage(PipelineStage):
                         #     correctness backstop for hash collisions (risk
                         #     ~2^-62 per pair, negligible at 299M rows).
                         # NULL credential_hashes pass straight through.
+                        # The SELECT list must be qualified with the staging
+                        # alias: both tables have url/domain/... and unqualified
+                        # references raise "AmbiguousColumn" (regression from
+                        # 2026-08-14 dcbe055 — every insert chunk failed,
+                        # silently dropping new credentials).
+                        # NOT EXISTS (instead of LEFT JOIN ... OR p.id IS NULL)
+                        # lets the planner use an anti-join with the ix_pc_hash64
+                        # expression index; the LEFT JOIN variant degrades to a
+                        # Seq Scan of the whole parsed_credentials table per
+                        # chunk (306M rows, >5 min, statement timeout).
+                        _sel = ", ".join(f"s.{f}" for f in fields)
                         if _has_hash64_index(ctx.session.get_bind()):
                             cursor.execute(
                                 f"INSERT INTO parsed_credentials ({col_list}) "
-                                f"SELECT {col_list} FROM _pc_staging s "
-                                "LEFT JOIN parsed_credentials p "
-                                f"  ON {_hash64_expr('p')} = {_hash64_expr('s')} "
-                                "WHERE s.credential_hash IS NULL OR p.id IS NULL "
+                                f"SELECT {_sel} FROM _pc_staging s "
+                                "WHERE s.credential_hash IS NULL "
+                                "   OR NOT EXISTS (SELECT 1 FROM parsed_credentials p "
+                                f"      WHERE {_hash64_expr('p')} = {_hash64_expr('s')}) "
                                 "ON CONFLICT (credential_hash) DO NOTHING "
                                 "RETURNING credential_hash, domain"
                             )
                         else:
                             cursor.execute(
                                 f"INSERT INTO parsed_credentials ({col_list}) "
-                                f"SELECT {col_list} FROM _pc_staging s "
-                                "LEFT JOIN parsed_credentials p "
-                                "  ON left(p.credential_hash, 32) = left(s.credential_hash, 32) "
-                                "WHERE s.credential_hash IS NULL OR p.id IS NULL "
+                                f"SELECT {_sel} FROM _pc_staging s "
+                                "WHERE s.credential_hash IS NULL "
+                                "   OR NOT EXISTS (SELECT 1 FROM parsed_credentials p "
+                                "      WHERE left(p.credential_hash, 32) = left(s.credential_hash, 32)) "
                                 "ON CONFLICT (credential_hash) DO NOTHING "
                                 "RETURNING credential_hash, domain"
                             )

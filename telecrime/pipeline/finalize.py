@@ -55,14 +55,17 @@ class FinalizeStage(PipelineStage):
             )
         ).scalars().all()
 
-        # Also process failed groups to reclaim disk space
-        # Include FAILED, FAILED_TERMINAL, and groups stuck in EXTRACTING (crashed mid-extraction)
+        # Also process failed groups to reclaim disk space.
+        # ONLY permanently-failed groups are cleaned here: transient
+        # GroupStatus.FAILED (retryable extraction error) and EXTRACTING groups
+        # must NOT have their downloaded archives deleted — startup recovery
+        # resets them to READY so the extraction is retried. Deleting them
+        # would silently destroy a recoverable group (see the AcquireStage
+        # low-disk test comment).
         failed_groups = ctx.session.execute(
             select(ArchiveGroup)
             .where(ArchiveGroup.status.in_([
-                GroupStatus.FAILED,
                 GroupStatus.FAILED_TERMINAL,
-                GroupStatus.EXTRACTING,
             ]))
             .options(
                 selectinload(ArchiveGroup.parts)
@@ -143,11 +146,11 @@ class FinalizeStage(PipelineStage):
             await self._finalize_extracted_group(ctx, group)
             return True
 
-        if group.status in (
-            GroupStatus.FAILED,
-            GroupStatus.FAILED_TERMINAL,
-            GroupStatus.EXTRACTING,
-        ):
+        if group.status == GroupStatus.EXTRACTED:
+            await self._finalize_extracted_group(ctx, group)
+            return True
+
+        if group.status == GroupStatus.FAILED_TERMINAL:
             await self._finalize_failed_group(ctx, group)
             return True
 

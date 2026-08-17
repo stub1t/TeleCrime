@@ -606,7 +606,11 @@ class AcquireStage(PipelineStage):
 
         groups = (
             ctx.session.execute(
-                query.options(joinedload(ArchiveGroup.parts).joinedload(ArchiveGroupPart.artifact))
+                query.options(
+                    joinedload(ArchiveGroup.parts)
+                    .joinedload(ArchiveGroupPart.artifact)
+                    .joinedload(DownloadArtifact.attachment)
+                )
             )
             .unique()
             .scalars()
@@ -614,13 +618,38 @@ class AcquireStage(PipelineStage):
         )
 
         for group in groups:
-            # Check if all parts are downloaded
+            # Check if all parts are downloaded.  A FAILED_TERMINAL part is
+            # "covered" when another part in the group holds the SAME physical
+            # file (identical platform_file_unique_id) and is COMPLETED — the
+            # repost copy can serve as the archive part.
+            completed_unique_ids = {
+                part.artifact.attachment.platform_file_unique_id
+                for part in group.parts
+                if part.artifact.attachment
+                and part.artifact.status == DownloadStatus.COMPLETED
+                and part.artifact.attachment.platform_file_unique_id
+            }
             all_downloaded = all(
-                part.artifact.status == DownloadStatus.COMPLETED for part in group.parts
+                part.artifact.status == DownloadStatus.COMPLETED
+                or (
+                    part.artifact.status == DownloadStatus.FAILED_TERMINAL
+                    and part.artifact.attachment
+                    and part.artifact.attachment.platform_file_unique_id
+                    in completed_unique_ids
+                )
+                for part in group.parts
             )
-            # Check if any parts are still pending or downloading
+            # Check if any parts are still pending, downloading or transiently
+            # failed (FAILED is retryable — counting it as "active" prevents
+            # the group from being marked FAILED_TERMINAL while a retryable
+            # part is still recoverable on the next pass).
             any_active = any(
-                part.artifact.status in (DownloadStatus.PENDING, DownloadStatus.DOWNLOADING)
+                part.artifact.status
+                in (
+                    DownloadStatus.PENDING,
+                    DownloadStatus.DOWNLOADING,
+                    DownloadStatus.FAILED,
+                )
                 for part in group.parts
             )
             # Check if any parts permanently failed

@@ -5,12 +5,12 @@ import json
 import logging
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import Session, joinedload
 
 from telecrime.adapters.base import BaseAdapter
@@ -256,13 +256,19 @@ async def _prefetch_download(
     ctx: PipelineContext,
     acquire_stage,
     artifact,
+    adapter: BaseAdapter | None = None,
 ) -> bool:
     """Download an artifact in the background while the current one is processed.
 
     Only downloads the file — does NOT update group statuses or commit the session.
     The caller is responsible for calling _update_group_statuses and committing after
     awaiting this task, to avoid concurrent session access.
+
+    If adapter is given (a pooled download session), a copy of the context is used
+    so the download runs through that session while sharing the DB session.
     """
+    if adapter is not None and adapter is not ctx.adapter:
+        ctx = replace(ctx, adapter=adapter)
     try:
         return await acquire_stage._download_artifact(ctx, artifact)
     except (Exception, asyncio.CancelledError) as e:
@@ -357,6 +363,22 @@ async def _process_ready_groups_batch(
                 )
             except (Exception, asyncio.CancelledError) as e:
                 logger.error("Error processing READY group %s: %s", group_id, e)
+                # Mark the group transiently FAILED so the main loop does not
+                # retry it forever in the same run (which would starve downloads).
+                # The next run's startup recovery retries it (bounded attempts).
+                try:
+                    with get_session(engine) as _sess:
+                        _sess.execute(
+                            update(ArchiveGroup)
+                            .where(
+                                ArchiveGroup.id == group_id,
+                                ArchiveGroup.status == GroupStatus.READY,
+                            )
+                            .values(status=GroupStatus.FAILED)
+                        )
+                        _sess.commit()
+                except Exception:
+                    pass
                 return {
                     "group_id": group_id,
                     "skipped": False,
@@ -537,6 +559,7 @@ async def run_sequential_pipeline(
     limit: int | None = None,
     display: Optional["PipelineDisplay"] = None,
     prefetch_count: int = 2,
+    download_adapters: Sequence[BaseAdapter] | None = None,
 ) -> PipelineContext:
     """Run pipeline processing one archive at a time, with N-archive prefetch.
 
@@ -557,6 +580,10 @@ async def run_sequential_pipeline(
         dry_run: Preview mode
         notifier: Optional notifier
         limit: Max archives to process (None = unlimited)
+        download_adapters: Additional adapters (one per extra Telegram session)
+            used to parallelize prefetch downloads. Each session has its own
+            Telegram download speed budget, so N sessions can approach N× the
+            single-session throughput.
 
     Returns:
         PipelineContext with results
@@ -578,6 +605,14 @@ async def run_sequential_pipeline(
         notifier=notifier,
         display=display,
     )
+    # Download session pool: main adapter first, then the extra sessions.
+    # Prefetch downloads are round-robined across the pool so each session
+    # contributes its own Telegram bandwidth budget.
+    _download_pool: list[BaseAdapter] = [adapter]
+    if download_adapters:
+        _download_pool.extend(download_adapters)
+    _pool_index = 0
+
 
     with pipeline_run_lock(config.data_dir):
         logger.info("Starting sequential pipeline (one archive at a time, with prefetch)")
@@ -720,17 +755,64 @@ async def run_sequential_pipeline(
                     _terminal,
                 )
 
-            # Startup recovery: reset any groups stuck in EXTRACTING state (crash
-            # during extraction) back to READY so they are re-processed this run.
-            extracting_stuck = session.execute(
-                select(ArchiveGroup).where(ArchiveGroup.status == GroupStatus.EXTRACTING)
-            ).scalars().all()
-            if extracting_stuck:
-                logger.info(
-                    "Resetting %d groups stuck in EXTRACTING → READY", len(extracting_stuck)
+            # Startup recovery: reset any groups stuck in EXTRACTING (crash
+            # during extraction) or transiently FAILED (retryable extraction
+            # error) back to READY so they are re-processed this run.  Groups
+            # whose extraction already failed the configured max number of
+            # times stay FAILED_TERMINAL (no endless retry loop).
+            stuck = session.execute(
+                select(ArchiveGroup).where(
+                    ArchiveGroup.status.in_(
+                        [GroupStatus.EXTRACTING, GroupStatus.FAILED]
+                    )
                 )
-                for _g in extracting_stuck:
-                    _g.status = GroupStatus.READY
+            ).scalars().all()
+            if stuck:
+                from telecrime.models import ExtractionJob
+
+                job_max_attempts = 3
+                retry_ids: list[int] = []
+                terminal_ids: list[int] = []
+                for _g in stuck:
+                    if _g.status == GroupStatus.EXTRACTING:
+                        retry_ids.append(_g.id)
+                        continue
+                    # FAILED: retry up to MAX_ATTEMPTS total extraction attempts.
+                    attempts = (
+                        session.execute(
+                            select(func.max(ExtractionJob.attempts_count)).where(
+                                ExtractionJob.group_id == _g.id
+                            )
+                        ).scalar()
+                        or 0
+                    )
+                    if attempts >= job_max_attempts:
+                        terminal_ids.append(_g.id)
+                    else:
+                        retry_ids.append(_g.id)
+                if retry_ids:
+                    session.execute(
+                        update(ArchiveGroup)
+                        .where(ArchiveGroup.id.in_(retry_ids))
+                        .values(status=GroupStatus.READY)
+                    )
+                    logger.info(
+                        "Startup recovery: reset %d EXTRACTING/FAILED groups → READY "
+                        "for re-processing",
+                        len(retry_ids),
+                    )
+                if terminal_ids:
+                    session.execute(
+                        update(ArchiveGroup)
+                        .where(ArchiveGroup.id.in_(terminal_ids))
+                        .values(status=GroupStatus.FAILED_TERMINAL)
+                    )
+                    logger.info(
+                        "Startup recovery: %d FAILED groups exceeded %d attempts → "
+                        "FAILED_TERMINAL",
+                        len(terminal_ids),
+                        job_max_attempts,
+                    )
                 session.commit()
 
             total_pending = (
@@ -924,9 +1006,18 @@ async def run_sequential_pipeline(
                     _next_task, artifact = _prefetch_queue.pop(0)
                     # Await with a hard cap: a permanently-stuck Telethon reconnection
                     # loop can prevent the stall detector from firing, which would block
-                    # the main pipeline forever.  30 min covers the worst-case scenario
-                    # of stall_seconds(300) × max_retries(3) + retry delays.
-                    _done, _ = await asyncio.wait({_next_task}, timeout=1800)
+                    # the main pipeline forever.  The cap scales with the artifact size
+                    # (the acquire stage allows max(1800, 2*size_mb) seconds per
+                    # download) plus a stall margin — a fixed 30-min cap would cancel
+                    # legitimately long multi-GB downloads, reset them to PENDING and
+                    # restart them from scratch on the next run.
+                    _pfx_size_mb = (
+                        (artifact.attachment.size or 0) / (1024 * 1024)
+                        if artifact.attachment
+                        else 0
+                    )
+                    _pfx_cap = max(1800, int(_pfx_size_mb * 2) + 300)
+                    _done, _ = await asyncio.wait({_next_task}, timeout=_pfx_cap)
                     if _done:
                         try:
                             _prefetch_task_result = _next_task.result()
@@ -939,8 +1030,9 @@ async def run_sequential_pipeline(
                             else str(artifact.id)
                         )
                         logger.error(
-                            "Prefetch task for %s timed out after 1800s — cancelling",
+                            "Prefetch task for %s timed out after %ds — cancelling",
                             _pfx_name,
+                            _pfx_cap,
                         )
                         _next_task.cancel()
                         await asyncio.wait({_next_task}, timeout=5.0)
@@ -1048,17 +1140,34 @@ async def run_sequential_pipeline(
                                 next_pending = _next_pending_artifact(session)
                                 if not next_pending:
                                     break
+                                if len(_download_pool) > 1:
+                                    _dl_adapter = _download_pool[
+                                        _pool_index % len(_download_pool)
+                                    ]
+                                    _pool_index += 1
+                                else:
+                                    _dl_adapter = None
                                 task = asyncio.create_task(
-                                    _prefetch_download(ctx, acquire_stage, next_pending)
+                                    _prefetch_download(
+                                        ctx,
+                                        acquire_stage,
+                                        next_pending,
+                                        adapter=_dl_adapter,
+                                    )
                                 )
                                 _prefetch_queue.append((task, next_pending))
                                 # Yield once so the task can start and mark artifact DOWNLOADING
                                 # before the next _next_pending_artifact call.
                                 await asyncio.sleep(0)
                                 logger.debug(
-                                    "Prefetch queued artifact %d (queue=%d)",
+                                    "Prefetch queued artifact %d (queue=%d, session=%s)",
                                     next_pending.id,
                                     len(_prefetch_queue),
+                                    (
+                                        _dl_adapter.config.telegram.session_name
+                                        if _dl_adapter is not None
+                                        else "main"
+                                    ),
                                 )
 
                         if display:

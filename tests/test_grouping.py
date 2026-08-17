@@ -31,6 +31,25 @@ class TestExtractBaseAndPart:
         assert base == "archive"
         assert part == 123
 
+    def test_zip_and_7z_part_formats(self):
+        """.partN.zip/.partN.7z must be detected as splits too.
+
+        Regression: only .partN.rar matched, so .partN.zip/.7z archives
+        (the dominant Telegram repost format) were planned as N standalone
+        groups and every part failed extraction.
+        """
+        base, part, total = extract_base_and_part("archive.part1.zip")
+        assert base == "archive"
+        assert part == 1
+
+        base, part, total = extract_base_and_part("archive.part2.7z")
+        assert base == "archive"
+        assert part == 2
+
+        base, part, total = extract_base_and_part("archive.part01.zip")
+        assert base == "archive"
+        assert part == 1
+
     def test_rar_old_style(self):
         """Test .r00, .r01 format."""
         base, part, total = extract_base_and_part("archive.r00")

@@ -22,8 +22,11 @@ class GroupingResult:
 # Patterns for detecting split archives
 # Each pattern: (regex, group_index_for_base, group_index_for_part_num)
 SPLIT_PATTERNS = [
-    # .part1.rar, .part01.rar, .part001.rar
-    (re.compile(r"^(.+?)\.part(\d+)\.rar$", re.IGNORECASE), 1, 2),
+    # .part1.rar, .part1.zip, .part01.7z — the dominant split format for
+    # Telegram reposts. Previously only .rar was matched, so .partN.zip/.7z
+    # archives were planned as N standalone groups and every part failed
+    # extraction (incomplete archive) — permanent data loss.
+    (re.compile(r"^(.+?)\.part(\d+)\.(zip|rar|7z)$", re.IGNORECASE), 1, 2),
     # .r00, .r01, .r02 (RAR old style)
     (re.compile(r"^(.+?)\.r(\d{2,})$", re.IGNORECASE), 1, 2),
     # archive_1of3.zip, archive_2of3.zip — must come BEFORE the generic

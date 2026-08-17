@@ -241,6 +241,43 @@ class PlanStage(PipelineStage):
         ).scalar_one_or_none()
 
         if existing:
+            # The same physical file(s) were posted again (repost across
+            # channels). Leaving the new artifacts unlinked would orphan them:
+            # _next_pending_artifact only selects artifacts WITH a group, so
+            # they'd never download — even when this group's original copy is
+            # gone (deleted message → FAILED_TERMINAL) and the new post is
+            # the only available source.
+            linked_any = False
+            for idx, attachment in enumerate(unique_attachments):
+                artifact = artifact_map.get(attachment.id)
+                if artifact is None:
+                    continue
+                already_linked = ctx.session.execute(
+                    select(ArchiveGroupPart).where(
+                        ArchiveGroupPart.artifact_id == artifact.id
+                    )
+                ).scalar_one_or_none()
+                if already_linked:
+                    continue
+                part = ArchiveGroupPart(
+                    group_id=existing.id,
+                    artifact_id=artifact.id,
+                    part_index=result.part_numbers.get(attachment.id, idx)
+                    if result.part_numbers
+                    else idx,
+                    role="part" if len(unique_attachments) > 1 else "main",
+                )
+                ctx.session.add(part)
+                linked_any = True
+            # A new source for a permanently-failed group can rescue it:
+            # revert to INCOMPLETE so the acquire stage downloads the new
+            # artifact and (re-)evaluates the group.
+            if linked_any and existing.status == GroupStatus.FAILED_TERMINAL:
+                logger.info(
+                    "Reviving FAILED_TERMINAL group %s — reposted source linked",
+                    existing.base_name,
+                )
+                existing.status = GroupStatus.INCOMPLETE
             return existing
 
         # Create new group
