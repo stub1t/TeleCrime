@@ -82,6 +82,44 @@ class TestTelegramConfig:
             _apply_env_vars(config)
         assert config.telegram.aux_session_name == "tc_aux"
 
+    def test_download_sessions_env_override(self):
+        """TELECRIME_DOWNLOAD_SESSIONS populates download_session_names."""
+        config = Config()
+        with patch.dict(
+            os.environ,
+            {"TELECRIME_DOWNLOAD_SESSIONS": "dl2, dl3 ,dl4"},
+        ):
+            _apply_env_vars(config)
+        assert config.telegram.download_session_names == ["dl2", "dl3", "dl4"]
+
+    def test_download_session_swap(self):
+        """with_download_session picks the right session; index 0 stays main."""
+        config = Config()
+        assert config.with_download_session(0) is config
+        assert config.with_download_session(1) is config
+
+        config.telegram.download_session_names = ["dl2", "dl3"]
+        assert config.with_download_session(0).telegram.session_name == "telecrime"
+        assert config.with_download_session(1).telegram.session_name == "dl2"
+        assert config.with_download_session(2).telegram.session_name == "dl3"
+        # out of range falls back to main
+        assert config.with_download_session(3) is config
+        # original is untouched
+        assert config.telegram.session_name == "telecrime"
+
+    def test_parallel_chunks_env_override(self):
+        """TELECRIME_PARALLEL_CHUNKS populates download.parallel_chunks."""
+        config = Config()
+        with patch.dict(os.environ, {"TELECRIME_PARALLEL_CHUNKS": "4"}):
+            _apply_env_vars(config)
+        assert config.download.parallel_chunks == 4
+
+    def test_parallel_chunks_default(self):
+        """Parallel chunk download is enabled by default."""
+        config = Config()
+        assert config.download.parallel_chunks == 8
+        assert config.download.parallel_min_bytes == 4 * 1024 * 1024
+
 
 class TestExtractionConfig:
     """Tests for ExtractionConfig dataclass."""

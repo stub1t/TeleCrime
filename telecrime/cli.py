@@ -131,6 +131,56 @@ def telegram_auth_aux(
     asyncio.run(_run())
 
 
+@app.command("telegram-auth-download")
+def telegram_auth_download(
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
+) -> None:
+    """Authenticate all configured parallel download sessions interactively.
+
+    Run once per session file. TELECRIME_DOWNLOAD_SESSIONS must be set to a
+    comma-separated list of session names (e.g. 'download2,download3'). Each
+    session needs its own Telegram account/phone number. Telethon will prompt
+    for each verification code and persist a <name>.session file in the data
+    directory.
+    """
+    import asyncio
+
+    config, _ = get_config_and_engine(config_path)
+    names = config.telegram.download_session_names
+    if not names:
+        console.print(
+            "[red]TELECRIME_DOWNLOAD_SESSIONS is not set.[/red] "
+            "Set it (e.g. 'download2,download3') in .env or your config and re-run."
+        )
+        raise typer.Exit(1)
+
+    from telecrime.adapters.telegram import TelegramAdapter
+
+    async def _run() -> None:
+        for i, name in enumerate(names, start=1):
+            session_config = config.with_download_session(i)
+            session_path = (
+                session_config.data_dir / f"{session_config.telegram.session_name}.session"
+            )
+            console.print(
+                f"Authenticating download session [cyan]{name}[/cyan] "
+                f"(file: {session_path})"
+            )
+            adapter = TelegramAdapter(session_config)
+            try:
+                await adapter.connect(timeout=300)
+                assert adapter.client is not None
+                me = await adapter.client.get_me()
+                console.print(
+                    f"[green]Download session {name} ready[/green] as "
+                    f"{me.first_name or ''} (id={me.id})"
+                )
+            finally:
+                await adapter.disconnect()
+
+    asyncio.run(_run())
+
+
 @app.command()
 def repair(
     config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
@@ -398,6 +448,15 @@ def run(
         adapter = TelegramAdapter(config)
         console_display = PipelineDisplay(console=console)
 
+        # Parallel download sessions: one extra adapter per configured session
+        # name. Each session (separate Telegram account) has its own download
+        # speed budget, so N sessions multiply download throughput.
+        download_adapters: list[TelegramAdapter] = []
+        for i in range(1, len(config.telegram.download_session_names) + 1):
+            download_adapters.append(
+                TelegramAdapter(config.with_download_session(i))
+            )
+
         try:
             with pipeline_run_lock(config.data_dir):
                 # Construct PipelineProgressWriter inside the lock so its __init__
@@ -408,9 +467,19 @@ def run(
                 console.print("Connecting to Telegram...")
                 await adapter.connect()
 
+                # Connect extra download sessions in parallel.
+                for dl_adapter in download_adapters:
+                    console.print(
+                        f"Connecting download session {dl_adapter.config.telegram.session_name}..."
+                    )
+                    await dl_adapter.connect()
+                if download_adapters:
+                    console.print(
+                        f"[green]Download pool: {1 + len(download_adapters)} sessions[/green]"
+                    )
+
                 # Create notifier for progress updates to Saved Messages
                 notifier = TelegramNotifier(adapter.client, enabled=True)
-
                 with get_session(engine) as session:
                     # Disable idle-in-transaction timeout for the pipeline session.
                     # The pipeline commits before each long network/I/O operation,
@@ -435,6 +504,7 @@ def run(
                                 limit=limit,
                                 display=display,
                                 prefetch_count=prefetch,
+                                download_adapters=download_adapters,
                             )
                         else:
                             pipeline = create_default_pipeline(config, session, adapter)
@@ -459,6 +529,11 @@ def run(
                 await adapter.disconnect()
             except Exception:
                 pass
+            for dl_adapter in download_adapters:
+                try:
+                    await dl_adapter.disconnect()
+                except Exception:
+                    pass
             # Drain any background tasks Telethon left behind (e.g.
             # Connection._send_loop, queue waiters from auto_reconnect=True).
             # Without this, asyncio.run() closes the loop while these are

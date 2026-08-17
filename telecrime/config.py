@@ -38,6 +38,10 @@ class TelegramConfig:
     phone: str | None = None
     # Separate session for housekeeping jobs so they don't wait on the pipeline.
     aux_session_name: str | None = None
+    # Additional session files used for parallel downloads. Each session is a
+    # separate Telegram account, so it has its own download speed budget
+    # (~2 MB/s each). Configure via TELECRIME_DOWNLOAD_SESSIONS (comma list).
+    download_session_names: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -63,6 +67,13 @@ class DownloadConfig:
     # Number of archives to pre-download while current archive is being processed.
     # Max 3 (higher values risk Telegram rate-limiting / temporary ban).
     prefetch_count: int = 2
+    # Number of parallel upload.getFile chunk streams used per large download.
+    # Telegram throttles a single sequential stream (~1-2 MB/s); parallel chunk
+    # striping multiplies throughput (measured ~5-7 MB/s with 8 streams on a
+    # premium account). 1 disables parallel downloads entirely.
+    parallel_chunks: int = 8
+    # Files smaller than this are downloaded sequentially (overhead not worth it).
+    parallel_min_bytes: int = 4 * 1024 * 1024
 
 
 @dataclass
@@ -97,6 +108,19 @@ class Config:
             return self
         new_telegram = dataclasses.replace(
             self.telegram, session_name=self.telegram.aux_session_name
+        )
+        return dataclasses.replace(self, telegram=new_telegram)
+
+    def with_download_session(self, index: int) -> "Config":
+        """Return a copy pointing at the (index)-th parallel download session.
+
+        index 0 is the main session; 1..N map to download_session_names.
+        """
+        names = self.telegram.download_session_names
+        if index == 0 or not names or index > len(names):
+            return self
+        new_telegram = dataclasses.replace(
+            self.telegram, session_name=names[index - 1]
         )
         return dataclasses.replace(self, telegram=new_telegram)
 
@@ -184,6 +208,10 @@ def _apply_env_vars(config: Config) -> None:
         config.telegram.api_hash = api_hash
     if aux := os.environ.get("TELECRIME_TELEGRAM_AUX_SESSION_NAME"):
         config.telegram.aux_session_name = aux
+    if sessions := os.environ.get("TELECRIME_DOWNLOAD_SESSIONS"):
+        config.telegram.download_session_names = [
+            s.strip() for s in sessions.split(",") if s.strip()
+        ]
     if extensions := os.environ.get("TELECRIME_TARGET_EXTENSIONS"):
         config.extraction.target_extensions = [e.strip() for e in extensions.split(",")]
     if max_seconds := os.environ.get("TELECRIME_MAX_EXTRACTION_SECONDS"):
@@ -192,6 +220,10 @@ def _apply_env_vars(config: Config) -> None:
         config.extraction.min_free_disk_mb = int(min_free)
     if scheduler_min_free := os.environ.get("TELECRIME_SCHEDULER_MIN_FREE_DISK_GB"):
         config.extraction.scheduler_min_free_disk_gb = float(scheduler_min_free)
+    if parallel_chunks := os.environ.get("TELECRIME_PARALLEL_CHUNKS"):
+        config.download.parallel_chunks = int(parallel_chunks)
+    if parallel_min := os.environ.get("TELECRIME_PARALLEL_MIN_BYTES"):
+        config.download.parallel_min_bytes = int(parallel_min)
 
 
 def _remove_none_values(d: ConfigDict) -> ConfigDict:
@@ -228,6 +260,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             "session_name": config.telegram.session_name,
             "phone": config.telegram.phone,
             "aux_session_name": config.telegram.aux_session_name,
+            "download_session_names": config.telegram.download_session_names,
         },
         "extraction": {
             "target_extensions": config.extraction.target_extensions,
@@ -238,6 +271,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         },
         "download": {
             "max_retries": config.download.max_retries,
+            "parallel_chunks": config.download.parallel_chunks,
+            "parallel_min_bytes": config.download.parallel_min_bytes,
         },
     }
 
