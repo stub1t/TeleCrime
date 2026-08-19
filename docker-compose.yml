@@ -78,6 +78,11 @@ services:
       # multiply the I/O wait. One focused insert stream beats N competing
       # ones on this disk-bound workload.
       TELECRIME_READY_GROUP_CONCURRENCY: "1"
+      # Parse worker processes: 1 = sequential parse. This host is RAM-tight
+      # (Postgres holds multi-GB buffers; only ~400MB free), so spawning parse
+      # workers gets them OOM-killed -> BrokenProcessPool -> the pipeline hangs
+      # forever on large files instead of parsing them.
+      TELECRIME_PARSE_WORKERS: "1"
     env_file:
       - path: .env
         required: false

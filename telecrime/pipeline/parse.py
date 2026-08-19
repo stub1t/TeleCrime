@@ -264,6 +264,11 @@ class ParseStage(PipelineStage):
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
             in_flight: list[Future] = []
             submitting = True
+            # If the spawn workers get OOM-killed (RAM-tight host), the pool
+            # breaks: futures stay pending forever and this generator would
+            # hang the pipeline. Detect no-progress and bail out so the caller
+            # can fall back to the sequential parse.
+            last_result_at = time.monotonic()
             try:
                 while True:
                     # Refill the in-flight window from the reader thread.
@@ -286,6 +291,7 @@ class ParseStage(PipelineStage):
                     # on a threaded wait() that could re-enter pool locks.
                     await asyncio.sleep(0.05)
                     still_pending: list[Future] = []
+                    progressed = False
                     for fut in in_flight:
                         if not fut.done():
                             still_pending.append(fut)
@@ -294,10 +300,22 @@ class ParseStage(PipelineStage):
                             chunk_result = fut.result()
                         except Exception as exc:
                             logger.warning("Parallel parse chunk failed: %s", exc)
-                            continue
+                            raise RuntimeError(
+                                "parallel parse pool failed — falling back to sequential"
+                            ) from exc
+                        progressed = True
                         for tup in chunk_result:
                             yield tup
                     in_flight = still_pending
+                    if progressed:
+                        last_result_at = time.monotonic()
+                    elif in_flight and time.monotonic() - last_result_at > 120:
+                        # No result for 2 minutes while futures are pending →
+                        # workers are dead (OOM). Abort instead of hanging.
+                        raise RuntimeError(
+                            "parallel parse produced no results for 120s — "
+                            "falling back to sequential"
+                        )
             finally:
                 await read_task
 
@@ -665,60 +683,11 @@ class ParseStage(PipelineStage):
             # (lower overhead, and the tests exercise that path directly).
             file_size = file_path.stat().st_size if file_path.exists() else 0
             workers = self._parallel_worker_count()
-            if file_size >= _PARALLEL_PARSE_MIN_BYTES and workers > 1:
-                logger.info(
-                    "Parsing %s in parallel (%d workers, %.1f MB)",
-                    file_path.name, workers, file_size / 1024 / 1024,
-                )
-                credential_iter = self._iter_parallel_credentials(
-                    file_path, str(file_path), workers
-                )
-                async for tup in credential_iter:
-                    if file_skipped_as_dup:
-                        break
-                    url, username, password, application, profile = tup
-                    cred = Credential(
-                        url=url,
-                        username=username,
-                        password=password,
-                        application=application,
-                        profile=profile,
-                        source_file=str(file_path),
-                    )
-                    batch.append(cred)
-                    file_cred_count += 1
 
-                    if len(batch) >= _BATCH_SIZE:
-                        new, dups = await _flush_batch(batch)
-                        credentials_found += new
-                        duplicates_found += dups
-                        if ctx.display:
-                            # Single write/redraw per batch instead of two back-to-back.
-                            ctx.display.update_counts(
-                                ctx.credentials_parsed + credentials_found,
-                                ctx.duplicates_skipped + duplicates_found,
-                            )
-                        batch = []
-                        batches_since_commit += 1
-                        # Commit every 2 batches (20K rows) — more frequent commits
-                        # unblock CONCURRENTLY index builds and dashboard readers faster.
-                        if batches_since_commit >= 2:
-                            ctx.session.commit()
-                            batches_since_commit = 0
-                        # Yield to event loop between batches so downloads can progress
-                        await asyncio.sleep(0)
-
-                        if _is_dup_batch(new, dups, _BATCH_SIZE):
-                            dup_batches_seen += 1
-                            if dup_batches_seen >= dup_confirm_batches:
-                                file_skipped_as_dup = True
-                                logger.info(
-                                    "Early-skip %s: %d consecutive batches at %.0f%% duplicates",
-                                    file_path.name, dup_batches_seen, (dups / (new + dups)) * 100,
-                                )
-                        else:
-                            dup_batches_seen = 0
-            else:
+            async def _sequential_parse() -> None:
+                nonlocal batch, file_cred_count, credentials_found
+                nonlocal duplicates_found, batches_since_commit
+                nonlocal dup_batches_seen, file_skipped_as_dup
                 for cred in iter_credentials_file(file_path):
                     if file_skipped_as_dup:
                         break
@@ -730,21 +699,16 @@ class ParseStage(PipelineStage):
                         credentials_found += new
                         duplicates_found += dups
                         if ctx.display:
-                            # Single write/redraw per batch instead of two back-to-back.
                             ctx.display.update_counts(
                                 ctx.credentials_parsed + credentials_found,
                                 ctx.duplicates_skipped + duplicates_found,
                             )
                         batch = []
                         batches_since_commit += 1
-                        # Commit every 2 batches (20K rows) — more frequent commits
-                        # unblock CONCURRENTLY index builds and dashboard readers faster.
                         if batches_since_commit >= 2:
                             ctx.session.commit()
                             batches_since_commit = 0
-                        # Yield to event loop between batches so downloads can progress
                         await asyncio.sleep(0)
-
                         if _is_dup_batch(new, dups, _BATCH_SIZE):
                             dup_batches_seen += 1
                             if dup_batches_seen >= dup_confirm_batches:
@@ -755,6 +719,70 @@ class ParseStage(PipelineStage):
                                 )
                         else:
                             dup_batches_seen = 0
+
+            if file_size >= _PARALLEL_PARSE_MIN_BYTES and workers > 1:
+                try:
+                    logger.info(
+                        "Parsing %s in parallel (%d workers, %.1f MB)",
+                        file_path.name, workers, file_size / 1024 / 1024,
+                    )
+                    async for tup in self._iter_parallel_credentials(
+                        file_path, str(file_path), workers
+                    ):
+                        if file_skipped_as_dup:
+                            break
+                        url, username, password, application, profile = tup
+                        batch.append(
+                            Credential(
+                                url=url,
+                                username=username,
+                                password=password,
+                                application=application,
+                                profile=profile,
+                                source_file=str(file_path),
+                            )
+                        )
+                        file_cred_count += 1
+
+                        if len(batch) >= _BATCH_SIZE:
+                            new, dups = await _flush_batch(batch)
+                            credentials_found += new
+                            duplicates_found += dups
+                            if ctx.display:
+                                ctx.display.update_counts(
+                                    ctx.credentials_parsed + credentials_found,
+                                    ctx.duplicates_skipped + duplicates_found,
+                                )
+                            batch = []
+                            batches_since_commit += 1
+                            if batches_since_commit >= 2:
+                                ctx.session.commit()
+                                batches_since_commit = 0
+                            await asyncio.sleep(0)
+                            if _is_dup_batch(new, dups, _BATCH_SIZE):
+                                dup_batches_seen += 1
+                                if dup_batches_seen >= dup_confirm_batches:
+                                    file_skipped_as_dup = True
+                                    logger.info(
+                                        "Early-skip %s: %d consecutive batches at %.0f%% duplicates",
+                                        file_path.name, dup_batches_seen,
+                                        (dups / (new + dups)) * 100,
+                                    )
+                            else:
+                                dup_batches_seen = 0
+                except Exception as exc:
+                    # Parallel pool broke (e.g. spawn workers OOM-killed on a
+                    # RAM-tight host -> BrokenProcessPool or 120s no-progress).
+                    # Already-parsed rows live in the DB (dedup), so re-parsing
+                    # the file sequentially is safe, not duplicated.
+                    logger.warning(
+                        "Parallel parse of %s failed (%s) — falling back to "
+                        "sequential parse",
+                        file_path.name, exc,
+                    )
+                    await _sequential_parse()
+            else:
+                await _sequential_parse()
 
             # Flush any remaining credentials
             new, dups = await _flush_batch(batch)
