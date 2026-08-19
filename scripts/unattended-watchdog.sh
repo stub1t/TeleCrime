@@ -84,13 +84,14 @@ if [ -n "$SIG" ] && [ -f "$SNAP" ]; then
 fi
 echo "$SIG" > "$SNAP"
 
-# Pipeline stage — the extract phase (7z/unrar subprocess) is a legitimate
-# long-running state: a multi-GB archive with 50k+ files can take 1-2 h,
-# during which the signature, DB queries and downloads are all quiet.
-# Extraction is self-protected by _extraction_timeout (proportional to size),
-# so a truly stuck extraction fails on its own instead of needing the
-# watchdog — treating it as "hung" kills healthy long extracts and loops
-# forever (2026-08-17: worker restarted every ~10 min on 92k-file RAR5s).
+# Pipeline stage — the extract and parse phases are legitimate long-running
+# states: 7z/unrar on 50k+ file archives can take 1-2 h, and parsing a
+# multi-GB / 500k-line ULP credential file can take 25-40+ min of pure-Python
+# regex with no downloads, no DB queries and a frozen signature. Both are
+# self-protected (extraction by its proportional timeout; parsing proceeds in
+# batches), so treating them as "hung" kills healthy long work — and an
+# aborted parse leaves the group EXTRACTED with its credentials never parsed
+# (finalize just cleans it) → permanent data loss.
 STAGE=$(python3 -c "
 import json, sys
 try:
@@ -149,12 +150,15 @@ elif [ "$FROZEN" = "1" ] && [ "$DB_ACTIVE" = "0" ] && [ "$DL_ACTIVE" = "0" ]; th
   # Fresh heartbeat but the counters/archive/download have not moved between
   # two consecutive checks AND there is no DB query running AND no active
   # download → the main loop is deadlocked while the heartbeat thread ticks.
-  # EXCEPT during the extract phase (long subprocess, see STAGE above) —
-  # extraction failures/timeouts are handled by the pipeline itself.
-  if [ "$STAGE" != "extract" ]; then
-    NEED_HEAL=1
-    REASON="hung pipeline (progress frozen for two checks, no DB or download activity)"
-  fi
+  # EXCEPT during the extract/parse phases (long subprocess/regex work, see
+  # STAGE above) — those are self-protected and must not be killed.
+  case "$STAGE" in
+    extract|parse) : ;;
+    *) if [ "$FROZEN" = "1" ]; then
+         NEED_HEAL=1
+         REASON="hung pipeline (progress frozen for two checks, no DB or download activity)"
+       fi ;;
+  esac
 fi
 
 if [ "$NEED_HEAL" = "1" ]; then
