@@ -862,6 +862,15 @@ class ParseStage(PipelineStage):
                     raw_conn = ctx.session.connection().connection
                     cursor = raw_conn.cursor()
                     try:
+                        # The DB server default is statement_timeout=5min and the
+                        # session-level SET (in _apply_pg_bulk_settings) is lost
+                        # when the pooled connection is recycled between commits.
+                        # Re-apply on the RAW connection that actually runs the
+                        # COPY/INSERT so large chunks never hit the 5-min cap
+                        # (would drop the whole chunk — 20k rows lost per hit).
+                        cursor.execute("SET statement_timeout = 0")
+                        cursor.execute("SET lock_timeout = 0")
+                        cursor.execute("SET synchronous_commit = off")
                         # Reuse the staging temp table across chunks within the
                         # same transaction for fewer DDL ticks.
                         cursor.execute(
