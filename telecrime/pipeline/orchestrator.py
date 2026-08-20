@@ -256,24 +256,70 @@ async def _prefetch_download(
     ctx: PipelineContext,
     acquire_stage,
     artifact,
+    engine,
     adapter: BaseAdapter | None = None,
 ) -> bool:
     """Download an artifact in the background while the current one is processed.
 
-    Only downloads the file — does NOT update group statuses or commit the session.
-    The caller is responsible for calling _update_group_statuses and committing after
-    awaiting this task, to avoid concurrent session access.
+    Prefetch downloads use an isolated session. The parser can have uncommitted
+    credential rows in the main session, so a download failure must not roll those
+    rows back and a download commit must not commit parser work accidentally.
+
+    Group-status reconciliation remains the caller's responsibility after the task
+    completes.
 
     If adapter is given (a pooled download session), a copy of the context is used
-    so the download runs through that session while sharing the DB session.
+    so the download runs through that session.
     """
-    if adapter is not None and adapter is not ctx.adapter:
-        ctx = replace(ctx, adapter=adapter)
-    try:
-        return await acquire_stage._download_artifact(ctx, artifact)
-    except (Exception, asyncio.CancelledError) as e:
-        logger.warning("Background download error for artifact %d: %s", artifact.id, e)
-        return False
+    with get_session(engine) as task_session:
+        task_artifact = (
+            task_session.execute(
+                select(DownloadArtifact)
+                .where(DownloadArtifact.id == artifact.id)
+                .options(
+                    joinedload(DownloadArtifact.attachment)
+                    .joinedload(FileAttachment.message)
+                )
+            )
+            .unique()
+            .scalar_one_or_none()
+        )
+        if task_artifact is None:
+            logger.warning("Background download artifact %d no longer exists", artifact.id)
+            return False
+
+        task_ctx = replace(
+            ctx,
+            session=task_session,
+            adapter=adapter if adapter is not None else ctx.adapter,
+        )
+        try:
+            return await acquire_stage._download_artifact(task_ctx, task_artifact)
+        except (Exception, asyncio.CancelledError) as e:
+            logger.warning("Background download error for artifact %d: %s", artifact.id, e)
+            return False
+
+
+def _reset_prefetch_artifact(session: Session, artifact_id: int) -> None:
+    """Reset a still-running prefetch artifact without touching other work."""
+    artifact = (
+        session.execute(
+            select(DownloadArtifact)
+            .where(DownloadArtifact.id == artifact_id)
+            .execution_options(populate_existing=True)
+        )
+        .scalar_one_or_none()
+    )
+    if artifact is None or artifact.status != DownloadStatus.DOWNLOADING:
+        return
+
+    if artifact.temp_path:
+        try:
+            Path(str(artifact.temp_path)).unlink(missing_ok=True)
+        except Exception as e:
+            logger.debug("Could not remove temp file %s: %s", artifact.temp_path, e)
+    artifact.status = DownloadStatus.PENDING
+    artifact.temp_path = None
 
 
 async def _process_ready_group(
@@ -649,6 +695,8 @@ async def run_sequential_pipeline(
                             "Prefetch task for artifact %s raised: %s",
                             getattr(artifact, "id", "?"), e,
                         )
+                    if reset_pending:
+                        _reset_prefetch_artifact(session, artifact.id)
                     continue
 
                 task.cancel()
@@ -656,14 +704,7 @@ async def run_sequential_pipeline(
                 if not reset_pending:
                     continue
 
-                if getattr(artifact, "temp_path", None):
-                    try:
-                        Path(str(artifact.temp_path)).unlink(missing_ok=True)
-                    except Exception as e:
-                        logger.debug("Could not remove temp file %s: %s", artifact.temp_path, e)
-                if getattr(artifact, "status", None) == DownloadStatus.DOWNLOADING:
-                    artifact.status = DownloadStatus.PENDING
-                    artifact.temp_path = None
+                _reset_prefetch_artifact(session, artifact.id)
 
             await acquire_stage._update_group_statuses(ctx)
             session.commit()
@@ -1037,9 +1078,7 @@ async def run_sequential_pipeline(
                         _next_task.cancel()
                         await asyncio.wait({_next_task}, timeout=5.0)
                         # Reset artifact so recover_stuck_downloads picks it up next run
-                        if artifact.status == DownloadStatus.DOWNLOADING:
-                            artifact.status = DownloadStatus.PENDING
-                            artifact.temp_path = None
+                        _reset_prefetch_artifact(session, artifact.id)
                         session.commit()
                         _prefetch_task_result = False
                     needs_download = not _prefetch_task_result
@@ -1152,6 +1191,7 @@ async def run_sequential_pipeline(
                                         ctx,
                                         acquire_stage,
                                         next_pending,
+                                        engine,
                                         adapter=_dl_adapter,
                                     )
                                 )

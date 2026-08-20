@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import re
+import time
 from collections import Counter
 from collections.abc import AsyncGenerator, Iterator
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -884,6 +885,7 @@ class ParseStage(PipelineStage):
         for i in range(0, len(rows), _INSERT_CHUNK_SIZE):
             chunk = rows[i : i + _INSERT_CHUNK_SIZE]
             chunk_ok = False
+            last_error: Exception | None = None
             for attempt in range(2):
                 savepoint = ctx.session.begin_nested()
                 try:
@@ -995,6 +997,7 @@ class ParseStage(PipelineStage):
                     chunk_ok = True
                     break
                 except Exception as exc:
+                    last_error = exc
                     try:
                         savepoint.rollback()
                     except Exception:
@@ -1010,7 +1013,15 @@ class ParseStage(PipelineStage):
                             type(exc).__name__, exc,
                         )
             if not chunk_ok:
-                logger.warning("Skipped %d credentials due to persistent chunk error", len(chunk))
+                logger.error(
+                    "Credential COPY chunk failed after retry; aborting parse instead of "
+                    "silently dropping %d credentials: %s",
+                    len(chunk),
+                    last_error,
+                )
+                raise RuntimeError(
+                    f"Credential COPY chunk failed after retry ({len(chunk)} rows)"
+                ) from last_error
 
         return inserted
 
