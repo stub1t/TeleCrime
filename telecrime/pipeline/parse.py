@@ -896,9 +896,13 @@ class ParseStage(PipelineStage):
                         # session-level SET (in _apply_pg_bulk_settings) is lost
                         # when the pooled connection is recycled between commits.
                         # Re-apply on the RAW connection that actually runs the
-                        # COPY/INSERT so large chunks never hit the 5-min cap
-                        # (would drop the whole chunk — 20k rows lost per hit).
-                        cursor.execute("SET statement_timeout = 0")
+                        # COPY/INSERT. A generous 10-min bound (not 0) still
+                        # allows legitimately slow disk-bound batches while
+                        # auto-cancelling the pathological 11+ minute anti-join
+                        # INSERTs (cold index reads on a 200M+ row table); the
+                        # chunk savepoint + retry + abort-on-persistent-error
+                        # path keeps that safe — no rows are lost.
+                        cursor.execute("SET statement_timeout = 600000")
                         cursor.execute("SET lock_timeout = 0")
                         cursor.execute("SET synchronous_commit = off")
                         # Reuse the staging temp table across chunks within the
