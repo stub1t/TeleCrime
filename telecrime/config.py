@@ -92,9 +92,17 @@ class Config:
     download: DownloadConfig = field(default_factory=DownloadConfig)
 
     def __post_init__(self) -> None:
-        """Hook reserved for future derived defaults. database_url is
-        validated at load_config()/engine creation time, not here, so bare
-        Config() construction stays viable for tests and tooling."""
+        """Keep derived paths alongside a custom data directory.
+
+        Explicit download/extraction paths remain untouched, while the default
+        paths follow ``data_dir`` when it is supplied by a config file or test.
+        """
+        default_data_dir = get_default_data_dir()
+        if self.data_dir != default_data_dir:
+            if self.downloads_dir == default_data_dir / "downloads":
+                self.downloads_dir = self.data_dir / "downloads"
+            if self.extracted_dir == default_data_dir / "extracted":
+                self.extracted_dir = self.data_dir / "extracted"
 
     def ensure_directories(self) -> None:
         """Create all required directories."""
@@ -162,7 +170,7 @@ def _apply_config_dict(config: Config, data: ConfigDict) -> None:
     if "database_url" in data:
         config.database_url = data["database_url"]
     if "data_dir" in data:
-        config.data_dir = Path(data["data_dir"])
+        _set_data_dir(config, Path(data["data_dir"]))
 
     if "telegram" in data:
         tg = data["telegram"]
@@ -201,7 +209,7 @@ def _apply_env_vars(config: Config) -> None:
     if url := os.environ.get("TELECRIME_DATABASE_URL"):
         config.database_url = url
     if data_dir := os.environ.get("TELECRIME_DATA_DIR"):
-        config.data_dir = Path(data_dir)
+        _set_data_dir(config, Path(data_dir))
     if api_id := os.environ.get("TELECRIME_TELEGRAM_API_ID"):
         config.telegram.api_id = int(api_id)
     if api_hash := os.environ.get("TELECRIME_TELEGRAM_API_HASH"):
@@ -224,6 +232,15 @@ def _apply_env_vars(config: Config) -> None:
         config.download.parallel_chunks = int(parallel_chunks)
     if parallel_min := os.environ.get("TELECRIME_PARALLEL_MIN_BYTES"):
         config.download.parallel_min_bytes = int(parallel_min)
+
+
+def _set_data_dir(config: Config, data_dir: Path) -> None:
+    """Set data_dir and update only paths that still use its derived defaults."""
+    if config.downloads_dir == config.data_dir / "downloads":
+        config.downloads_dir = data_dir / "downloads"
+    if config.extracted_dir == config.data_dir / "extracted":
+        config.extracted_dir = data_dir / "extracted"
+    config.data_dir = data_dir
 
 
 def _remove_none_values(d: ConfigDict) -> ConfigDict:

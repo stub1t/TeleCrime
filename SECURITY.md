@@ -4,8 +4,8 @@
 
 Telecrime processes credential data sourced from stealer-log Telegram channels.
 The repository itself contains **no runtime data**: no credentials, no channel
-lists, no Telegram sessions, no database dumps. All of that lives on the
-operator's encrypted external storage and never enters git.
+lists, no Telegram sessions, no database dumps. Runtime data belongs in the
+operator-configured data directory and never enters git.
 
 ## Reporting a vulnerability
 

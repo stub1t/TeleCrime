@@ -1045,9 +1045,9 @@ def _ensure_stats_indexes(engine) -> None:
 
 
 def _stats_cache_path() -> Path:
-    # parent.parent.parent lands on the project root (/app in container),
-    # so the cache lives on the mounted volume rather than inside the package.
-    return Path(__file__).parent.parent.parent / "data" / "stats_cache.json"
+    default_data_dir = Path(__file__).parent.parent.parent / "data"
+    data_dir = Path(os.environ.get("TELECRIME_DATA_DIR", str(default_data_dir)))
+    return data_dir / "stats_cache.json"
 
 
 # Protects read-modify-write cycles on the shared stats cache JSON file.
@@ -2145,25 +2145,29 @@ def _compute_stats_payload(engine, days: int, limit: int) -> dict[str, object]:
 def create_app(database_url: str | None = None) -> FastAPI:
     """Create FastAPI app bound to the Telecrime database."""
     engine = get_engine(database_url)
+    # str(engine.url) masks the password; background workers must receive a
+    # URL they can actually connect with when create_app() is called without
+    # an explicit database_url.
+    worker_database_url = database_url or engine.url.render_as_string(hide_password=False)
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
         if not os.environ.get("TELECRIME_DISABLE_STATS_WORKER") == "1":
             stats_worker = threading.Thread(
                 target=_stats_worker,
-                args=(database_url or str(engine.url), app.state.stats_presets, 600),
+                args=(worker_database_url, app.state.stats_presets, 600),
                 daemon=True,
             )
             stats_worker.start()
             home_worker = threading.Thread(
                 target=_home_worker,
-                args=(database_url or str(engine.url), 600),
+                args=(worker_database_url, 600),
                 daemon=True,
             )
             home_worker.start()
             watchlist_thread = threading.Thread(
                 target=_watchlist_worker,
-                args=(database_url or str(engine.url), 1800),
+                args=(worker_database_url, 1800),
                 daemon=True,
             )
             watchlist_thread.start()

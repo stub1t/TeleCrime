@@ -39,7 +39,11 @@ logger = logging.getLogger(LOGGER_NAME)
 # Also log to the repo data dir so commands are inspectable next to the
 # pipeline logs, not only in the systemd journal.
 try:
-    _log_path = Path(__file__).resolve().parent.parent / "data" / "tg_bridge.log"
+    _data_dir = Path(
+        os.environ.get("TELECRIME_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data"))
+    )
+    _data_dir.mkdir(parents=True, exist_ok=True)
+    _log_path = _data_dir / "tg_bridge.log"
     _fh = logging.FileHandler(_log_path)
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(_fh)
@@ -85,15 +89,9 @@ async def _run_opencode(
     """
     import re
 
-    # systemd user services have a minimal PATH — resolve the binary explicitly.
-    opencode_bin = shutil.which("opencode") or next(
-        (p for p in (
-            "/home/user/.opencode/bin/opencode",
-            "/usr/local/bin/opencode",
-            "/usr/bin/opencode",
-        ) if Path(p).exists()),
-        None,
-    )
+    # Allow service managers to provide a non-standard binary location without
+    # baking a particular user's home directory into the bridge.
+    opencode_bin = os.environ.get("OPENCODE_BIN") or shutil.which("opencode")
     if opencode_bin is None:
         return "opencode binary not found — install opencode for this user"
     cmd = [opencode_bin, "run", "--format", "json", "--auto"]
@@ -183,12 +181,6 @@ async def main() -> None:
     from telecrime.adapters.telegram import TelegramAdapter
 
     config = load_config()
-    # The live data dir is /mnt/telecrime (bind-mounted into the containers);
-    # the repo-default data/ dir holds a stale session from an old deployment.
-    if "TELECRIME_DATA_DIR" not in os.environ:
-        live_dir = Path("/mnt/telecrime/data")
-        if live_dir.exists() and (live_dir / "telecrime.session").exists():
-            config.data_dir = live_dir
     data_dir = config.data_dir
     session_path = data_dir / "telecrime_bridge.session"
     live_path = data_dir / f"{config.telegram.session_name}.session"

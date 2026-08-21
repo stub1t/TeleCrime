@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-_PROGRESS_FILE = Path(__file__).parent.parent.parent / "data" / "pipeline_progress.json"
+_DEFAULT_DATA_DIR = Path(__file__).parent.parent.parent / "data"
 
 # Runtime-note fields patched via patch_progress() (e.g. from TelegramAdapter) are stored
 # here so that PipelineProgressWriter._write() can merge them on every write.  Without this,
@@ -36,7 +36,9 @@ STAGE_ORDER = [
 
 
 def _progress_path() -> Path:
-    return Path(os.environ.get("TELECRIME_PROGRESS_FILE", str(_PROGRESS_FILE)))
+    default_data_dir = Path(os.environ.get("TELECRIME_DATA_DIR", str(_DEFAULT_DATA_DIR)))
+    default_path = default_data_dir / "pipeline_progress.json"
+    return Path(os.environ.get("TELECRIME_PROGRESS_FILE", str(default_path)))
 
 
 def _write_progress_data(data: dict[str, object]) -> None:

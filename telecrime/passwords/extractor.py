@@ -1,5 +1,6 @@
 """Password extraction from message context."""
 
+import os
 import re
 from pathlib import Path
 
@@ -10,8 +11,7 @@ from telecrime.config import Config
 from telecrime.models import Conversation, Message, PasswordCandidate
 from telecrime.states import PasswordScope
 
-# Default password file location
-DEFAULT_PASSWORD_FILE = Path(__file__).parent.parent.parent / "data" / "passwords.txt"
+_DEFAULT_DATA_DIR = Path(__file__).parent.parent.parent / "data"
 
 # Cache: (path, mtime) -> list[str]. Avoids re-reading the file on every archive.
 _password_file_cache: dict[Path, tuple[float, list[str]]] = {}
@@ -19,7 +19,9 @@ _password_file_cache: dict[Path, tuple[float, list[str]]] = {}
 
 def load_password_file(path: Path | None = None) -> list[str]:
     """Load passwords from a text file, caching by mtime."""
-    path = path or DEFAULT_PASSWORD_FILE
+    if path is None:
+        data_dir = Path(os.environ.get("TELECRIME_DATA_DIR", str(_DEFAULT_DATA_DIR)))
+        path = data_dir / "passwords.txt"
     if not path.exists():
         return []
 

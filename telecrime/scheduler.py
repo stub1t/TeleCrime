@@ -31,9 +31,7 @@ _status_lock = threading.Lock()
 # Status persistence
 # ---------------------------------------------------------------------------
 
-_STATUS_FILE = Path(__file__).parent.parent / "data" / "scheduler_status.json"
-_PIPELINE_PID_FILE = Path(__file__).parent.parent / "data" / "pipeline.pid"
-_SHUTDOWN_REQUEST_FILE = Path(__file__).parent.parent / "data" / "pipeline_shutdown_request.json"
+_DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
 
 JOB_DEFS: dict[str, dict] = {
     "pipeline": {
@@ -142,16 +140,22 @@ def _iso_age_seconds(value: str | None) -> float | None:
 
 
 def _status_path() -> Path:
-    return Path(os.environ.get("TELECRIME_STATUS_FILE", str(_STATUS_FILE)))
+    data_dir = Path(os.environ.get("TELECRIME_DATA_DIR", str(_DEFAULT_DATA_DIR)))
+    return Path(os.environ.get("TELECRIME_STATUS_FILE", str(data_dir / "scheduler_status.json")))
 
 
 def _pipeline_pid_path() -> Path:
-    return Path(os.environ.get("TELECRIME_PIPELINE_PID_FILE", str(_PIPELINE_PID_FILE)))
+    data_dir = Path(os.environ.get("TELECRIME_DATA_DIR", str(_DEFAULT_DATA_DIR)))
+    return Path(os.environ.get("TELECRIME_PIPELINE_PID_FILE", str(data_dir / "pipeline.pid")))
 
 
 def _shutdown_request_path() -> Path:
+    data_dir = Path(os.environ.get("TELECRIME_DATA_DIR", str(_DEFAULT_DATA_DIR)))
     return Path(
-        os.environ.get("TELECRIME_SHUTDOWN_REQUEST_FILE", str(_SHUTDOWN_REQUEST_FILE))
+        os.environ.get(
+            "TELECRIME_SHUTDOWN_REQUEST_FILE",
+            str(data_dir / "pipeline_shutdown_request.json"),
+        )
     )
 
 
@@ -1009,7 +1013,7 @@ def _run_reparse_stealers_job(config, engine) -> str:
 
 
 def _run_channel_export_job(config, engine) -> str:
-    """Regenerate channels.md + channels.txt to /app/data/ for host pickup."""
+    """Regenerate channels.md + channels.txt in the configured data directory."""
     from telecrime.channels.export import export_reports
     from telecrime.database import get_session
 

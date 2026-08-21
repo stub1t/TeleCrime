@@ -381,7 +381,7 @@ async def process_folder(
     logger.info("Found %d archive files in %s", len(archives), folder)
     logger.info("Database: %s", config.database_url)
 
-    processed_marker = Path("data") / f".processed_{folder.name}.txt"
+    processed_marker = config.data_dir / f".processed_{folder.name}.txt"
     processed_marker.parent.mkdir(parents=True, exist_ok=True)
     already_processed: set[str] = set()
     if processed_marker.exists():
@@ -414,8 +414,9 @@ async def process_folder(
     # Setup extractor
     extractor = SevenZipExtractor()
 
-    # data/ keeps temp output off the (possibly read-only) source folder.
-    output_dir = Path("data") / f".extract_temp_{folder.name}"
+    # The configured data directory keeps temp output off the (possibly
+    # read-only) source folder.
+    output_dir = config.data_dir / f".extract_temp_{folder.name}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:

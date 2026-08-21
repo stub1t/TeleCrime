@@ -26,7 +26,48 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-DATA_DIR="${TELECRIME_DATA_DIR:-/mnt/telecrime/data}"
+COMPOSE_FILE="$REPO/docker-compose.yml"
+DATA_DIR="${TELECRIME_DATA_DIR:-$REPO/data}"
+
+compose() {
+    docker compose -f "$COMPOSE_FILE" "$@"
+}
+
+dotenv_value() {
+    local key="$1"
+    if [[ -n "${!key:-}" ]]; then
+        printf '%s' "${!key}"
+        return
+    fi
+    if [[ -f "$REPO/.env" ]]; then
+        (
+            set -a
+            # shellcheck disable=SC1091
+            . "$REPO/.env"
+            printf '%s' "${!key:-}"
+        )
+    fi
+}
+
+container_for() {
+    compose ps -q "$1"
+}
+
+copy_to_service() {
+    local service="$1"
+    local rel="$2"
+    local container
+    container="$(container_for "$service")"
+    if [[ -z "$container" ]]; then
+        echo "✗ service is not running: $service" >&2
+        exit 1
+    fi
+    docker cp "$REPO/$rel" "$container:/app/$rel"
+}
+
+cd "$REPO"
+DATA_DIR="${TELECRIME_DATA_DIR:-$(dotenv_value TELECRIME_DATA_DIR)}"
+DATA_DIR="${DATA_DIR:-$REPO/data}"
 
 if [[ $# -lt 1 ]]; then
     echo "usage: $0 <repo-relative-path> [<path>...]" >&2
@@ -50,8 +91,6 @@ classify() {
     esac
 }
 
-declare -a PIPELINE_TARGETS=(telecrime-worker-1 telecrime-web-1)
-
 for rel in "$@"; do
     if [[ ! -f "$REPO/$rel" ]]; then
         echo "✗ missing: $REPO/$rel" >&2
@@ -61,22 +100,21 @@ for rel in "$@"; do
     case "$cls" in
         scheduler)
             echo "→ $rel [scheduler-class]: will hot-cp + restart worker"
-            docker cp "$REPO/$rel" "telecrime-worker-1:/app/$rel"
+            copy_to_service worker "$rel"
             # Also push to web — it imports some scheduler helpers for the
             # dashboard's status panel (read-only helpers).
-            docker cp "$REPO/$rel" "telecrime-web-1:/app/$rel"
+            copy_to_service web "$rel"
             WORKER_RESTART=1
             ;;
         web)
             echo "→ $rel [web-class]: will hot-cp + restart web"
-            docker cp "$REPO/$rel" "telecrime-web-1:/app/$rel"
+            copy_to_service web "$rel"
             WEB_RESTART=1
             ;;
         pipeline)
             echo "→ $rel [pipeline-class]: hot-cp only (effective on next pipeline subprocess)"
-            for c in "${PIPELINE_TARGETS[@]}"; do
-                docker cp "$REPO/$rel" "$c:/app/$rel"
-            done
+            copy_to_service worker "$rel"
+            copy_to_service web "$rel"
             PIPELINE_KICK=1
             ;;
         unknown)
@@ -92,19 +130,19 @@ if (( WORKER_RESTART )); then
     # the SIGTERM-driven stop, so the new APScheduler doesn't see a leftover
     # file and refuse to run coalesced jobs.
     rm -f "$DATA_DIR/pipeline_shutdown_request.json"
-    docker stop -t 5 telecrime-worker-1 >/dev/null
+    compose stop -t 5 worker >/dev/null
     rm -f "$DATA_DIR/pipeline_shutdown_request.json"
-    docker start telecrime-worker-1 >/dev/null
+    compose up -d worker >/dev/null
     sleep 3
-    docker ps --format '  {{.Names}} {{.Status}}' | grep telecrime-worker-1
+    compose ps worker
 fi
 
 if (( WEB_RESTART )); then
     echo "--- restarting web (stop+start) ---"
-    docker stop -t 5 telecrime-web-1 >/dev/null
-    docker start telecrime-web-1 >/dev/null
+    compose stop -t 5 web >/dev/null
+    compose up -d web >/dev/null
     sleep 3
-    docker ps --format '  {{.Names}} {{.Status}}' | grep telecrime-web-1
+    compose ps web
 fi
 
 if (( PIPELINE_KICK )); then
@@ -114,7 +152,7 @@ if (( PIPELINE_KICK )); then
     echo "    a) wait — next scheduled pipeline run (≤10 min interval) picks it up"
     echo "    b) finish the current run, scheduler starts new one within 10 min"
     echo "    c) force immediate restart:"
-    echo "         docker top telecrime-worker-1 axo pid,cmd | awk '/telecrime run/{print \$1}' | xargs sudo kill -TERM"
+    echo "         docker compose -f \"$COMPOSE_FILE\" exec worker pkill -TERM -f 'telecrime run'"
 fi
 
 echo ""

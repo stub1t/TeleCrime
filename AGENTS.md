@@ -7,3 +7,7 @@ change to git **immediately** — do not wait for confirmation.
 
 See also `scripts/unattended-watchdog.sh` (host health-check, restart loop) and
 `docker-compose.yml` (worker/web/db).
+
+## Git workflow
+After making changes, commit them and push the commit to the configured remote
+without waiting for separate confirmation.

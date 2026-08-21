@@ -348,10 +348,14 @@ def dashboard(
     reload: bool = typer.Option(False, "--reload", help="Auto-reload on code changes"),
 ) -> None:
     """Run the web dashboard (local-only by default)."""
+    import os
+
     import uvicorn
 
     config, _engine = get_config_and_engine(config_path)
 
+    # Keep web-side runtime caches aligned with the same configured data root.
+    os.environ["TELECRIME_DATA_DIR"] = str(config.data_dir)
     from telecrime.web.app import create_app
 
     app_instance = create_app(config.database_url)

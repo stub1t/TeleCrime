@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Unlocks and mounts the encrypted SSD that holds the TeleCrime Postgres volume
-# and ./data dir. Run after each reboot before `docker compose up`.
+# Optional helper for unlocking and mounting a LUKS-backed data directory.
+# Run after each reboot before `docker compose up` when external storage is used.
 #
-#   sudo /home/user/TeleCrime/scripts/mount-encrypted-data.sh
+#   sudo ./scripts/mount-encrypted-data.sh
 #
 # Idempotent: skips steps that are already done.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 # Replace with your device's UUID — find it with: lsblk -o NAME,UUID
 LUKS_UUID="${TELECRIME_LUKS_UUID:-YOUR-LUKS-UUID-HERE}"
-MAPPER_NAME="telecrime-data"
-MOUNT_POINT="/mnt/telecrime"
+MAPPER_NAME="${TELECRIME_MAPPER_NAME:-telecrime-data}"
+MOUNT_POINT="${TELECRIME_MOUNT_POINT:-${TELECRIME_DATA_DIR:-$REPO_DIR/data}}"
 
 if [[ $EUID -ne 0 ]]; then
     echo "must be run as root (use sudo)" >&2

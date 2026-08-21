@@ -3,28 +3,21 @@ services:
     image: postgres:16-alpine
     command: >
       postgres
-      -c shared_buffers=8GB
-      -c effective_cache_size=14GB
-      -c work_mem=64MB
-      -c random_page_cost=2.0
-      -c autovacuum_vacuum_scale_factor=0.05
-      -c autovacuum_work_mem=1GB
-      -c max_wal_size=8GB
-      -c min_wal_size=1GB
-      -c wal_buffers=64MB
-      -c checkpoint_completion_target=0.7
-      -c maintenance_work_mem=512MB
-      -c effective_io_concurrency=200
-      -c statement_timeout=5min
-      -c lock_timeout=30s
-      -c idle_in_transaction_session_timeout=10min
+      -c shared_buffers=${TELECRIME_POSTGRES_SHARED_BUFFERS:-128MB}
+      -c effective_cache_size=${TELECRIME_POSTGRES_EFFECTIVE_CACHE_SIZE:-4GB}
+      -c work_mem=${TELECRIME_POSTGRES_WORK_MEM:-4MB}
+      -c maintenance_work_mem=${TELECRIME_POSTGRES_MAINTENANCE_WORK_MEM:-64MB}
+      -c max_wal_size=${TELECRIME_POSTGRES_MAX_WAL_SIZE:-1GB}
+      -c statement_timeout=${TELECRIME_POSTGRES_STATEMENT_TIMEOUT:-5min}
+      -c lock_timeout=${TELECRIME_POSTGRES_LOCK_TIMEOUT:-30s}
+      -c idle_in_transaction_session_timeout=${TELECRIME_POSTGRES_IDLE_TRANSACTION_TIMEOUT:-10min}
     environment:
       POSTGRES_DB: telecrime
       POSTGRES_USER: telecrime
       POSTGRES_PASSWORD: ${TELECRIME_POSTGRES_PASSWORD:-telecrime}
     ports:
-      - "5432:5432"
-    shm_size: 1g
+      - "${TELECRIME_POSTGRES_PORT:-5432}:5432"
+    shm_size: ${TELECRIME_POSTGRES_SHM_SIZE:-1g}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -40,11 +33,12 @@ services:
       sh -c "uv run alembic upgrade head &&
              uv run python -m telecrime dashboard --host 0.0.0.0 --port 8000"
     ports:
-      - "8000:8000"
+      - "${TELECRIME_WEB_PORT:-8000}:8000"
     volumes:
-      - /mnt/telecrime/data:/app/data
+      - "${TELECRIME_DATA_DIR:-./data}:/app/data"
     environment:
       TELECRIME_DATABASE_URL: "postgresql://telecrime:${TELECRIME_POSTGRES_PASSWORD:-telecrime}@db:5432/telecrime"
+      TELECRIME_DATA_DIR: /app/data
     env_file:
       - path: .env
         required: false
@@ -62,27 +56,15 @@ services:
   worker:
     build: .
     command: ["uv", "run", "python", "-m", "telecrime", "worker"]
-    stop_grace_period: 24h
+    stop_grace_period: ${TELECRIME_WORKER_STOP_GRACE_PERIOD:-5m}
     volumes:
-      - /mnt/telecrime/data:/app/data
+      - "${TELECRIME_DATA_DIR:-./data}:/app/data"
     environment:
       TELECRIME_DATABASE_URL: "postgresql://telecrime:${TELECRIME_POSTGRES_PASSWORD:-telecrime}@db:5432/telecrime"
-      # Bumped from default 1200s — orphan EXTRACTED groups can contain
-      # multi-GB credential text files (e.g. ULP dumps) that legitimately
-      # take 25-40 min of pure-Python regex parsing per file. Watchdog
-      # still detects truly dead subprocesses via the PID-liveness check.
-      TELECRIME_PIPELINE_STALE_SECONDS: "3600"
-      # Sequential group processing: every READY group inserts into the same
-      # 196GB parsed_credentials table, so parallel inserts only contend for
-      # the same dedup indexes (34GB exact + 16GB prefix + 38GB trgm) and
-      # multiply the I/O wait. One focused insert stream beats N competing
-      # ones on this disk-bound workload.
-      TELECRIME_READY_GROUP_CONCURRENCY: "1"
-      # Parse worker processes: 1 = sequential parse. This host is RAM-tight
-      # (Postgres holds multi-GB buffers; only ~400MB free), so spawning parse
-      # workers gets them OOM-killed -> BrokenProcessPool -> the pipeline hangs
-      # forever on large files instead of parsing them.
-      TELECRIME_PARSE_WORKERS: "1"
+      TELECRIME_DATA_DIR: /app/data
+      TELECRIME_PIPELINE_STALE_SECONDS: ${TELECRIME_PIPELINE_STALE_SECONDS:-1200}
+      TELECRIME_READY_GROUP_CONCURRENCY: ${TELECRIME_READY_GROUP_CONCURRENCY:-3}
+      TELECRIME_PARSE_WORKERS: ${TELECRIME_PARSE_WORKERS:-}
     env_file:
       - path: .env
         required: false
@@ -93,5 +75,4 @@ services:
 
 volumes:
   postgres_data:
-    external: true
-    name: telecrime_postgres_data_restored
+    name: ${TELECRIME_POSTGRES_VOLUME:-telecrime_postgres_data}

@@ -39,8 +39,6 @@ The stack consists of three containers:
 | `web` | FastAPI dashboard with full-text search on port 8000 |
 | `worker` | Scheduler + pipeline (supervised subprocess, watchdog-restarted) |
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for moving the stack to new hardware.
-
 ### Local development
 
 ```bash
@@ -60,6 +58,10 @@ export TELECRIME_TELEGRAM_API_ID=your_api_id
 export TELECRIME_TELEGRAM_API_HASH=your_api_hash
 export TELECRIME_DATABASE_URL=postgresql://telecrime:password@localhost:5432/telecrime
 ```
+
+For Docker, copy `.env.example` to `.env`. Data defaults to `./data` and the
+database defaults to a named Docker volume; set `TELECRIME_DATA_DIR` or
+`TELECRIME_POSTGRES_VOLUME` when using existing storage.
 
 Get your Telegram API credentials at https://my.telegram.org/apps
 

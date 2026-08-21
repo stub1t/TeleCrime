@@ -14,13 +14,41 @@
 #
 # Install:
 #   crontab -e
-#   */10 * * * * /home/user/TeleCrime/scripts/unattended-watchdog.sh >> /home/user/TeleCrime/data/watchdog.log 2>&1
+#   */10 * * * * /path/to/TeleCrime/scripts/unattended-watchdog.sh >> /path/to/TeleCrime/data/watchdog.log 2>&1
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
+DATA_DIR="${TELECRIME_DATA_DIR:-$REPO_DIR/data}"
 
-LOG=/mnt/telecrime/data/watchdog.log
-PROGRESS=/mnt/telecrime/data/pipeline_progress.json
+compose() {
+  docker compose -f "$COMPOSE_FILE" "$@"
+}
+
+dotenv_value() {
+  local key="$1"
+  if [[ -n "${!key:-}" ]]; then
+    printf '%s' "${!key}"
+    return
+  fi
+  if [[ -f "$REPO_DIR/.env" ]]; then
+    (
+      set -a
+      # shellcheck disable=SC1091
+      . "$REPO_DIR/.env"
+      printf '%s' "${!key:-}"
+    )
+  fi
+}
+
+cd "$REPO_DIR"
+DATA_DIR="${TELECRIME_DATA_DIR:-$(dotenv_value TELECRIME_DATA_DIR)}"
+DATA_DIR="${DATA_DIR:-$REPO_DIR/data}"
+mkdir -p "$DATA_DIR"
+
+LOG="$DATA_DIR/watchdog.log"
+PROGRESS="$DATA_DIR/pipeline_progress.json"
 SNAP=/tmp/telecrime-watchdog-snap.txt   # last observed progress signature
 STALE_HEARTBEAT_SEC=600      # pipeline must touch progress file this often
 NO_DB_ACTIVITY_SEC=300       # pipeline must have an active query this often
@@ -35,10 +63,14 @@ if ! flock -n 9; then
 fi
 
 # --- 1. Pipeline process running? ---
-PIPELINE_PID=$(cat /mnt/telecrime/data/pipeline.pid 2>/dev/null || echo 0)
+PIPELINE_PID=0
+if [[ -f "$DATA_DIR/pipeline.pid" ]]; then
+  PIPELINE_PID=$(<"$DATA_DIR/pipeline.pid")
+fi
 PIPELINE_ALIVE=0
 if [ "$PIPELINE_PID" != "0" ]; then
-  if docker exec "$(docker ps -q --filter name=worker)" sh -c "kill -0 $PIPELINE_PID 2>/dev/null" 2>/dev/null; then
+  WORKER_CONTAINER=$(compose ps -q worker 2>/dev/null)
+  if [[ -n "$WORKER_CONTAINER" ]] && docker exec "$WORKER_CONTAINER" sh -c "kill -0 $PIPELINE_PID 2>/dev/null" 2>/dev/null; then
     PIPELINE_ALIVE=1
   fi
 fi
@@ -122,7 +154,7 @@ fi
 # --- 4. Active DB query (pipeline doing real work)? ---
 DB_ACTIVE=0
 DB_ACTIVITY_AGE=9999
-DB_Q=$(timeout 20 docker compose exec -T db psql -U telecrime -t -A -c "
+DB_Q=$(timeout 20 docker compose -f "$COMPOSE_FILE" exec -T db psql -U telecrime -t -A -c "
   SELECT COALESCE(EXTRACT(EPOCH FROM (now() - max(query_start)))::int, 9999)
   FROM pg_stat_activity
   WHERE datname='telecrime' AND state='active'
@@ -166,21 +198,21 @@ if [ "$NEED_HEAL" = "1" ]; then
   # Force-kill the worker container; docker compose restarts it fresh.
   # The pipeline is crash-safe (per-archive commits) and resumes via the
   # scheduler watchdog + startup recovery.
-  CID=$(docker ps -q --filter name=worker)
+  CID=$(compose ps -q worker 2>/dev/null)
   if [ -n "$CID" ]; then
     docker kill "$CID" 2>/dev/null
     sleep 5
     docker rm -f "$CID" 2>/dev/null
   fi
-  cd /home/user/TeleCrime && docker compose up -d worker 2>/dev/null
+  compose up -d worker 2>/dev/null
   log "HEAL done: worker restarted"
 fi
 
 # --- 4. Containers down? ---
 for svc in db web worker; do
-  if ! docker compose -f /home/user/TeleCrime/docker-compose.yml ps "$svc" 2>/dev/null | grep -q "Up"; then
+  if ! compose ps "$svc" 2>/dev/null | grep -q "Up"; then
     log "HEAL: container '$svc' not up — starting"
-    cd /home/user/TeleCrime && docker compose up -d "$svc" 2>/dev/null
+    compose up -d "$svc" 2>/dev/null
   fi
 done
 

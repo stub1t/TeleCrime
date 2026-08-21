@@ -673,7 +673,7 @@ class ParseStage(PipelineStage):
             # reposted across channels, so a file whose first batches are
             # ~all duplicates is almost certainly content we already parsed.
             # Aborting after a few high-dup batches avoids spending minutes on
-            # per-row index lookups against the 34GB credential_hash index
+            # per-row index lookups against the large credential_hash index
             # for rows that will all be rejected anyway.
             dup_batches_seen = 0
             dup_confirm_batches = 3  # consecutive batches above the threshold
@@ -911,8 +911,8 @@ class ParseStage(PipelineStage):
                         cursor.execute("TRUNCATE _pc_staging")
                         # Deduplicate within the batch *before* hitting the live
                         # table: repeated hashes in one chunk (common in ULP dumps)
-                        # are rejected here instead of scanning the 33GB
-                        # ix_parsed_credentials_credential_hash for each copy.
+                        # are rejected here instead of scanning the full
+                        # credential hash index for each copy.
                         cursor.execute(
                             "CREATE UNIQUE INDEX IF NOT EXISTS _pc_staging_hash "
                             "ON _pc_staging (credential_hash)"
@@ -931,7 +931,7 @@ class ParseStage(PipelineStage):
                         _seen_hashes: set[str] = set()
                         for row in chunk:
                             _h = row.get("credential_hash")
-                            if _h is not None:
+                            if isinstance(_h, str):
                                 if _h in _seen_hashes:
                                     continue
                                 _seen_hashes.add(_h)
@@ -946,24 +946,23 @@ class ParseStage(PipelineStage):
                         # Two-stage dedup:
                         #  1. Anti-join against a compact hash index to reject
                         #     the bulk of duplicates in one pass. The 64-bit
-                        #     expression index (ix_pc_hash64, ~5GB) is far more
-                        #     cache-resident than the 128-bit prefix index
-                        #     (ix_pc_credential_hash_prefix, ~16GB), so per-row
-                        #     probes hit shared_buffers instead of disk.
+                        #     expression index is more cache-friendly than
+                        #     probing the full credential hash index for every
+                        #     row.
                         #  2. ON CONFLICT (credential_hash) stays as the exact
                         #     correctness backstop for hash collisions (risk
-                        #     ~2^-62 per pair, negligible at 299M rows).
+                        #     collision risk remains negligible for the
+                        #     prefilter's purpose).
                         # NULL credential_hashes pass straight through.
                         # The SELECT list must be qualified with the staging
                         # alias: both tables have url/domain/... and unqualified
-                        # references raise "AmbiguousColumn" (regression from
-                        # 2026-08-14 dcbe055 — every insert chunk failed,
-                        # silently dropping new credentials).
+                        # references raise "AmbiguousColumn" and can make
+                        # every insert chunk fail.
                         # NOT EXISTS (instead of LEFT JOIN ... OR p.id IS NULL)
                         # lets the planner use an anti-join with the ix_pc_hash64
                         # expression index; the LEFT JOIN variant degrades to a
                         # Seq Scan of the whole parsed_credentials table per
-                        # chunk (306M rows, >5 min, statement timeout).
+                        # chunk and can exceed the database statement timeout.
                         _sel = ", ".join(f"s.{f}" for f in fields)
                         if _has_hash64_index(ctx.session.get_bind()):
                             cursor.execute(
