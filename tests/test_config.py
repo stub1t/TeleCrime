@@ -35,6 +35,12 @@ class TestConfig:
 
         assert config.database_url == ""
 
+    def test_custom_data_dir_updates_derived_paths(self, tmp_path):
+        config = Config(data_dir=tmp_path / "data")
+
+        assert config.downloads_dir == tmp_path / "data" / "downloads"
+        assert config.extracted_dir == tmp_path / "data" / "extracted"
+
     def test_ensure_directories(self, tmp_path):
         """Test ensure_directories creates all required dirs."""
         config = Config(
@@ -48,6 +54,18 @@ class TestConfig:
         assert config.data_dir.exists()
         assert config.downloads_dir.exists()
         assert config.extracted_dir.exists()
+
+    def test_explicit_paths_are_preserved(self, tmp_path):
+        downloads = tmp_path / "custom-downloads"
+        extracted = tmp_path / "custom-extracted"
+        config = Config(
+            data_dir=tmp_path / "data",
+            downloads_dir=downloads,
+            extracted_dir=extracted,
+        )
+
+        assert config.downloads_dir == downloads
+        assert config.extracted_dir == extracted
 
 
 class TestTelegramConfig:
@@ -175,10 +193,13 @@ class TestApplyEnvVars:
         """Test TELECRIME_DATABASE_URL environment variable."""
         config = Config()
 
-        with patch.dict(os.environ, {"TELECRIME_DATABASE_URL": "sqlite:///custom.db"}):
+        with patch.dict(
+            os.environ,
+            {"TELECRIME_DATABASE_URL": "postgresql://user:pass@db:5432/telecrime"},
+        ):
             _apply_env_vars(config)
 
-        assert config.database_url == "sqlite:///custom.db"
+        assert config.database_url == "postgresql://user:pass@db:5432/telecrime"
 
     def test_data_dir_from_env(self):
         """Test TELECRIME_DATA_DIR environment variable."""
@@ -188,6 +209,8 @@ class TestApplyEnvVars:
             _apply_env_vars(config)
 
         assert config.data_dir == Path("/custom/data")
+        assert config.downloads_dir == Path("/custom/data/downloads")
+        assert config.extracted_dir == Path("/custom/data/extracted")
 
     def test_telegram_api_id_from_env(self):
         """Test TELECRIME_TELEGRAM_API_ID environment variable."""
@@ -261,6 +284,7 @@ class TestLoadConfig:
         config_path = tmp_path / "config.toml"
         config_path.write_text(f"""
 database_url = "{self._PG_URL}"
+data_dir = "{tmp_path / 'configured-data'}"
 
 [telegram]
 api_id = 12345
@@ -276,6 +300,9 @@ target_extensions = [".epub", ".mobi"]
         assert config.telegram.api_hash == "testhash"
         assert ".epub" in config.extraction.target_extensions
         assert ".mobi" in config.extraction.target_extensions
+        assert config.data_dir == tmp_path / "configured-data"
+        assert config.downloads_dir == tmp_path / "configured-data" / "downloads"
+        assert config.extracted_dir == tmp_path / "configured-data" / "extracted"
 
     def test_load_requires_database_url(self, tmp_path, monkeypatch):
         monkeypatch.delenv("TELECRIME_DATABASE_URL", raising=False)

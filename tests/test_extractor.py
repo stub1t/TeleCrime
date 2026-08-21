@@ -398,7 +398,6 @@ class TestExtractionTimeoutHelper:
     """Tests for extract._extraction_timeout (size-proportional timeout)."""
 
     def test_small_archive_uses_config_floor(self, tmp_path):
-        from telecrime.config import Config
         from telecrime.pipeline.extract import _extraction_timeout
 
         archive = tmp_path / "small.zip"
@@ -409,7 +408,6 @@ class TestExtractionTimeoutHelper:
         assert _extraction_timeout(ctx, archive) == 600
 
     def test_large_archive_scales_with_size(self, tmp_path):
-        from telecrime.config import Config
         from telecrime.pipeline.extract import _extraction_timeout
 
         archive = tmp_path / "big.zip"

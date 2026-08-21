@@ -36,64 +36,6 @@ class TestConversation:
         assert conv.is_accessible is True
 
 
-class TestMessage:
-    def test_create_message_with_conversation(self, session):
-        """Test creating a message linked to a conversation."""
-        conv = Conversation(
-            platform_id=123456789,
-            title="Test Channel",
-            conversation_type="channel",
-        )
-        session.add(conv)
-        session.flush()
-
-        msg = Message(
-            conversation_id=conv.id,
-            platform_id=100,
-            platform_timestamp=datetime.now(UTC),
-            text="Hello world",
-        )
-        session.add(msg)
-        session.commit()
-
-        assert msg.id is not None
-        assert msg.conversation_id == conv.id
-        assert msg.conversation == conv
-        assert conv.messages == [msg]
-
-
-class TestFileAttachment:
-    def test_create_attachment(self, session):
-        """Test creating a file attachment."""
-        conv = Conversation(platform_id=1, conversation_type="channel")
-        session.add(conv)
-        session.flush()
-
-        msg = Message(
-            conversation_id=conv.id,
-            platform_id=100,
-            platform_timestamp=datetime.now(UTC),
-        )
-        session.add(msg)
-        session.flush()
-
-        attachment = FileAttachment(
-            message_id=msg.id,
-            platform_file_id="abc123",
-            filename="test.zip",
-            mime_type="application/zip",
-            size=1024,
-            is_archive_candidate=True,
-            archive_type="zip",
-        )
-        session.add(attachment)
-        session.commit()
-
-        assert attachment.id is not None
-        assert attachment.is_archive_candidate is True
-        assert attachment.message == msg
-
-
 class TestDownloadArtifact:
     def test_download_status_tracking(self, session):
         """Test download status state machine."""

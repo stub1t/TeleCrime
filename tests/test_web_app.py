@@ -2,11 +2,10 @@
 
 import asyncio
 import json
-import os
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from telecrime.database import get_engine, get_session, init_db
+from telecrime.database import get_session
 from telecrime.models import (
     ArchiveGroup,
     Conversation,
@@ -26,11 +25,10 @@ from telecrime.web.app import (
     _pipeline_running_for_heavy_web_work,
     _preferred_table_estimate,
     _search_for_export,
+    _stats_cache_path,
     _triage_payload,
     create_app,
 )
-
-PG_URL = os.environ.get("TELECRIME_TEST_DATABASE_URL", "")
 
 
 def test_credential_fts_search_applies_filters_before_limit(pg_session):
@@ -98,6 +96,13 @@ def test_heavy_web_work_pauses_while_pipeline_running(monkeypatch):
     monkeypatch.setattr("telecrime.web.app.read_progress", lambda: {"running": True})
 
     assert _pipeline_running_for_heavy_web_work() is True
+
+
+def test_stats_cache_path_uses_configured_data_dir(tmp_path, monkeypatch):
+    data_dir = tmp_path / "runtime"
+    monkeypatch.setenv("TELECRIME_DATA_DIR", str(data_dir))
+
+    assert _stats_cache_path() == data_dir / "stats_cache.json"
 
 
 def test_heavy_web_work_runs_when_pipeline_idle(monkeypatch):
@@ -226,13 +231,9 @@ def test_message_fts_search_preserves_order_and_exclusions(pg_engine):
     assert ids == [2]
 
 
-def test_triage_payload_includes_recent_failures(tmp_path):
+def test_triage_payload_includes_recent_failures(pg_engine):
     """Dashboard triage payload includes failed downloads and extractions."""
-    db_path = tmp_path / "triage.db"
-    engine = get_engine(f"sqlite:///{db_path}")
-    init_db(engine)
-
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         conv = Conversation(platform_id=1, conversation_type="channel")
         session.add(conv)
         session.flush()
@@ -272,7 +273,7 @@ def test_triage_payload_includes_recent_failures(tmp_path):
             )
         )
 
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         payload = _triage_payload(session, limit=20)
     payload = cast(dict[str, Any], payload)
 
@@ -318,7 +319,7 @@ def test_search_count_endpoint_returns_total_matches(pg_engine):
             ]
         )
 
-    app = create_app(PG_URL)
+    app = create_app(pg_engine.url.render_as_string(hide_password=False))
     route = cast(Any, next(r for r in app.routes if getattr(r, "path", None) == "/search/count"))
     response = route.endpoint(q="google", regex=False)
 
@@ -327,13 +328,10 @@ def test_search_count_endpoint_returns_total_matches(pg_engine):
     assert payload["total_credentials"] == 1
 
 
-def test_search_export_soft_dedupes_equivalent_credentials(tmp_path):
-    db_path = tmp_path / "search-soft-dedup.db"
-    engine = get_engine(f"sqlite:///{db_path}")
-    init_db(engine)
-    assert _ensure_search_infra(engine) is True
+def test_search_export_soft_dedupes_equivalent_credentials(pg_engine):
+    assert _ensure_search_infra(pg_engine) is True
 
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         session.add_all(
             [
                 ParsedCredential(
@@ -363,7 +361,7 @@ def test_search_export_soft_dedupes_equivalent_credentials(tmp_path):
             ]
         )
 
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         results = _search_for_export(
             session,
             "example",
@@ -384,14 +382,11 @@ def test_search_export_soft_dedupes_equivalent_credentials(tmp_path):
     assert len(results.credentials) == 1
 
 
-def test_export_json_supports_no_markdown(tmp_path):
+def test_export_json_supports_no_markdown(pg_engine):
     """Search export can strip simple markdown formatting from string fields."""
-    db_path = tmp_path / "search-export.db"
-    engine = get_engine(f"sqlite:///{db_path}")
-    init_db(engine)
-    assert _ensure_search_infra(engine) is True
+    assert _ensure_search_infra(pg_engine) is True
 
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         session.add(
             ParsedCredential(
                 url="https://example.com/login",
@@ -405,7 +400,7 @@ def test_export_json_supports_no_markdown(tmp_path):
             )
         )
 
-    app = create_app(f"sqlite:///{db_path}")
+    app = create_app(pg_engine.url.render_as_string(hide_password=False))
     route = cast(
         Any, next(r for r in app.routes if getattr(r, "path", None) == "/search/export.json")
     )
@@ -430,14 +425,11 @@ def test_export_json_supports_no_markdown(tmp_path):
     assert first["source_archive"] == "archive"
 
 
-def test_export_markdown_returns_markdown_tables(tmp_path):
+def test_export_markdown_returns_markdown_tables(pg_engine):
     """Markdown export returns Markdown tables and supports plain-value export."""
-    db_path = tmp_path / "search-markdown.db"
-    engine = get_engine(f"sqlite:///{db_path}")
-    init_db(engine)
-    assert _ensure_search_infra(engine) is True
+    assert _ensure_search_infra(pg_engine) is True
 
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         session.add(
             ParsedCredential(
                 url="https://example.com/login",
@@ -451,7 +443,7 @@ def test_export_markdown_returns_markdown_tables(tmp_path):
             )
         )
 
-    app = create_app(f"sqlite:///{db_path}")
+    app = create_app(pg_engine.url.render_as_string(hide_password=False))
     route = cast(
         Any, next(r for r in app.routes if getattr(r, "path", None) == "/search/export.md")
     )

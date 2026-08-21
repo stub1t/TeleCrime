@@ -160,14 +160,14 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_parallel_download_writes_all_bytes(monkeypatch):
+async def test_parallel_download_writes_all_bytes(tmp_path):
     """Parallel stripers cover the file exactly once, with no gaps/overlaps."""
     adapter = _make_adapter()
     size = 2 * 1024 * 1024 + 12345  # not a multiple of chunk size
     n = 8
     client = _FakeClient(size)
     msg = _FakeMessage(size)
-    dest = "/tmp/opencode/test_par_dl.bin"
+    dest = tmp_path / "test_par_dl.bin"
 
     await adapter._download_media_parallel(client, msg, dest, n, size, None)
 

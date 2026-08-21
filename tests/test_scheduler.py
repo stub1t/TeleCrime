@@ -22,7 +22,9 @@ from telecrime.scheduler import (
     _run_pipeline_health_job,
     _run_pipeline_job,
     _send_telegram_notification,
+    _shutdown_request_path,
     _shutdown_state,
+    _status_path,
     _update_job,
     _write_status,
     clear_shutdown_request,
@@ -93,6 +95,18 @@ def test_write_status_atomic(status_file):
     # .tmp file should not exist after write
     assert not status_file.with_suffix(".tmp").exists()
     assert status_file.exists()
+
+
+def test_runtime_files_follow_configured_data_dir(tmp_path, monkeypatch):
+    data_dir = tmp_path / "runtime"
+    monkeypatch.setenv("TELECRIME_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("TELECRIME_STATUS_FILE", raising=False)
+    monkeypatch.delenv("TELECRIME_PIPELINE_PID_FILE", raising=False)
+    monkeypatch.delenv("TELECRIME_SHUTDOWN_REQUEST_FILE", raising=False)
+
+    assert _status_path() == data_dir / "scheduler_status.json"
+    assert _pipeline_pid_path() == data_dir / "pipeline.pid"
+    assert _shutdown_request_path() == data_dir / "pipeline_shutdown_request.json"
 
 
 def test_worker_skips_telegram_jobs_when_no_creds(status_file):
@@ -171,32 +185,22 @@ def test_vacuum_job_executes_vacuum(pg_engine):
     assert "completed" in result.lower() or "done" in result.lower()
 
 
-def test_reparse_stealers_in_job_defs():
-    """reparse_stealers is registered in JOB_DEFS with correct properties."""
-    assert "reparse_stealers" in JOB_DEFS
-    job = JOB_DEFS["reparse_stealers"]
-    assert job["requires_telegram"] is False
-    assert job["interval_hours"] == 24
-
-
-def test_pipeline_watchdog_in_job_defs():
-    assert "pipeline_watchdog" in JOB_DEFS
-    job = JOB_DEFS["pipeline_watchdog"]
-    assert job["requires_telegram"] is False
-    assert job["interval_minutes"] == 10
-
-
-def test_pipeline_health_in_job_defs():
-    assert "pipeline_health" in JOB_DEFS
-    job = JOB_DEFS["pipeline_health"]
-    assert job["requires_telegram"] is False
-    assert job["interval_hours"] == 2
-
-
-def test_notification_jobs_in_job_defs():
-    assert JOB_DEFS["watchlist_notify"]["interval_minutes"] == 15
-    assert JOB_DEFS["hourly_summary"]["requires_telegram"] is True
-    assert JOB_DEFS["daily_summary"]["interval_hours"] == 24
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("reparse_stealers", {"requires_telegram": False, "interval_hours": 24}),
+        ("pipeline_watchdog", {"requires_telegram": False, "interval_minutes": 10}),
+        ("pipeline_health", {"requires_telegram": False, "interval_hours": 2}),
+        ("watchlist_notify", {"requires_telegram": True, "interval_minutes": 15}),
+        ("hourly_summary", {"requires_telegram": True, "interval_hours": 1}),
+        ("daily_summary", {"requires_telegram": True, "interval_hours": 24}),
+    ],
+)
+def test_job_defs_registers_background_jobs(name, expected):
+    """Background jobs expose the scheduler properties they require."""
+    assert name in JOB_DEFS
+    for key, value in expected.items():
+        assert JOB_DEFS[name][key] == value
 
 
 def test_progress_age_seconds_handles_valid_and_invalid_values():
@@ -290,16 +294,13 @@ def test_run_pipeline_health_job_recovers_unhealthy_pipeline(
     recover.assert_called_once()
 
 
-def test_mark_stale_pipeline_runs_failed(tmp_path):
+def test_mark_stale_pipeline_runs_failed(pg_engine):
     from datetime import datetime
 
-    from telecrime.database import get_engine, get_session, init_db
+    from telecrime.database import get_session
     from telecrime.models import PipelineRun
 
-    engine = get_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    init_db(engine)
-
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         session.add(
             PipelineRun(
                 mode="sequential",
@@ -310,11 +311,11 @@ def test_mark_stale_pipeline_runs_failed(tmp_path):
         )
         session.commit()
 
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         count = _mark_stale_pipeline_runs_failed(session, "stale heartbeat")
 
     assert count == 1
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         run = session.query(PipelineRun).one()
         assert run.status == "failed"
         assert run.finished_at is not None
@@ -475,19 +476,16 @@ def test_worker_start_pauses_scheduler_when_shutdown_requested(status_file, tmp_
         assert statuses["pipeline"].shutdown_state in {"draining", "drained"}
 
 
-def test_reparse_stealers_impl_dry_run(tmp_path):
+def test_reparse_stealers_impl_dry_run(pg_engine):
     """_reparse_stealers_impl dry_run returns count string without writing."""
-    from telecrime.database import get_engine, get_session, init_db
+    from telecrime.database import get_session
     from telecrime.models import ExtractionJob
     from telecrime.models.archive_group import ArchiveGroup
     from telecrime.models.credential import ParsedCredential
     from telecrime.scheduler import _reparse_stealers_impl
     from telecrime.states import ExtractionStatus, GroupStatus
 
-    engine = get_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    init_db(engine)
-
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         group = ArchiveGroup(
             fingerprint="test.zip",
             base_name="test.zip",
@@ -512,21 +510,21 @@ def test_reparse_stealers_impl_dry_run(tmp_path):
             ))
         session.commit()
 
-    result = _reparse_stealers_impl(engine, dry_run=True)
+    result = _reparse_stealers_impl(pg_engine, dry_run=True)
     assert "dry-run" in result
     assert "3" in result
 
     # Verify no stealer_type was written
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         nulls = session.query(ParsedCredential).filter(
             ParsedCredential.stealer_type.is_(None)
         ).count()
     assert nulls == 3
 
 
-def test_reparse_stealers_impl_backfills(tmp_path):
+def test_reparse_stealers_impl_backfills(pg_engine):
     """_reparse_stealers_impl updates stealer_type for jobs with known filenames."""
-    from telecrime.database import get_engine, get_session, init_db
+    from telecrime.database import get_session
     from telecrime.models import ExtractionJob
     from telecrime.models.archive_group import ArchiveGroup
     from telecrime.models.credential import ParsedCredential
@@ -534,10 +532,7 @@ def test_reparse_stealers_impl_backfills(tmp_path):
     from telecrime.scheduler import _reparse_stealers_impl
     from telecrime.states import ExtractionStatus, GroupStatus
 
-    engine = get_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    init_db(engine)
-
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         group = ArchiveGroup(
             fingerprint="redline.zip",
             base_name="redline.zip",
@@ -568,22 +563,19 @@ def test_reparse_stealers_impl_backfills(tmp_path):
         ))
         session.commit()
 
-    result = _reparse_stealers_impl(engine)
+    result = _reparse_stealers_impl(pg_engine)
     assert "1" in result  # 1 credential updated
 
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         cred = session.query(ParsedCredential).first()
     assert cred.stealer_type == "redline"
 
 
-def test_count_recent_unique_credentials_uses_soft_dedup(tmp_path):
-    from telecrime.database import get_engine, get_session, init_db
+def test_count_recent_unique_credentials_uses_soft_dedup(pg_engine):
+    from telecrime.database import get_session
     from telecrime.models.credential import ParsedCredential
 
-    engine = get_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    init_db(engine)
-
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         session.add_all(
             [
                 ParsedCredential(
@@ -606,18 +598,25 @@ def test_count_recent_unique_credentials_uses_soft_dedup(tmp_path):
         )
         session.commit()
 
-    assert _count_recent_unique_credentials(engine, hours=24) == 1
+    assert _count_recent_unique_credentials(pg_engine, hours=24) == 1
 
 
-def test_collect_watchlist_alerts_only_returns_new_matches(tmp_path):
-    from telecrime.database import get_engine, get_session, init_db
+def test_collect_watchlist_alerts_only_returns_new_matches(pg_engine):
+    """Incremental watchlist alerts cover only rows created after the watermark.
+
+    On PostgreSQL the very first run deliberately seeds last_alerted_at without
+    scanning (a full-table scan would time out on production-sized data), so
+    this test seeds the watermark itself and asserts on the incremental path.
+    """
+    from datetime import timedelta
+
+    from telecrime.database import get_session
     from telecrime.models.credential import ParsedCredential
     from telecrime.models.watchlist import WatchlistItem
 
-    engine = get_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    init_db(engine)
+    watermarked_at = datetime.now(UTC) - timedelta(hours=2)
 
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         session.add(
             WatchlistItem(
                 label="Example",
@@ -625,6 +624,7 @@ def test_collect_watchlist_alerts_only_returns_new_matches(tmp_path):
                 match_type="domain",
                 enabled=True,
                 last_alerted_count=1,
+                last_alerted_at=watermarked_at,
             )
         )
         session.add_all(
@@ -635,6 +635,7 @@ def test_collect_watchlist_alerts_only_returns_new_matches(tmp_path):
                     username="alice",
                     password="secret",
                     credential_hash="hash-1",
+                    created_at=watermarked_at - timedelta(minutes=30),
                 ),
                 ParsedCredential(
                     url="https://example.com/portal",
@@ -647,19 +648,21 @@ def test_collect_watchlist_alerts_only_returns_new_matches(tmp_path):
         )
         session.commit()
 
-    alerts = _collect_watchlist_alerts(engine)
+    alerts = _collect_watchlist_alerts(pg_engine)
 
     assert len(alerts) == 1
     assert alerts[0]["new_matches"] == 1
+    assert alerts[0]["total_matches"] == 2
     assert len(alerts[0]["hits"]) == 1
     assert alerts[0]["hits"][0]["matched_values"] == ["domain: example.com"]
     assert alerts[0]["hits"][0]["username"] == "bob"
     assert alerts[0]["hits"][0]["password"] == "secret"
 
-    with get_session(engine) as session:
+    with get_session(pg_engine) as session:
         item = session.query(WatchlistItem).one()
         assert item.last_alerted_count == 2
         assert item.last_alerted_at is not None
+        assert item.last_alerted_at.replace(tzinfo=UTC) > watermarked_at
 
 
 def test_check_disk_status_uses_config_threshold(tmp_path, monkeypatch):
@@ -741,7 +744,7 @@ def test_send_telegram_notification_swallows_connection_error():
     assert "transient" in result.lower() or "skipped" in result.lower()
 
 
-def test_send_telegram_notification_swallows_sqlite_lock():
+def test_send_telegram_notification_swallows_session_lock():
     """Telethon session-file lock is transient — return "skipped", don't raise."""
     import asyncio
     import sqlite3

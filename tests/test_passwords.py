@@ -8,6 +8,7 @@ from telecrime.passwords.extractor import (
     _strip_telegram_markdown,
     extract_inline_passwords,
     extract_passwords_from_text,
+    load_password_file,
     normalize_password,
 )
 from telecrime.passwords.ranker import (
@@ -17,6 +18,15 @@ from telecrime.passwords.ranker import (
     rank_passwords,
 )
 from telecrime.states import PasswordScope
+
+
+def test_load_password_file_defaults_to_configured_data_dir(tmp_path, monkeypatch):
+    data_dir = tmp_path / "runtime"
+    data_dir.mkdir()
+    (data_dir / "passwords.txt").write_text("secret123\n")
+    monkeypatch.setenv("TELECRIME_DATA_DIR", str(data_dir))
+
+    assert load_password_file() == ["secret123"]
 
 
 class TestExtractPasswordsFromText:

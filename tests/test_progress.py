@@ -2,7 +2,7 @@
 
 import time
 
-from telecrime.pipeline.progress import PipelineProgressWriter
+from telecrime.pipeline.progress import PipelineProgressWriter, _progress_path
 
 
 def _run_one_heartbeat_tick(w: PipelineProgressWriter) -> None:
@@ -27,6 +27,14 @@ def _run_one_heartbeat_tick(w: PipelineProgressWriter) -> None:
     # Run the loop body once in this thread (the original heartbeat thread is
     # still waiting on the original event; we drive a synchronous tick here).
     w._heartbeat_loop()
+
+
+def test_progress_path_uses_configured_data_dir(tmp_path, monkeypatch):
+    monkeypatch.delenv("TELECRIME_PROGRESS_FILE", raising=False)
+    data_dir = tmp_path / "runtime"
+    monkeypatch.setenv("TELECRIME_DATA_DIR", str(data_dir))
+
+    assert _progress_path() == data_dir / "pipeline_progress.json"
 
 
 def test_heartbeat_marks_progress_for_ingest_stage(tmp_path, monkeypatch):

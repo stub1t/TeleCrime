@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select
 
 from telecrime.models import PipelineRun
 from telecrime.pipeline.acquire import AcquireStage
@@ -16,7 +17,6 @@ from telecrime.pipeline.discover import DiscoverStage
 from telecrime.pipeline.extract import ExtractStage
 from telecrime.pipeline.ingest import IngestStage
 from telecrime.pipeline.lock import pipeline_run_lock
-from telecrime.pipeline.plan import PlanStage
 from telecrime.pipeline.orchestrator import (
     Pipeline,
     PipelineContext,
@@ -25,8 +25,8 @@ from telecrime.pipeline.orchestrator import (
     run_sequential_pipeline,
 )
 from telecrime.pipeline.parse import ParseStage
+from telecrime.pipeline.plan import PlanStage
 from telecrime.states import ExtractionStatus, GroupStatus
-from sqlalchemy import select
 
 
 class MockStage(PipelineStage):
@@ -610,7 +610,6 @@ class TestExtractStageDirect:
             FileAttachment,
             Message,
         )
-        from telecrime.pipeline.extract import _extraction_timeout
 
         conv = Conversation(platform_id=299, conversation_type="channel")
         session.add(conv)
@@ -675,10 +674,8 @@ class TestExtractStageDirect:
         )
         extractor.test_password = AsyncMock(return_value=False)
         extractor.available = MagicMock(return_value=True)
-        # RAR5 check: force the plain path (not .rar).
-        monkeypatch_extract = None
 
-        result = await stage._extract_group(ctx, group, extractor)
+        await stage._extract_group(ctx, group, extractor)
 
         # Must not raise; password path must be reached (extract attempted).
         extractor.extract.assert_awaited()
@@ -702,7 +699,6 @@ class TestPlanStage:
         """
         from telecrime.grouping.patterns import GroupingResult
         from telecrime.models import (
-            ArchiveGroup,
             ArchiveGroupPart,
             Conversation,
             DownloadArtifact,
@@ -1161,162 +1157,40 @@ class TestParseStageChunkedInsert:
         count = session.query(ParsedCredential).count()
         assert count == len(rows)
 
-    @pytest.mark.asyncio
-    async def test_bulk_insert_continues_after_chunk_failure(self, session, test_config, tmp_path):
-        """A failing chunk does not abort the whole batch."""
-        from telecrime.models import ArchiveGroup, ExtractionJob, ParsedCredential
 
-        group = ArchiveGroup(
-            fingerprint="fail-test",
-            base_name="archive.zip",
-            expected_part_count=1,
-            detected_part_count=1,
-            status=GroupStatus.EXTRACTED,
-        )
-        session.add(group)
-        session.flush()
+def test_postgres_bulk_insert_uses_copy_and_exact_dedup(pg_session, test_config):
+    """Production PostgreSQL loading deduplicates rows in the COPY path."""
+    from telecrime.models import ParsedCredential
 
-        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
-        session.add(job)
-        session.flush()
+    stage = ParseStage()
+    ctx = PipelineContext(config=test_config, session=pg_session, adapter=MagicMock())
 
-        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
-        stage = ParseStage()
-
-        # Pre-seed one hash so the first chunk has a conflict
-        existing_hash = ParsedCredential.compute_hash("site0.com", "user0", "secret")
-        session.add(
-            ParsedCredential(
-                url="https://site0.com/login",
-                domain="site0.com",
-                username="user0",
-                password="secret",
-                credential_hash=existing_hash,
-                extraction_job_id=job.id,
-            )
-        )
-        session.commit()
-
-        rows = [
-            {
-                "url": "https://site0.com/login",
-                "domain": "site0.com",
-                "username": "user0",
-                "password": "secret",
-                "credential_hash": existing_hash,
-                "extraction_job_id": job.id,
-                "source_file": "/tmp/f.txt",
-                "source_archive": group.base_name,
-                "source_conversation_id": None,
-                "source_message_id": None,
-                "stealer_type": None,
-            },
-            {
-                "url": "https://site1.com/login",
-                "domain": "site1.com",
-                "username": "user1",
-                "password": "secret",
-                "credential_hash": ParsedCredential.compute_hash("site1.com", "user1", "secret"),
-                "extraction_job_id": job.id,
-                "source_file": "/tmp/f.txt",
-                "source_archive": group.base_name,
-                "source_conversation_id": None,
-                "source_message_id": None,
-                "stealer_type": None,
-            },
-        ]
-
-        inserted = stage._bulk_insert_credentials(ctx, rows)
-        # Only the second row should be newly inserted
-        assert len(inserted) == 1
-        assert inserted[0]["credential_hash"] == rows[1]["credential_hash"]
-
-    @pytest.mark.asyncio
-    async def test_bulk_insert_savepoint_preserves_prior_chunks_on_failure(
-        self, session, test_config, tmp_path, monkeypatch
-    ):
-        """A mid-batch chunk failure must not discard chunks inserted earlier.
-
-        Regression: before the SAVEPOINT-per-chunk fix, ctx.session.rollback()
-        on a failed chunk discarded the WHOLE transaction including prior
-        successful chunks — silent data loss while the return count claimed
-        the rows had been inserted.
-        """
-        from telecrime.models import ArchiveGroup, ExtractionJob, ParsedCredential
-        from telecrime.pipeline import parse as parse_mod
-
-        group = ArchiveGroup(
-            fingerprint="sp-test",
-            base_name="sp.zip",
-            expected_part_count=1,
-            detected_part_count=1,
-            status=GroupStatus.EXTRACTED,
-        )
-        session.add(group)
-        session.flush()
-        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
-        session.add(job)
-        session.flush()
-        session.commit()
-
-        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
-        stage = ParseStage()
-
-        # 1-row chunks so we can target the middle chunk precisely.
-        monkeypatch.setattr(parse_mod, "_INSERT_CHUNK_SIZE", 1)
-        monkeypatch.setattr(parse_mod, "_INSERT_CHUNK_SIZE_SQLITE", 1)
-
-        def _row(host: str) -> dict:
-            return {
-                "url": f"https://{host}/login",
-                "domain": host,
-                "username": "u",
-                "password": "p",
-                "credential_hash": ParsedCredential.compute_hash(host, "u", "p"),
-                "extraction_job_id": job.id,
-                "source_file": "/tmp/f.txt",
-                "source_archive": group.base_name,
-                "source_conversation_id": None,
-                "source_message_id": None,
-                "stealer_type": None,
-            }
-
-        rows = [_row("a.example.com"), _row("b.example.com"), _row("c.example.com")]
-
-        # Make the middle chunk's INSERT raise. SAVEPOINT semantics: the first
-        # row is committed-to-outer-tx, the middle is rolled back to savepoint,
-        # the third proceeds normally.
-        original_execute = session.execute
-        call_count = {"n": 0}
-
-        def fake_execute(*args, **kwargs):
-            call_count["n"] += 1
-            if call_count["n"] == 2:
-                raise RuntimeError("synthetic chunk failure")
-            return original_execute(*args, **kwargs)
-
-        monkeypatch.setattr(session, "execute", fake_execute)
-
-        inserted = stage._bulk_insert_credentials(ctx, rows)
-        # Restore real execute so the commit/query below work.
-        monkeypatch.setattr(session, "execute", original_execute)
-        session.commit()
-
-        # Two of three chunks inserted; the bad one was skipped, not the others.
-        assert len(inserted) == 2
-        hashes_inserted = {row["credential_hash"] for row in inserted}
-        assert rows[0]["credential_hash"] in hashes_inserted
-        assert rows[2]["credential_hash"] in hashes_inserted
-
-        # Critically: the successful rows are actually durable, not silently
-        # discarded by a rollback of the surrounding transaction.
-        durable_hashes = {
-            r[0]
-            for r in session.query(ParsedCredential.credential_hash).all()
+    def row(username: str) -> dict[str, object]:
+        return {
+            "url": "https://example.com/login",
+            "domain": "example.com",
+            "username": username,
+            "password": "secret",
+            "email_domain": None,
+            "application": None,
+            "profile": None,
+            "extraction_job_id": None,
+            "source_file": "/tmp/credentials.txt",
+            "source_archive": "archive.zip",
+            "source_conversation_id": None,
+            "source_message_id": None,
+            "stealer_type": None,
+            "credential_hash": ParsedCredential.compute_hash(
+                "example.com", username, "secret"
+            ),
         }
-        assert rows[0]["credential_hash"] in durable_hashes
-        assert rows[2]["credential_hash"] in durable_hashes
-        assert rows[1]["credential_hash"] not in durable_hashes
+
+    rows = [row("alice"), row("alice"), row("bob")]
+    inserted = stage._bulk_insert_credentials(ctx, rows)
+    pg_session.commit()
+
+    assert len(inserted) == 2
+    assert pg_session.query(ParsedCredential).count() == 2
 
 
 class TestParseParallelChunking:

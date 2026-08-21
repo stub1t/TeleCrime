@@ -9,11 +9,10 @@ from typer.testing import CliRunner
 
 from telecrime import __version__
 from telecrime.cli import app
-from telecrime.database import get_engine, get_session, init_db
+from telecrime.database import get_session
 from telecrime.models import ArchiveGroup, ExtractionJob, ParsedCredential, PipelineRun
 from telecrime.states import ExtractionStatus, GroupStatus
 
-PG_URL = os.environ.get("TELECRIME_TEST_DATABASE_URL", "")
 runner = CliRunner()
 
 
@@ -42,7 +41,7 @@ class TestCliInit:
 
         with patch("telecrime.cli.get_config_and_engine") as mock_get:
             mock_config = MagicMock()
-            mock_config.database_url = f"sqlite:///{tmp_path / 'test.db'}"
+            mock_config.database_url = "postgresql://telecrime:telecrime@db:5432/telecrime"
             mock_engine = MagicMock()
             mock_get.return_value = (mock_config, mock_engine)
 
@@ -53,6 +52,23 @@ class TestCliInit:
 
         assert result.exit_code == 0
         assert "initialized" in result.stdout.lower()
+
+
+class TestCliDashboard:
+    def test_dashboard_propagates_configured_data_dir(self, tmp_path, monkeypatch):
+        config = MagicMock()
+        config.database_url = "postgresql://telecrime:telecrime@db:5432/telecrime"
+        config.data_dir = tmp_path / "runtime"
+        monkeypatch.setenv("TELECRIME_DATA_DIR", "sentinel")
+
+        with patch("telecrime.cli.get_config_and_engine", return_value=(config, MagicMock())):
+            with patch("telecrime.web.app.create_app") as create_app:
+                with patch("uvicorn.run"):
+                    result = runner.invoke(app, ["dashboard"])
+
+        assert result.exit_code == 0
+        assert os.environ["TELECRIME_DATA_DIR"] == str(config.data_dir)
+        create_app.assert_called_once_with(config.database_url)
 
 
 class TestCliStatus:
@@ -103,12 +119,8 @@ class TestCliDiagnostics:
         assert "pipeline diagnostics" in result.stdout.lower()
         assert "failure summary" in result.stdout.lower()
 
-    def test_diagnostics_shows_recent_runs(self, tmp_path):
-        db_path = tmp_path / "diag.db"
-        engine = get_engine(f"sqlite:///{db_path}")
-        init_db(engine)
-
-        with get_session(engine) as session:
+    def test_diagnostics_shows_recent_runs(self, pg_engine):
+        with get_session(pg_engine) as session:
             session.add(
                 PipelineRun(
                     mode="batch",
@@ -122,7 +134,7 @@ class TestCliDiagnostics:
             )
 
         with patch("telecrime.cli.get_config_and_engine") as mock_get:
-            mock_get.return_value = (MagicMock(), engine)
+            mock_get.return_value = (MagicMock(), pg_engine)
             result = runner.invoke(app, ["diagnostics"])
 
         assert result.exit_code == 0
@@ -279,12 +291,8 @@ class TestCliReprocess:
         result = runner.invoke(app, ["reprocess"])
         assert result.exit_code == 1
 
-    def test_reprocess_parse_resets_group(self, tmp_path):
-        db_path = tmp_path / "reprocess.db"
-        engine = get_engine(f"sqlite:///{db_path}")
-        init_db(engine)
-
-        with get_session(engine) as session:
+    def test_reprocess_parse_resets_group(self, pg_engine):
+        with get_session(pg_engine) as session:
             group = ArchiveGroup(
                 fingerprint="group1",
                 base_name="sample.zip",
@@ -310,13 +318,13 @@ class TestCliReprocess:
 
         with patch("telecrime.cli.get_config_and_engine") as mock_get:
             mock_config = MagicMock()
-            mock_config.database_url = f"sqlite:///{db_path}"
-            mock_get.return_value = (mock_config, engine)
+            mock_config.database_url = pg_engine.url.render_as_string(hide_password=False)
+            mock_get.return_value = (mock_config, pg_engine)
 
             result = runner.invoke(app, ["reprocess", "--group-id", "1", "--stage", "parse"])
 
         assert result.exit_code == 0
-        with get_session(engine) as session:
+        with get_session(pg_engine) as session:
             group = session.query(ArchiveGroup).filter_by(id=1).one()
             assert group.status == GroupStatus.EXTRACTED
             assert session.query(ParsedCredential).count() == 0
@@ -398,7 +406,7 @@ class TestCliRun:
             mock_config = MagicMock()
             mock_config.telegram.api_id = 12345
             mock_config.telegram.api_hash = "test"
-            mock_config.database_url = "sqlite:///:memory:"
+            mock_config.database_url = "postgresql://telecrime:telecrime@db:5432/telecrime"
             mock_config.extraction.target_extensions = [".epub"]
             mock_engine = MagicMock()
             mock_get.return_value = (mock_config, mock_engine)
@@ -421,7 +429,7 @@ class TestCliRun:
             mock_config = MagicMock()
             mock_config.telegram.api_id = 12345
             mock_config.telegram.api_hash = "test"
-            mock_config.database_url = "sqlite:///:memory:"
+            mock_config.database_url = "postgresql://telecrime:telecrime@db:5432/telecrime"
             mock_config.extraction.target_extensions = [".txt"]
             mock_engine = MagicMock()
             mock_get.return_value = (mock_config, mock_engine)
@@ -447,7 +455,7 @@ class TestCliProcess:
 
         with patch("telecrime.cli.get_config_and_engine") as mock_get:
             mock_config = MagicMock()
-            mock_config.database_url = "sqlite:///ignored.db"
+            mock_config.database_url = "postgresql://telecrime:telecrime@db:5432/telecrime"
             mock_get.return_value = (mock_config, MagicMock())
 
             with patch("subprocess.run") as mock_run:
@@ -468,7 +476,7 @@ class TestCliProcess:
 
         with patch("telecrime.cli.get_config_and_engine") as mock_get:
             mock_config = MagicMock()
-            mock_config.database_url = "sqlite:///telecrime.db"
+            mock_config.database_url = "postgresql://telecrime:telecrime@localhost:5432/telecrime"
             mock_get.return_value = (mock_config, MagicMock())
 
             with patch("subprocess.run") as mock_run:
@@ -478,7 +486,7 @@ class TestCliProcess:
         assert result.exit_code == 0
         command = mock_run.call_args.args[0]
         assert "--database" in command
-        assert "sqlite:///telecrime.db" in command
+        assert "postgresql://telecrime:telecrime@localhost:5432/telecrime" in command
 
 
 class TestCliFts:
@@ -534,7 +542,7 @@ class TestCliSearch:
 
         with patch("telecrime.cli.get_config_and_engine") as mock_get:
             mock_config = MagicMock()
-            mock_config.database_url = PG_URL
+            mock_config.database_url = engine.url.render_as_string(hide_password=False)
             mock_get.return_value = (mock_config, engine)
 
             result = runner.invoke(app, ["search", "google", "--domain", "--stealer", "redline"])

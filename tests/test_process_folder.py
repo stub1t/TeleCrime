@@ -3,53 +3,33 @@
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from process_folder import ProcessingStats, find_archives, process_archive
-from telecrime.database import get_engine, get_session_factory, init_db
+from process_folder import ProcessingStats, find_archives, process_archive, process_folder
+from telecrime.database import get_session_factory
 from telecrime.models import ParsedCredential
 
 
-def test_find_archives_top_level(tmp_path):
-    """Archives in top-level folder are found."""
-    (tmp_path / "a.zip").touch()
-    (tmp_path / "b.rar").touch()
+@pytest.mark.parametrize(
+    ("relative_path", "expected_name"),
+    [("top.zip", "top.zip"), ("subdir/nested/logs.7z", "logs.7z")],
+)
+def test_find_archives_recursively_finds_supported_files(tmp_path, relative_path, expected_name):
+    """Archive discovery handles both top-level and nested files."""
+    archive = tmp_path / relative_path
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive.touch()
     (tmp_path / "readme.txt").touch()
 
     result = find_archives(tmp_path)
-    names = {f.name for f in result}
-    assert "a.zip" in names
-    assert "b.rar" in names
-    assert "readme.txt" not in names
 
-
-def test_find_archives_recursive(tmp_path):
-    """Archives in subdirectories are found recursively."""
-    sub = tmp_path / "subdir" / "nested"
-    sub.mkdir(parents=True)
-    (sub / "logs.7z").touch()
-    (tmp_path / "top.zip").touch()
-
-    result = find_archives(tmp_path)
-    names = {f.name for f in result}
-    assert "logs.7z" in names
-    assert "top.zip" in names
-
-
-def test_find_archives_skips_hidden_extract_temp(tmp_path):
-    """Archives inside .extract_temp (temp dir) are still returned by find_archives
-    but that dir is created after finding, so it won't exist during a normal run."""
-    sub = tmp_path / "channel1"
-    sub.mkdir()
-    (sub / "pack.zip").touch()
-
-    result = find_archives(tmp_path)
-    names = {f.name for f in result}
-    assert "pack.zip" in names
+    assert expected_name in {f.name for f in result}
+    assert "readme.txt" not in {f.name for f in result}
 
 
 def test_find_archives_empty_folder(tmp_path):
@@ -71,12 +51,43 @@ def test_find_archives_split_parts(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_process_archive_uses_domain_hash_dedup(tmp_path, monkeypatch):
+async def test_process_folder_uses_configured_data_dir(tmp_path, test_config, monkeypatch):
+    """Standalone processing keeps markers and temp files under data_dir."""
+    import process_folder as process_folder_module
+
+    source = tmp_path / "archives"
+    source.mkdir()
+    test_config.data_dir = tmp_path / "configured-data"
+    session = MagicMock()
+    removed: list[Path] = []
+
+    monkeypatch.setattr(process_folder_module, "load_config", lambda _path: test_config)
+    monkeypatch.setattr(process_folder_module, "get_engine", lambda _url: MagicMock())
+    monkeypatch.setattr(process_folder_module, "init_db", lambda _engine: None)
+    monkeypatch.setattr(
+        process_folder_module,
+        "get_session_factory",
+        lambda _engine: lambda: session,
+    )
+    monkeypatch.setattr(process_folder_module, "find_archives", lambda _folder: [])
+    monkeypatch.setattr(
+        process_folder_module.shutil,
+        "rmtree",
+        lambda path, ignore_errors=False: removed.append(Path(path)),
+    )
+
+    stats, credentials = await process_folder(source, config_path=tmp_path / "config.toml")
+
+    assert stats.archives_found == 0
+    assert credentials == []
+    assert (test_config.data_dir / f".processed_{source.name}.txt").exists()
+    assert removed == [test_config.data_dir / f".extract_temp_{source.name}"]
+
+
+@pytest.mark.asyncio
+async def test_process_archive_uses_domain_hash_dedup(tmp_path, pg_engine, monkeypatch):
     """Standalone imports deduplicate the same way as the main pipeline."""
-    db_path = tmp_path / "test.db"
-    engine = get_engine(f"sqlite:///{db_path}")
-    init_db(engine)
-    session_factory = get_session_factory(engine)
+    session_factory = get_session_factory(pg_engine)
 
     archive = tmp_path / "sample.zip"
     archive.touch()
