@@ -32,6 +32,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Bound every Telegram network call so a wedged connection (Telethon
+# swallowing CancelledError during a drop/reconnect loop) can never block
+# the pipeline main thread forever in a notification send.
+_SEND_TIMEOUT_SECONDS = 30
+
 
 def _esc(value: object) -> str:
     """HTML-escape a value for safe interpolation into a notification."""
@@ -131,8 +136,11 @@ class TelegramNotifier:
             return
 
         try:
-            me = await self._get_me()
-            await self.client.send_message(me.id, message, parse_mode="html")
+            me = await asyncio.wait_for(self._get_me(), timeout=_SEND_TIMEOUT_SECONDS)
+            await asyncio.wait_for(
+                self.client.send_message(me.id, message, parse_mode="html"),
+                timeout=_SEND_TIMEOUT_SECONDS,
+            )
             logger.debug("Notification sent: %s", _trunc(message, 80))
         except (Exception, asyncio.CancelledError) as e:
             logger.warning("Failed to send notification: %s", e)
