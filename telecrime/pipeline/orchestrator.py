@@ -1204,7 +1204,7 @@ async def run_sequential_pipeline(
                                     next_pending.id,
                                     len(_prefetch_queue),
                                     (
-                                        _dl_adapter.config.telegram.session_name
+                                        _dl_adapter.config.telegram.session_name  # type: ignore[attr-defined]
                                         if _dl_adapter is not None
                                         else "main"
                                     ),

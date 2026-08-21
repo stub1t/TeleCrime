@@ -10,22 +10,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
 from telecrime.extractor.interface import ExtractionResult
-
-
-def _extraction_timeout(ctx, archive: Path) -> int:
-    """Extraction timeout proportional to archive size.
-
-    A fixed cap (config max_extraction_seconds=600) kills legitimately slow
-    extractions of multi-GB archives (tens of thousands of small files take
-    30-60+ min on this hardware), failing the job and retrying in a loop that
-    never completes — same bug class as the fixed 300s download budget.
-    """
-    size_mb = 0
-    try:
-        size_mb = archive.stat().st_size / (1024 * 1024)
-    except OSError:
-        pass
-    return max(ctx.config.extraction.max_extraction_seconds, int(size_mb * 3))
 from telecrime.extractor.seven_zip import SevenZipExtractor
 from telecrime.extractor.unrar import UnrarExtractor
 from telecrime.logging_utils import log_context
@@ -71,6 +55,22 @@ def _get_group_message_text(group) -> str | None:
         return msg.text or msg.caption
     except Exception:
         return None
+
+
+def _extraction_timeout(ctx, archive: Path) -> int:
+    """Extraction timeout proportional to archive size.
+
+    A fixed cap (config max_extraction_seconds=600) kills legitimately slow
+    extractions of multi-GB archives (tens of thousands of small files take
+    30-60+ min on this hardware), failing the job and retrying in a loop that
+    never completes — same bug class as the fixed 300s download budget.
+    """
+    size_mb: float = 0
+    try:
+        size_mb = archive.stat().st_size / (1024 * 1024)
+    except OSError:
+        pass
+    return max(ctx.config.extraction.max_extraction_seconds, int(size_mb * 3))
 
 
 class ExtractStage(PipelineStage):
