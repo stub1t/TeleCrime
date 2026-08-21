@@ -5,6 +5,7 @@ Checking and subscribing happen after each archive completes via the
 ChannelJoiner helper (one check or join per archive).
 """
 
+import asyncio
 import logging
 import os
 
@@ -26,6 +27,11 @@ from telecrime.models import TelegramChannel
 from telecrime.pipeline.orchestrator import PipelineContext, PipelineStage
 
 logger = logging.getLogger(__name__)
+
+# Bound every joiner Telegram call. The adapter's reconnect loop can wedge on
+# a dead TCP socket (disconnect()/connect() outside the operation budget),
+# which previously hung the pipeline main thread for 20+ min after a parse.
+_CHANNEL_OP_TIMEOUT_SECONDS = 30
 
 
 class ChannelDiscoverStage(PipelineStage):
@@ -142,7 +148,9 @@ class ChannelJoiner:
             return
 
         try:
-            entity = await ctx.adapter.get_entity(target)
+            entity = await asyncio.wait_for(
+                ctx.adapter.get_entity(target), timeout=_CHANNEL_OP_TIMEOUT_SECONDS
+            )
             if entity is not None:
                 mark_channel_checked(channel, entity)
                 self.channels_checked += 1
@@ -158,9 +166,12 @@ class ChannelJoiner:
         """Subscribe to a single channel."""
         target = channel.username or channel.invite_link
         try:
-            success = await ctx.adapter.join_conversation(
-                channel.platform_id or 0,
-                username=target,
+            success = await asyncio.wait_for(
+                ctx.adapter.join_conversation(
+                    channel.platform_id or 0,
+                    username=target,
+                ),
+                timeout=_CHANNEL_OP_TIMEOUT_SECONDS,
             )
 
             if mark_channel_join_result(channel, success) == "joined":
