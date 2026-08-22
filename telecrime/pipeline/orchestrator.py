@@ -330,6 +330,7 @@ async def _process_ready_group(
     group_id: int,
     dry_run: bool,
     notifier: Optional["TelegramNotifier"],
+    display=None,
 ) -> dict[str, Any]:
     """Process one READY group in an isolated DB session."""
     from telecrime.pipeline.extract import ExtractStage
@@ -341,7 +342,11 @@ async def _process_ready_group(
             task_session.execute(
                 select(ArchiveGroup)
                 .where(ArchiveGroup.id == group_id)
-                .options(joinedload(ArchiveGroup.parts).joinedload(ArchiveGroupPart.artifact))
+                .options(
+                    joinedload(ArchiveGroup.parts)
+                    .joinedload(ArchiveGroupPart.artifact)
+                    .joinedload(DownloadArtifact.attachment)
+                )
             )
             .unique()
             .scalar_one_or_none()
@@ -349,13 +354,28 @@ async def _process_ready_group(
         if group is None or group.status != GroupStatus.READY:
             return {"group_id": group_id, "skipped": True}
 
+        # Surface this group on the progress file (dashboard + watchdog
+        # signature). Without this the whole READY-batch phase — which can
+        # run for days — reports zeros and a frozen signature.
+        group_name = None
+        for part in sorted(group.parts, key=lambda p: p.part_index):
+            attachment = part.artifact.attachment if part.artifact else None
+            if attachment is not None and attachment.filename:
+                group_name = attachment.filename
+                break
+        if not group_name:
+            group_name = f"group_{group_id}"
+        if display is not None:
+            display.stage_start("extract")
+            display.archive_start(group_name)
+
         task_ctx = PipelineContext(
             config=config,
             session=task_session,
             adapter=adapter,
             dry_run=dry_run,
             notifier=notifier,
-            display=None,
+            display=display,
         )
         extract_stage = ExtractStage()
         parse_stage = ParseStage()
@@ -372,6 +392,14 @@ async def _process_ready_group(
 
         await finalize_stage.run_group(task_ctx, group_id)
         task_session.commit()
+
+        if display is not None:
+            display.archive_complete(
+                group_name,
+                task_ctx.credentials_parsed,
+                task_ctx.duplicates_skipped,
+            )
+            display.stage_start("extract")
 
         return {
             "group_id": group_id,
@@ -406,6 +434,7 @@ async def _process_ready_groups_batch(
                     group_id=group_id,
                     dry_run=ctx.dry_run,
                     notifier=ctx.notifier,
+                    display=ctx.display,
                 )
             except (Exception, asyncio.CancelledError) as e:
                 logger.error("Error processing READY group %s: %s", group_id, e)
