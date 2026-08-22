@@ -170,8 +170,14 @@ log "check: pipeline_pid=$PIPELINE_PID alive=$PIPELINE_ALIVE heartbeat_age=${HEA
 NEED_HEAL=0
 REASON=""
 
-if [ "$PIPELINE_ALIVE" = "0" ]; then
-  # Pipeline process is gone but the pipeline_run table says running → stale
+# NOTE: a MISSING pid file (PIPELINE_PID=0) is NOT a crash: the pipeline
+# removes it on every clean exit, so it is briefly absent during any normal
+# stop/restart cycle (manual deploys, scheduler gaps between runs). Healing
+# there force-recreates the container mid-restart and silently reverts any
+# hot-deployed files. A genuinely crashed subprocess leaves the pid file
+# behind, which the PIPELINE_ALIVE=0 branch below catches.
+if [ "$PIPELINE_ALIVE" = "0" ] && [ "$PIPELINE_PID" != "0" ]; then
+  # Pipeline process is gone but left its pid file → crashed mid-run.
   NEED_HEAL=1
   REASON="pipeline process dead (pid=$PIPELINE_PID)"
 elif [ "$HEARTBEAT_AGE" -gt "$STALE_HEARTBEAT_SEC" ] && [ "$DB_ACTIVE" = "0" ]; then
