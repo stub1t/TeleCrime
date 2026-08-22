@@ -1088,11 +1088,29 @@ async def run_sequential_pipeline(
                     # find no READY group and silently skip the archive.
                     if _prefetch_task_result:
                         ctx.files_downloaded += 1
-                        _gid = _artifact_group_id(session, artifact.id)
-                        await acquire_stage._update_group_statuses(
-                            ctx, {_gid} if _gid else None
-                        )
-                        session.commit()
+                        try:
+                            _gid = _artifact_group_id(session, artifact.id)
+                            await acquire_stage._update_group_statuses(
+                                ctx, {_gid} if _gid else None
+                            )
+                            session.commit()
+                        except (Exception, asyncio.CancelledError) as e:
+                            # A dead/terminated PostgreSQL backend (e.g.
+                            # idle_in_transaction_session_timeout) raises
+                            # PendingRollbackError here; it must not crash the
+                            # pipeline. Reset the artifact so a later run retries
+                            # the download, and let the archive loop continue.
+                            logger.warning(
+                                "Prefetch completion DB update failed for artifact %d: %s",
+                                artifact.id, e,
+                            )
+                            try:
+                                session.rollback()
+                            except Exception:
+                                pass
+                            _reset_prefetch_artifact(session, artifact.id)
+                            session.commit()
+                            _prefetch_task_result = False
                 else:
                     artifact = _next_pending_artifact(session)
                     if not artifact:
@@ -1376,7 +1394,15 @@ def _finish_pipeline_run(
         session.rollback()
     except Exception:
         pass
-    fresh_run = session.get(PipelineRun, run_id)
+    try:
+        fresh_run = session.get(PipelineRun, run_id)
+    except Exception as e:
+        # The session's backend may have been terminated (connection
+        # invalidation) — finalizing must never crash the pipeline.
+        logger.warning(
+            "Pipeline run %s finalization skipped (session invalid): %s", run_id, e
+        )
+        return
     if fresh_run is None:
         logger.warning("Pipeline run %s disappeared before finalization", run_id)
         return
