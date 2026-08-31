@@ -716,6 +716,16 @@ def _run_channel_join_job(config, engine, max_joins: int = 1) -> str:
         # Step 2: join via Telegram (aux session if configured). Swallow
         # transient Telegram/session errors so the job reports "skipped"
         # instead of "failed" — same policy as _send_telegram_notification.
+        # Also defer while the pipeline subprocess is live: it holds the main
+        # session (a second client on the same session file invalidates both).
+        try:
+            if read_progress().get("running"):
+                return (
+                    f"discovered {new_count} new, "
+                    f"skipped Telegram step: pipeline running (session in use)"
+                )
+        except Exception:
+            pass
         adapter = TelegramAdapter(config.with_aux_telegram_session())
         joined = skipped = failed = 0
         try:
@@ -1449,6 +1459,17 @@ def _send_telegram_notification(config, callback) -> str:
     from telecrime.notify import TelegramNotifier
 
     async def _run() -> str:
+        # The pipeline subprocess holds the main Telegram session for the whole
+        # run (downloads, password extraction). Opening a second Telethon
+        # client on the same session file mid-run makes Telegram invalidate
+        # both connections ("Server replied with a wrong session ID") and can
+        # wedge the pipeline's extract stage indefinitely. Defer the
+        # notification until the pipeline is idle.
+        try:
+            if read_progress().get("running"):
+                return "skipped: pipeline running (session in use)"
+        except Exception:
+            pass
         adapter = TelegramAdapter(config.with_aux_telegram_session())
         try:
             await adapter.connect()

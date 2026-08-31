@@ -124,6 +124,9 @@ echo "$SIG" > "$SNAP"
 # batches), so treating them as "hung" kills healthy long work — and an
 # aborted parse leaves the group EXTRACTED with its credentials never parsed
 # (finalize just cleans it) → permanent data loss.
+# The exemption is NOT blind: a stuck extract (e.g. a Telegram session loop
+# with no 7z subprocess) must still be healed. Extract is only exempt while
+# an actual 7z/unrar subprocess is running in the worker container.
 STAGE=$(python3 -c "
 import json, sys
 try:
@@ -131,6 +134,15 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || echo "")
+
+EXTRACTOR_RUNNING=0
+if [ "$STAGE" = "extract" ]; then
+  WORKER_CONTAINER=$(compose ps -q worker 2>/dev/null)
+  if [ -n "$WORKER_CONTAINER" ] && \
+     docker exec "$WORKER_CONTAINER" sh -c "pgrep -f '7z|unrar' >/dev/null 2>&1" 2>/dev/null; then
+    EXTRACTOR_RUNNING=1
+  fi
+fi
 
 # Active download? A download is network I/O (no DB query) and keeps the
 # creds/dups/archive counters frozen while dl_pct advances — a frozen
@@ -191,7 +203,8 @@ elif [ "$FROZEN" = "1" ] && [ "$DB_ACTIVE" = "0" ] && [ "$DL_ACTIVE" = "0" ]; th
   # EXCEPT during the extract/parse phases (long subprocess/regex work, see
   # STAGE above) — those are self-protected and must not be killed.
   case "$STAGE" in
-    extract|parse) : ;;
+    extract) [ "$EXTRACTOR_RUNNING" = "1" ] || { NEED_HEAL=1; REASON="hung pipeline (extract frozen with no 7z/unrar subprocess)"; } ;;
+    parse) : ;;
     *) if [ "$FROZEN" = "1" ]; then
          NEED_HEAL=1
          REASON="hung pipeline (progress frozen for two checks, no DB or download activity)"
