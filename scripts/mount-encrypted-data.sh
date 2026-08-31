@@ -10,10 +10,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Replace with your device's UUID — find it with: lsblk -o NAME,UUID
-LUKS_UUID="${TELECRIME_LUKS_UUID:-YOUR-LUKS-UUID-HERE}"
+# UUID of the LUKS partition on the external drive (find it with: lsblk -o NAME,UUID)
+LUKS_UUID="${TELECRIME_LUKS_UUID:-2d87de69-8f80-4ac9-bfc1-56f4e304a572}"
 MAPPER_NAME="${TELECRIME_MAPPER_NAME:-telecrime-data}"
-MOUNT_POINT="${TELECRIME_MOUNT_POINT:-${TELECRIME_DATA_DIR:-$REPO_DIR/data}}"
+# Drive filesystem root — must be the parent of TELECRIME_DATA_DIR (data/ and
+# postgres_data/ live directly on this filesystem).
+MOUNT_POINT="${TELECRIME_MOUNT_POINT:-/mnt/telecrime}"
 
 if [[ $EUID -ne 0 ]]; then
     echo "must be run as root (use sudo)" >&2
