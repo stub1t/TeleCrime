@@ -222,4 +222,32 @@ for svc in db web worker; do
   fi
 done
 
+# --- 5. External drive still mounted? ---
+# The DB volume and the data dir live on the LUKS drive at /mnt/telecrime.
+# If it drops (USB timeout during heavy I/O) or was never mounted after boot,
+# try to bring it back: the already-open mapper mounts directly; otherwise
+# systemd-cryptsetup unlocks it via the keyfile (once luksAddKey has run).
+if ! mountpoint -q /mnt/telecrime; then
+  log "CRITICAL: /mnt/telecrime not mounted — attempting drive recovery"
+  sudo -n mount /dev/mapper/telecrime-data /mnt/telecrime 2>/dev/null \
+    || sudo -n systemctl start systemd-cryptsetup@telecrime-data.service 2>/dev/null
+  sleep 5
+  if mountpoint -q /mnt/telecrime; then
+    log "drive recovered: /mnt/telecrime is mounted again"
+    # DB and worker both depend on the bind-mounted volume; restart them so
+    # they see the real data instead of the empty root-dir fallback.
+    compose up -d db worker 2>/dev/null
+  else
+    log "drive recovery failed — data dir and DB volume unavailable"
+  fi
+else
+  # Healthy-mount sanity: the DB volume must point at real PG data.
+  # postgres_data is root-owned (0700) — plain -e fails with EACCES, so use
+  # sudo; fall back to checking the directory entry is visible.
+  if ! sudo -n test -e /mnt/telecrime/postgres_data/PG_VERSION 2>/dev/null \
+     && [ ! -e /mnt/telecrime/postgres_data ]; then
+    log "CRITICAL: /mnt/telecrime mounted but postgres_data missing"
+  fi
+fi
+
 log "watchdog done"
