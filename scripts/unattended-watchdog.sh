@@ -109,9 +109,13 @@ except Exception:
 
 FROZEN=0
 if [ -n "$SIG" ] && [ -f "$SNAP" ]; then
-  PREV_SIG=""
-  PREV_TS=0
-  read -r PREV_SIG PREV_TS < <(cat "$SNAP")
+  # SIG can contain spaces (archive names like "ULP Combo (1).zip"), so the
+  # snapshot is stored as two LINES (SIG then timestamp) — a single-line
+  # "SIG TS" pair would break read -r on whitespace and silently disable
+  # frozen detection whenever a spaced filename was current.
+  PREV_SIG=$(sed -n '1p' "$SNAP")
+  PREV_TS=$(sed -n '2p' "$SNAP")
+  PREV_TS=${PREV_TS:-0}
   NOW_TS=$(date +%s)
   # Two-consecutive-identical-signatures must be observed at least 9 minutes
   # apart. The cron watchdog (10-min) and the monitor loop (5-min) interleave,
@@ -122,7 +126,7 @@ if [ -n "$SIG" ] && [ -f "$SNAP" ]; then
     FROZEN=1
   fi
 fi
-echo "$SIG $NOW_TS" > "$SNAP"
+printf '%s\n%s\n' "$SIG" "$NOW_TS" > "$SNAP"
 
 # Pipeline stage — the extract and parse phases are legitimate long-running
 # states: 7z/unrar on 50k+ file archives can take 1-2 h, and parsing a

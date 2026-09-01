@@ -1896,29 +1896,3 @@ class TelecrimeWorker:
             return False
         job.modify(next_run_time=datetime.now(UTC))
         return True
-
-    def get_jobs_info(self) -> list[dict]:
-        """Return info about all configured jobs."""
-        statuses = read_status()
-        result = []
-        for name, defn in JOB_DEFS.items():
-            st = statuses.get(name)
-            job = self._scheduler.get_job(name) if self._scheduler else None
-            next_run = None
-            if job and job.next_run_time:
-                next_run = job.next_run_time.isoformat()
-            result.append(
-                {
-                    "name": name,
-                    "description": defn["description"],
-                    "interval_hours": defn["interval_hours"],
-                    "requires_telegram": defn["requires_telegram"],
-                    "enabled": job is not None,
-                    "running": st.running if st else False,
-                    "last_run": st.last_run if st else None,
-                    "last_result": st.last_result if st else None,
-                    "last_error": st.last_error if st else None,
-                    "next_run": next_run or (st.next_run if st else None),
-                }
-            )
-        return result

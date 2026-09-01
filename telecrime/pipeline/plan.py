@@ -269,14 +269,37 @@ class PlanStage(PipelineStage):
                 )
                 ctx.session.add(part)
                 linked_any = True
-            # A new source for a permanently-failed group can rescue it:
-            # revert to INCOMPLETE so the acquire stage downloads the new
-            # artifact and (re-)evaluates the group.
-            if linked_any and existing.status == GroupStatus.FAILED_TERMINAL:
+            # A new source can rescue a group that already finished (CLEANED:
+            # files deleted by finalize) or permanently failed: revert to
+            # INCOMPLETE so the acquire stage re-downloads the parts. Also
+            # reset any parts whose files were deleted (is_deleted=True) back
+            # to PENDING — otherwise they stay COMPLETED pointing at missing
+            # files and the revived group would be marked READY and extract
+            # nothing.
+            if linked_any and existing.status in (
+                GroupStatus.FAILED_TERMINAL,
+                GroupStatus.CLEANED,
+                GroupStatus.FAILED,
+            ):
                 logger.info(
-                    "Reviving FAILED_TERMINAL group %s — reposted source linked",
+                    "Reviving %s group %s — reposted source linked",
+                    existing.status.name,
                     existing.base_name,
                 )
+                revived_deleted = 0
+                for part in existing.parts:
+                    art = part.artifact
+                    if art is not None and art.is_deleted:
+                        art.status = DownloadStatus.PENDING
+                        art.is_deleted = False
+                        art.local_path = None
+                        revived_deleted += 1
+                if revived_deleted:
+                    logger.info(
+                        "Reset %d deleted artifacts of group %s for re-download",
+                        revived_deleted,
+                        existing.base_name,
+                    )
                 existing.status = GroupStatus.INCOMPLETE
             return existing
 

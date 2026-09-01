@@ -235,16 +235,14 @@ class SevenZipExtractor(ArchiveExtractor):
         cmd.append(str(archive_path))
 
         try:
+            # Stream the listing line-by-line instead of buffering the whole
+            # output: a 1M-file archive emits ~10M lines (~1 GB) that would
+            # otherwise be held in RAM 3-4x over (decode + splitlines + list).
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-
-            stdout, stderr = await process.communicate()
-
-            if process.returncode != 0:
-                return []
 
             # Parse file list from output.
             # 7z -slt output begins with the archive's own metadata block:
@@ -259,12 +257,13 @@ class SevenZipExtractor(ArchiveExtractor):
             # treating it as an unsafe member, and any section marked as a
             # folder (trailing "/" or "Folder = +").
             files = []
-            stdout_text = stdout.decode("utf-8", errors="replace")
             archive_path_str = str(archive_path)
 
             path: str | None = None
             is_folder = False
-            for line in stdout_text.splitlines():
+            line_bytes = await process.stdout.readline()
+            while line_bytes:
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
                 if line.startswith("Path = "):
                     path = line[7:].strip()
                     is_folder = path.endswith("/")
@@ -279,12 +278,19 @@ class SevenZipExtractor(ArchiveExtractor):
                         files.append(path)
                     path = None
                     is_folder = False
+                line_bytes = await process.stdout.readline()
             if (
                 path
                 and path != archive_path_str
                 and not is_folder
             ):
                 files.append(path)
+
+            # Wait for the process to exit; return [] on non-zero (password
+            # required, corrupt, etc.) — the caller treats [] as "no match".
+            await process.wait()
+            if process.returncode != 0:
+                return []
 
             return files
 
@@ -370,16 +376,3 @@ class SevenZipExtractor(ArchiveExtractor):
         all_files = await self.list_contents(archive_path, password)
         normalized_exts = self._normalize_extensions(target_extensions)
         return [f for f in all_files if Path(f).suffix.lower().lstrip(".") in normalized_exts]
-
-    async def has_matching_files(
-        self,
-        archive_path: Path,
-        target_extensions: list[str],
-        password: str | None = None,
-    ) -> bool:
-        """Check if archive contains any files matching target extensions.
-
-        Quick check to determine if extraction is worthwhile.
-        """
-        matching = await self.find_matching_files(archive_path, target_extensions, password)
-        return len(matching) > 0

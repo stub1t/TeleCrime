@@ -415,10 +415,41 @@ class FinalizeStage(PipelineStage):
             )
 
         # Delete archive parts
+        # Repost-dedup can point an artifact in ANOTHER (still-active) group
+        # at the same local_path. Deleting the file here would break that
+        # group's extraction. Leave the file when another non-CLEANED group
+        # shares it — _sweep_orphaned_downloads reclaims it once every sharing
+        # group is CLEANED.
+        part_ids = [p.artifact_id for p in group.parts if p.artifact_id is not None]
+        shared_paths: set[str] = set()
+        if part_ids:
+            shared_paths = {
+                row[0]
+                for row in ctx.session.execute(
+                    select(DownloadArtifact.local_path, ArchiveGroup.status)
+                    .join(ArchiveGroupPart, ArchiveGroupPart.artifact_id == DownloadArtifact.id)
+                    .join(ArchiveGroup, ArchiveGroup.id == ArchiveGroupPart.group_id)
+                    .where(
+                        DownloadArtifact.local_path.isnot(None),
+                        DownloadArtifact.is_deleted.is_(False),
+                        DownloadArtifact.id.not_in(part_ids),
+                        ArchiveGroup.status != GroupStatus.CLEANED,
+                    )
+                )
+                if row[0]
+            }
+
         for part in group.parts:
             artifact = part.artifact
             if artifact.local_path and not artifact.is_deleted:
                 archive_path = Path(artifact.local_path)
+
+                if archive_path.exists() and str(archive_path) in shared_paths:
+                    logger.info(
+                        "Leaving %s — shared with another active group (repost dedup)",
+                        archive_path.name,
+                    )
+                    continue
 
                 if archive_path.exists():
                     try:

@@ -19,32 +19,32 @@
 <div class="readouts">
   <div class="readout">
     <div class="ro-label"><span class="lamp on"></span> Credentials</div>
-    <div class="ro-value signal">{{ "{:,}".format(stats.credentials | default(0)) }}</div>
+    <div class="ro-value signal">{{ "{:,}".format(stats.credentials | default(0, true)) }}</div>
     <div class="ro-sub">parsed and stored</div>
   </div>
   <div class="readout">
     <div class="ro-label">Channels</div>
-    <div class="ro-value">{{ "{:,}".format(stats.channels | default(0)) }}</div>
+    <div class="ro-value">{{ "{:,}".format(stats.channels | default(0, true)) }}</div>
     <div class="ro-sub">tracked</div>
   </div>
   <div class="readout">
     <div class="ro-label">Messages</div>
-    <div class="ro-value">{{ "{:,}".format(stats.messages | default(0)) }}</div>
+    <div class="ro-value">{{ "{:,}".format(stats.messages | default(0, true)) }}</div>
     <div class="ro-sub">ingested</div>
   </div>
   <div class="readout">
     <div class="ro-label">Archives</div>
-    <div class="ro-value">{{ "{:,}".format(stats.archives | default(0)) }}</div>
+    <div class="ro-value">{{ "{:,}".format(stats.archives | default(0, true)) }}</div>
     <div class="ro-sub">processed</div>
   </div>
   <div class="readout">
     <div class="ro-label">Conversations</div>
-    <div class="ro-value">{{ "{:,}".format(stats.conversations | default(0)) }}</div>
+    <div class="ro-value">{{ "{:,}".format(stats.conversations | default(0, true)) }}</div>
     <div class="ro-sub">chats and groups</div>
   </div>
   <div class="readout">
     <div class="ro-label">Attachments</div>
-    <div class="ro-value">{{ "{:,}".format(stats.attachments | default(0)) }}</div>
+    <div class="ro-value">{{ "{:,}".format(stats.attachments | default(0, true)) }}</div>
     <div class="ro-sub">files seen</div>
   </div>
 </div>
@@ -93,7 +93,7 @@
               <td><span class="tag">{{ run.mode }}</span></td>
               <td class="code">{{ run.started_at.strftime("%Y-%m-%d %H:%M") if run.started_at else "—" }}</td>
               <td class="code">{% if run.duration_seconds %}{{ "{:.0f}".format(run.duration_seconds // 60) }}m{% else %}—{% endif %}</td>
-              <td class="code">{{ "{:,}".format(run.credentials_parsed | default(0)) }}</td>
+              <td class="code">{{ "{:,}".format(run.credentials_parsed | default(0, true)) }}</td>
               <td class="code">{% if run.error_count %}<span style="color:var(--bad)">{{ run.error_count }}</span>{% else %}<span class="muted">0</span>{% endif %}</td>
             </tr>
             {% endfor %}

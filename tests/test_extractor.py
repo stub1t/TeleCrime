@@ -5,6 +5,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+
+class _AsyncLineReader:
+    """Async iterable over bytes lines, mimicking subprocess stdout."""
+
+    def __init__(self, data: bytes):
+        lines = data.splitlines()
+        self._lines = iter(lines if lines else [b""])
+
+    async def readline(self) -> bytes:
+        try:
+            return next(self._lines) + b"\n"
+        except StopIteration:
+            return b""
+
 from telecrime.extractor.interface import ExtractionResult
 from telecrime.extractor.seven_zip import SevenZipExtractor
 
@@ -282,8 +296,9 @@ Folder = +
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
             mock_process = AsyncMock()
-            mock_process.communicate = AsyncMock(return_value=(mock_output, b""))
+            mock_process.stdout = _AsyncLineReader(mock_output)
             mock_process.returncode = 0
+            mock_process.wait = AsyncMock(return_value=0)
             mock_exec.return_value = mock_process
 
             files = await extractor.list_contents(Path("/tmp/test.7z"))
@@ -309,8 +324,9 @@ Folder = +
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
             mock_process = AsyncMock()
-            mock_process.communicate = AsyncMock(return_value=(mock_output, b""))
+            mock_process.stdout = _AsyncLineReader(mock_output)
             mock_process.returncode = 0
+            mock_process.wait = AsyncMock(return_value=0)
             mock_exec.return_value = mock_process
 
             files = await extractor.list_contents(archive)

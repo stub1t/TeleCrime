@@ -189,34 +189,6 @@ class TelegramNotifier:
         )
         await self.send(msg)
 
-    async def extracting(self, filename: str, password_used: bool = False):
-        """Extraction is too frequent and short-lived to notify on."""
-        del filename, password_used
-
-    # ------------------------------------------------------------- parse stats
-
-    async def credentials_found(
-        self,
-        count: int,
-        unique_domains: int,
-        source_file: str,
-        top_domains: list[tuple[str, int]] | None = None,
-    ):
-        """Per-file parse notification (legacy; archive_parsed is preferred)."""
-        lines = [
-            "🔑 <b>Credentials parsed</b>",
-            _code(_trunc(source_file, 80)),
-            "",
-            f"• <b>Count:</b> {_fmt_int(count)}",
-            f"• <b>Unique domains:</b> {_fmt_int(unique_domains)}",
-        ]
-        if top_domains:
-            lines.append("")
-            lines.append("<b>Top domains</b>")
-            for domain, cnt in top_domains[:5]:
-                lines.append(f"• {_esc(domain)} — {_fmt_int(cnt)}")
-        await self.send("\n".join(lines))
-
     async def archive_parsed(
         self,
         archive_name: str,
@@ -250,21 +222,6 @@ class TelegramNotifier:
             for domain, cnt in top_domains[:5]:
                 lines.append(f"• {_esc(_trunc(domain, 48))} — {_fmt_int(cnt)}")
         await self.send("\n".join(lines))
-
-    async def new_credential(self, domain: str, username: str, source: str):
-        """High-signal one-off credential (use sparingly)."""
-        user_masked = (
-            f"{username[0]}***{username[-1]}" if username and len(username) > 2 else "***"
-        )
-        msg = (
-            "🆕 <b>New credential</b>\n\n"
-            f"• <b>Domain:</b> {_code(domain)}\n"
-            f"• <b>User:</b> {_esc(user_masked)}\n"
-            f"• <b>Source:</b> {_esc(_trunc(source, 60))}"
-        )
-        await self.send(msg)
-
-    # ----------------------------------------------------------------- errors
 
     async def error(self, message: str, stage: str | None = None):
         """Pipeline error — formatted with stage and timestamp."""
@@ -405,8 +362,3 @@ class TelegramNotifier:
 _notifier: TelegramNotifier | None = None
 
 
-async def notify(message: str):
-    if _notifier:
-        await _notifier.send(message)
-    else:
-        logger.info("[NOTIFY] %s", message)

@@ -1388,13 +1388,13 @@ def _home_stats_fallback(session, credential_count: object) -> dict[str, object]
     )
     return {
         "conversations": session.query(Conversation).count(),
-        "messages": estimates.get("messages"),
-        "attachments": estimates.get("file_attachments"),
-        "archives": estimates.get("download_artifacts"),
+        "messages": estimates.get("messages") or 0,
+        "attachments": estimates.get("file_attachments") or 0,
+        "archives": estimates.get("download_artifacts") or 0,
         "archive_groups": session.query(ArchiveGroup).count(),
-        "extractions": estimates.get("extraction_jobs"),
-        "extracted_outputs": None,
-        "credentials": credential_count,
+        "extractions": estimates.get("extraction_jobs") or 0,
+        "extracted_outputs": 0,
+        "credentials": credential_count or 0,
         "channels": session.query(TelegramChannel).count(),
     }
 
@@ -2249,7 +2249,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
             elif isinstance(cached_stats, dict):
                 stats = dict(cached_stats)
             else:
-                stats = _home_stats_fallback(session, "...")
+                stats = _home_stats_fallback(session, 0)
 
             # The cache only refreshes when the pipeline is idle, so on a busy
             # ingest it can lag by days. Use the larger fast estimate because

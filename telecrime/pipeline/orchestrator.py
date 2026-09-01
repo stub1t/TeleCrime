@@ -25,7 +25,7 @@ from telecrime.models import (
     PipelineRun,
 )
 from telecrime.pipeline.lock import pipeline_run_lock
-from telecrime.states import DownloadStatus, GroupStatus
+from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
 
 if TYPE_CHECKING:
     from telecrime.notify import TelegramNotifier
@@ -813,10 +813,42 @@ async def run_sequential_pipeline(
                 statuses = {p.artifact.status for p in _g.parts}
                 no_active = not (statuses & {DownloadStatus.PENDING, DownloadStatus.DOWNLOADING})
                 if no_active:
+                    # A FAILED_TERMINAL part is "covered" when another part in
+                    # the group holds the same physical file (identical
+                    # platform_file_unique_id) and is COMPLETED — the repost
+                    # copy serves as the archive part. Without this, a group
+                    # with {COMPLETED, FAILED_TERMINAL} parts fell through both
+                    # branches below and stayed INCOMPLETE forever.
+                    _completed_ids = {
+                        p.artifact.attachment.platform_file_unique_id
+                        for p in _g.parts
+                        if p.artifact.attachment
+                        and p.artifact.status == DownloadStatus.COMPLETED
+                        and p.artifact.attachment.platform_file_unique_id
+                    }
+                    _covered = {
+                        p.artifact.attachment.platform_file_unique_id
+                        for p in _g.parts
+                        if p.artifact.status == DownloadStatus.FAILED_TERMINAL
+                        and p.artifact.attachment
+                        and p.artifact.attachment.platform_file_unique_id
+                    } <= _completed_ids
                     if statuses <= {DownloadStatus.COMPLETED}:
                         _g.status = GroupStatus.READY
                         _promoted += 1
-                    elif DownloadStatus.FAILED_TERMINAL in statuses and DownloadStatus.COMPLETED not in statuses:
+                    elif (
+                        DownloadStatus.FAILED_TERMINAL in statuses
+                        and DownloadStatus.COMPLETED not in statuses
+                        and not _covered
+                    ):
+                        _g.status = GroupStatus.FAILED_TERMINAL
+                        _terminal += 1
+                    elif statuses <= {DownloadStatus.COMPLETED, DownloadStatus.FAILED_TERMINAL} and _covered:
+                        # All parts settled; failed parts covered by reposts.
+                        _g.status = GroupStatus.READY
+                        _promoted += 1
+                    elif statuses <= {DownloadStatus.COMPLETED, DownloadStatus.FAILED_TERMINAL}:
+                        # All parts settled but a failed part is NOT covered.
                         _g.status = GroupStatus.FAILED_TERMINAL
                         _terminal += 1
             if _promoted or _terminal:
@@ -997,13 +1029,26 @@ async def run_sequential_pipeline(
                 # Process any READY groups before downloading more.
                 # This frees disk space (finalize deletes archives) so
                 # subsequent downloads have room.
+                # Exclude PASSWORD_NEEDED groups: they are retried once per
+                # run (next run), not re-extracted every loop iteration.
+                _pwd_needed_exists = (
+                    select(ExtractionJob.id)
+                    .where(
+                        ExtractionJob.group_id == ArchiveGroup.id,
+                        ExtractionJob.status == ExtractionStatus.PASSWORD_NEEDED,
+                    )
+                    .exists()
+                )
                 ready_groups = (
                     session.execute(
                         select(ArchiveGroup.id)
                         .join(ArchiveGroupPart, ArchiveGroupPart.group_id == ArchiveGroup.id)
                         .join(DownloadArtifact, DownloadArtifact.id == ArchiveGroupPart.artifact_id)
                         .join(FileAttachment, FileAttachment.id == DownloadArtifact.attachment_id)
-                        .where(ArchiveGroup.status == GroupStatus.READY)
+                        .where(
+                            ArchiveGroup.status == GroupStatus.READY,
+                            ~_pwd_needed_exists,
+                        )
                         .group_by(ArchiveGroup.id)
                         .order_by(
                             func.min(_download_priority(FileAttachment.filename)).asc(),

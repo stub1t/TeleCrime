@@ -84,10 +84,24 @@ class ExtractStage(PipelineStage):
 
         # Fetch IDs only, then commit immediately so the read transaction is
         # released before the potentially long 7z extraction begins.
+        # Groups whose job is PASSWORD_NEEDED are retried once per run (next
+        # run), not re-extracted every pass — a password learned mid-run is
+        # picked up by the next run's READY sweep.
+        _pwd_needed_exists = (
+            select(ExtractionJob.id)
+            .where(
+                ExtractionJob.group_id == ArchiveGroup.id,
+                ExtractionJob.status == ExtractionStatus.PASSWORD_NEEDED,
+            )
+            .exists()
+        )
         ready_ids = (
             ctx.session.execute(
                 select(ArchiveGroup.id)
-                .where(ArchiveGroup.status == GroupStatus.READY)
+                .where(
+                    ArchiveGroup.status == GroupStatus.READY,
+                    ~_pwd_needed_exists,
+                )
             )
             .scalars()
             .all()

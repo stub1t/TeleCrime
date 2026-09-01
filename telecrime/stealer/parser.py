@@ -366,25 +366,19 @@ def _open_credential_file(file_path: Path, encoding: str) -> TextIO | None:
 
     enc_chain = _detect_encoding(file_path, encoding)
     for enc in enc_chain:
+        # Decode probe must be STRICT: opening with errors="replace" never
+        # raises, so the fallback chain was dead code and non-UTF8 files were
+        # silently mojibake'd instead of falling back to cp1252/latin-1.
         try:
-            fh = _open_file(file_path, enc)
-            # Decode probe: read first line to confirm this encoding works.
-            fh.readline()
-            fh.seek(0)
-            return fh
+            with open(file_path, encoding=enc, errors="strict") as probe:
+                probe.readline()
         except (UnicodeDecodeError, UnicodeError):
-            try:
-                fh.close()
-            except Exception:
-                pass
             continue
         except Exception as exc:
-            logger.error("Error reading %s with encoding %s: %s", file_path, enc, exc)
-            try:
-                fh.close()
-            except Exception:
-                pass
+            logger.error("Error probing %s with encoding %s: %s", file_path, enc, exc)
             return None
+        fh = _open_file(file_path, enc)
+        return fh
 
     logger.warning("Could not decode file: %s", file_path)
     return None

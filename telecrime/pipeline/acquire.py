@@ -498,7 +498,20 @@ class AcquireStage(PipelineStage):
                 # Compute hash
                 content_hash = await self._compute_hash(temp_path)
 
-                # Atomic rename to final location
+                # Atomic rename to final location. Never overwrite: another
+                # concurrent prefetch download may have claimed dest_path since
+                # the exists() check above (TOCTOU) — if it did, pick a new
+                # unique name instead of silently clobbering the other file.
+                if dest_path.exists():
+                    counter = 1
+                    stem = original_dest.stem
+                    suffix = original_dest.suffix
+                    while True:
+                        candidate = original_dest.parent / f"{stem}_{counter}{suffix}"
+                        if not candidate.exists():
+                            dest_path = candidate
+                            break
+                        counter += 1
                 temp_path.rename(dest_path)
 
                 # Update artifact — safe to set attributes on expired object;

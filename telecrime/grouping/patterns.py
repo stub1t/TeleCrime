@@ -154,16 +154,33 @@ def group_by_pattern(attachments: list[FileAttachment]) -> list[GroupingResult]:
                 explicit_parts = parts  # include all
 
             attachments_list = [p[0] for p in explicit_parts]
-            part_numbers = {
-                p[0].id: p[1] if p[1] is not None else idx
-                for idx, p in enumerate(sorted(explicit_parts, key=lambda x: x[1] or 0))
-            }
+            if uses_part_n:
+                part_numbers = {
+                    p[0].id: p[1] if p[1] is not None else idx
+                    for idx, p in enumerate(sorted(explicit_parts, key=lambda x: x[1] or 0))
+                }
+            else:
+                # Old-style RAR: the bare .rar is the header-bearing first
+                # volume (index 0); .r00/.r01/.r02... follow as 1,2,3.
+                # Sorting by `x[1] or 0` would tie the bare .rar with .r00,
+                # and assigning the .rar an enumerate index could collide with
+                # .r00's explicit 0 → two parts with part_index 0, breaking
+                # 7z's volume order and failing extraction.
+                part_numbers = {}
+                for p in sorted(
+                    explicit_parts,
+                    key=lambda x: x[1] if x[1] is not None else -1,
+                ):
+                    part_numbers[p[0].id] = 0 if p[1] is None else p[1] + 1
 
             # Infer expected parts from the range of part numbers.
             # Most formats are 1-indexed (.part1, .001, .z01) so the count
             # is max-min+1.  0-indexed formats (.r00) also work correctly.
             part_nums = [p[1] for p in explicit_parts if p[1] is not None]
             expected_parts = max(part_nums) - min(part_nums) + 1
+            # Old-style RAR includes the bare .rar as an extra part before .r00.
+            if not uses_part_n and any(p[1] is None for p in explicit_parts):
+                expected_parts += 1
 
             results.append(GroupingResult(
                 base_name=attachments_list[0].detected_base_name or attachments_list[0].filename or base_name,

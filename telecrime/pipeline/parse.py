@@ -318,10 +318,17 @@ class ParseStage(PipelineStage):
                 logger.warning("Parallel parse reader failed: %s", exc)
             finally:
                 fh.close()
-                try:
-                    chunks_q.put_nowait(sentinel)
-                except _queue.Full:
-                    pass
+                # The sentinel must be delivered even when the queue is full
+                # (normal EOF state: the fast reader races ahead of the
+                # consumer). A put_nowait here would raise Full and silently
+                # drop it, leaving the consumer spinning on submitting=True
+                # forever. Poll with the same timeout loop the chunks use.
+                while not stop_event.is_set():
+                    try:
+                        chunks_q.put(sentinel, timeout=0.5)
+                        break
+                    except _queue.Full:
+                        continue
 
         read_task = loop.run_in_executor(None, _read_chunks)
 
@@ -362,6 +369,15 @@ class ParseStage(PipelineStage):
                             pool.submit(_parse_lines_chunk_worker, (chunk, source_file))
                         )
                     if not in_flight and not submitting:
+                        break
+                    if (
+                        not in_flight
+                        and read_task.done()
+                        and chunks_q.empty()
+                    ):
+                        # Belt-and-suspenders: reader thread finished, nothing
+                        # queued and nothing in flight — done, even if the
+                        # sentinel was somehow lost.
                         break
                     # Poll for completed futures without ever blocking the loop
                     # on a threaded wait() that could re-enter pool locks.
@@ -890,6 +906,12 @@ class ParseStage(PipelineStage):
                         "sequential parse",
                         file_path.name, exc,
                     )
+                    # Discard any pre-processed tuples left in the batch from
+                    # the parallel path: _flush_batch dispatches on the first
+                    # item's type, and the sequential fallback appends
+                    # Credential objects — a mixed batch would crash the flush.
+                    batch = []
+                    file_cred_count = 0
                     await _sequential_parse()
             else:
                 await _sequential_parse()

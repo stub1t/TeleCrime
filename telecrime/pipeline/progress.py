@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 import threading
 import time
 from collections import deque
@@ -45,9 +46,24 @@ def _write_progress_data(data: dict[str, object]) -> None:
     path = _progress_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data))
-        tmp.replace(path)
+        # Unique temp name per write: the pipeline's heartbeat thread and the
+        # scheduler process (patch_progress) write this file concurrently, and
+        # a shared ".tmp" name let two writers clobber each other's temp —
+        # worst case renaming a torn file into place (readers then see no
+        # heartbeat and the watchdog kills a healthy pipeline).
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".progress-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception:
         pass
 
@@ -276,12 +292,6 @@ class PipelineProgressWriter:
         if count != self._credentials:
             self._mark_progress()
         self._credentials = count
-        self._write()
-
-    def update_dups(self, count: int) -> None:
-        if count != self._duplicates:
-            self._mark_progress()
-        self._duplicates = count
         self._write()
 
     def update_counts(self, creds: int, dups: int) -> None:

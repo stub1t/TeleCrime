@@ -398,8 +398,3 @@ class PipelineDisplay:
             self.console.print(f"\n[yellow]Errors ({len(ctx.errors)}):[/yellow]")
             for error in ctx.errors[:10]:
                 self.console.print(f"  - {error}")
-
-    def finish(self, ctx: "PipelineContext") -> None:
-        """Stop display and print summary (convenience)."""
-        self.stop()
-        self.print_summary(ctx)
