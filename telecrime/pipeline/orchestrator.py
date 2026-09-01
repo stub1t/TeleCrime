@@ -21,6 +21,7 @@ from telecrime.models import (
     ArchiveGroup,
     ArchiveGroupPart,
     DownloadArtifact,
+    ExtractionJob,
     FileAttachment,
     PipelineRun,
 )
@@ -875,8 +876,6 @@ async def run_sequential_pipeline(
                 )
             ).scalars().all()
             if stuck:
-                from telecrime.models import ExtractionJob
-
                 job_max_attempts = 3
                 retry_ids: list[int] = []
                 terminal_ids: list[int] = []
