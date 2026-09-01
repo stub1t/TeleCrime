@@ -47,11 +47,11 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/').status==200 else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/', timeout=10).status==200 else 1)\""]
       interval: 30s
-      timeout: 5s
+      timeout: 15s
       retries: 3
-      start_period: 15s
+      start_period: 30s
 
   worker:
     build: .

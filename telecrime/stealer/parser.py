@@ -32,8 +32,12 @@ BRACKET_HEADER_PATTERN = re.compile(
 )
 
 # Format 3: URL:user:password (colon-separated)
+# The URL may carry a :port — "https://host:8080:user:pass" must split as
+# url="https://host:8080", user="user", pass="pass". URLs with a port AND a
+# path ("https://host:8080/x:u:p") fail the match entirely (fall through to
+# other formats) rather than being mangled into bogus triples.
 COLON_SEPARATED_PATTERN = re.compile(
-    r"^(?P<url>https?://[^\s:]+):(?P<username>[^:]+):(?P<password>.+)$",
+    r"^(?P<url>https?://[^\s:]+(?::\d{1,5})?):(?P<username>[^:]+):(?P<password>.+)$",
     re.MULTILINE
 )
 
@@ -51,7 +55,7 @@ SEMICOLON_SEPARATED_PATTERN = re.compile(
 
 # Line patterns for per-line detection (used in streaming)
 _COLON_LINE_RE = re.compile(
-    r"^(?P<url>https?://[^\s:]+):(?P<username>[^:]+):(?P<password>.+)$"
+    r"^(?P<url>https?://[^\s:]+(?::\d{1,5})?):(?P<username>[^:]+):(?P<password>.+)$"
 )
 _PIPE_LINE_RE = re.compile(
     r"^(?P<url>https?://[^\s|]+)\s*\|\s*(?P<username>[^|]+)\s*\|\s*(?P<password>.+)$"
@@ -69,6 +73,9 @@ _PROMO_MARKERS_RE = re.compile(
     r"|\s*(?:you\s+can\s+buy|to\s+buy|dm\s+@)[^\r\n]*$",
     re.IGNORECASE,
 )
+# Fast fail-fast trigger scan (C-level, no allocation) replacing the
+# unconditional .lower() copy on every field.
+_PROMO_TRIGGER_RE = re.compile(r"t\.me|buy|dm\s+@", re.IGNORECASE)
 _BRACKET_PROMO_RE = re.compile(r"\s*\[.*?(?:to\s+buy|buy|dm)\b.*$", re.IGNORECASE)
 
 # Exact-match sentinel values that indicate placeholder/garbage rows, not real credentials.
@@ -103,9 +110,8 @@ def _clean_credential_field(value: str | None, *, username: bool = False) -> str
     # before invoking the regex engine — saves ~12-15x on the common clean case.
     if username and "[" in cleaned:
         cleaned = _BRACKET_PROMO_RE.sub("", cleaned).strip()
-    # The promo regexes are case-insensitive, so the trigger check must be too.
-    low = cleaned.lower()
-    if "t.me" in low or "buy" in low or "dm @" in low:
+    # Single case-insensitive C-level scan; no lowercased copy allocated.
+    if _PROMO_TRIGGER_RE.search(cleaned):
         cleaned = _PROMO_MARKERS_RE.sub("", cleaned).strip()
     return cleaned
 

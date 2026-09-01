@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import re
 from pathlib import Path
 
 from telecrime.extractor.interface import ArchiveExtractor, ExtractionResult
@@ -204,12 +203,21 @@ class SevenZipExtractor(ArchiveExtractor):
         target_extensions: list[str] | None,
     ) -> list[Path]:
         """Find all extracted files in output directory."""
-        if target_extensions:
-            files: list[Path] = []
-            for ext in self._normalize_extensions(target_extensions):
-                files.extend(f for f in output_dir.rglob(f"*.{ext}") if f.is_file() and f.stat().st_size > 0)
-            return files
-        return [f for f in output_dir.rglob("*") if f.is_file() and f.stat().st_size > 0]
+        exts = self._normalize_extensions(target_extensions) if target_extensions else None
+        # Single directory walk, one stat per file (previously one full rglob
+        # walk per extension + f.is_file() and f.stat() per file).
+        files: list[Path] = []
+        for f in output_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            if exts is not None and f.suffix.lower().lstrip(".") not in exts:
+                continue
+            try:
+                if f.stat().st_size > 0:
+                    files.append(f)
+            except OSError:
+                continue
+        return files
 
     async def list_contents(
         self,
@@ -245,6 +253,8 @@ class SevenZipExtractor(ArchiveExtractor):
             #   Type = zip
             #   ...
             # Then each member is in its own section separated by "----------".
+            # Single-pass line scan (previously re.split over every block +
+            # one re.search per block — 60K+ blocks per archive listing).
             # We skip any Path entry that equals the archive's own path to avoid
             # treating it as an unsafe member, and any section marked as a
             # folder (trailing "/" or "Folder = +").
@@ -252,14 +262,29 @@ class SevenZipExtractor(ArchiveExtractor):
             stdout_text = stdout.decode("utf-8", errors="replace")
             archive_path_str = str(archive_path)
 
-            for block in re.split(r"\n--+\n", stdout_text):
-                block_path = re.search(r"^Path = (.+)$", block, re.MULTILINE)
-                if not block_path:
-                    continue
-                path = block_path.group(1).strip()
-                is_folder = path.endswith("/") or "Folder = +" in block
-                if path and path != archive_path_str and not is_folder:
-                    files.append(path)
+            path: str | None = None
+            is_folder = False
+            for line in stdout_text.splitlines():
+                if line.startswith("Path = "):
+                    path = line[7:].strip()
+                    is_folder = path.endswith("/")
+                elif line.startswith("Folder = +"):
+                    is_folder = True
+                elif line.startswith("--") and not line.startswith("Path"):
+                    if (
+                        path
+                        and path != archive_path_str
+                        and not is_folder
+                    ):
+                        files.append(path)
+                    path = None
+                    is_folder = False
+            if (
+                path
+                and path != archive_path_str
+                and not is_folder
+            ):
+                files.append(path)
 
             return files
 

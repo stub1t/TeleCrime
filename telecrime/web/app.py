@@ -1374,13 +1374,25 @@ def _witem_dict(item) -> dict:
 
 
 def _home_stats_fallback(session, credential_count: object) -> dict[str, object]:
+    # The stats worker is disabled in production (TELECRIME_DISABLE_STATS_WORKER=1),
+    # so this fallback runs on every page load. Real COUNT(*) on messages /
+    # attachments / artifacts / extraction_jobs are multi-million-row seq scans
+    # that compete with the parse stage's bulk INSERT I/O — use pg_class
+    # estimates for the big tables and real counts only for the small ones.
+    estimates = _pg_fast_count_estimates(
+        session,
+        "messages",
+        "file_attachments",
+        "download_artifacts",
+        "extraction_jobs",
+    )
     return {
         "conversations": session.query(Conversation).count(),
-        "messages": session.query(Message).count(),
-        "attachments": session.query(FileAttachment).count(),
-        "archives": session.query(DownloadArtifact).count(),
+        "messages": estimates.get("messages"),
+        "attachments": estimates.get("file_attachments"),
+        "archives": estimates.get("download_artifacts"),
         "archive_groups": session.query(ArchiveGroup).count(),
-        "extractions": session.query(ExtractionJob).count(),
+        "extractions": estimates.get("extraction_jobs"),
         "extracted_outputs": None,
         "credentials": credential_count,
         "channels": session.query(TelegramChannel).count(),

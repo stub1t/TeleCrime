@@ -521,7 +521,6 @@ def _run_pipeline_job(config, engine) -> str:
                 except Exception:
                     pass
 
-    import threading
     _stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     _stderr_thread.start()
 

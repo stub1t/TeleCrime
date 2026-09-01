@@ -57,6 +57,8 @@ class ProcessingStats:
     credentials_new: int = 0
     credentials_duplicate: int = 0
     unique_domains: set = field(default_factory=set)
+    domain_counter: Counter = field(default_factory=Counter)
+    stealer_counter: Counter = field(default_factory=Counter)
     bytes_processed: int = 0
     bytes_deleted: int = 0
 
@@ -120,15 +122,15 @@ async def process_archive(
     session,
     stats: ProcessingStats,
     delete_after: bool = False,
-    collect_csv: bool = True,
-) -> list[dict]:
+    csv_writer=None,
+) -> bool:
     """Process a single archive and extract credentials.
 
-    Returns:
-        List of credential dicts (for optional CSV export). Empty when
-        collect_csv is False — avoids materializing huge ULP batches in RAM.
+    Returns True when the archive was processed successfully (credentials
+    found or archive legitimately empty); False when it failed (needs a
+    password, extraction error). Failed archives are NOT marked processed so
+    they are retried on a later run.
     """
-    credentials_for_csv: list[dict] = []
     archive_size = archive.stat().st_size
     stats.bytes_processed += archive_size
 
@@ -136,7 +138,7 @@ async def process_archive(
     is_split, is_first = is_split_part(archive)
     if is_split and not is_first:
         logger.debug("Skipping non-first split part: %s", archive.name)
-        return credentials_for_csv
+        return True
 
     logger.info("Processing: %s (%.1f MB)", archive.name, archive_size / 1024 / 1024)
 
@@ -164,14 +166,14 @@ async def process_archive(
             stats.archives_failed += 1
             if delete_after:
                 _delete_archive_and_parts(archive, stats)
-            return credentials_for_csv
+            return False
 
         if not result.success:
             logger.error("  Extraction failed: %s - %s", archive.name, result.error_message)
             stats.archives_failed += 1
             if delete_after:
                 _delete_archive_and_parts(archive, stats)
-            return credentials_for_csv
+            return False
 
         if not result.extracted_files:
             logger.info("  No .txt files extracted from: %s", archive.name)
@@ -179,7 +181,7 @@ async def process_archive(
             stats.archives_processed += 1
             if delete_after:
                 _delete_archive_and_parts(archive, stats)
-            return credentials_for_csv
+            return True
 
         logger.info("  Extracted %d files", len(result.extracted_files))
 
@@ -235,6 +237,9 @@ async def process_archive(
                         }
                         if cred.domain:
                             stats.unique_domains.add(cred.domain)
+                            stats.domain_counter[cred.domain] += 1
+                        if stealer_type:
+                            stats.stealer_counter[stealer_type] += 1
 
                     if not rows_by_hash:
                         return
@@ -257,10 +262,10 @@ async def process_archive(
                     file_found_count += new_count
                     seen_in_file.update(rows_by_hash.keys())
 
-                    if collect_csv:
+                    if csv_writer is not None:
                         for h in inserted_hashes:
                             row = rows_by_hash[h]
-                            credentials_for_csv.append({
+                            csv_writer.writerow({
                                 **{k: row[k] for k in (
                                     "url", "domain", "username", "password",
                                     "application", "profile", "source_archive", "stealer_type",
@@ -294,7 +299,7 @@ async def process_archive(
         if delete_after:
             _delete_archive_and_parts(archive, stats)
 
-        return credentials_for_csv
+        return True
 
     finally:
         # Cleanup extraction directory
@@ -363,7 +368,6 @@ async def process_folder(
 ) -> tuple[ProcessingStats, list[dict]]:
     """Process all archives in a folder."""
     stats = ProcessingStats()
-    all_credentials = []
 
     # Setup database
     config = load_config(config_path)
@@ -419,6 +423,18 @@ async def process_folder(
     output_dir = config.data_dir / f".extract_temp_{folder.name}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Streaming CSV: rows are appended per archive so memory stays bounded
+    # even for millions of new credentials (previously all_credentials grew
+    # without limit and the file was only written at the very end — an OOM
+    # mid-run lost both the CSV and the resume marker for the current batch).
+    csv_fp = None
+    csv_writer = None
+    if output_file:
+        csv_fp = open(output_file, "w", newline="", encoding="utf-8")
+        csv_writer = csv.DictWriter(csv_fp, fieldnames=CSV_FIELDNAMES)
+        csv_writer.writeheader()
+        csv_fp.flush()
+
     try:
         session = session_factory()
         # Line-buffered — writes flush on '\n' without an explicit flush per archive.
@@ -428,22 +444,26 @@ async def process_folder(
                 logger.info("\n[%d/%d] Processing archive...", i, len(archives))
 
                 try:
-                    creds = await process_archive(
+                    success = await process_archive(
                         archive,
                         extractor,
                         output_dir,
                         session,
                         stats,
                         delete_after,
-                        collect_csv=bool(output_file),
+                        csv_writer=csv_writer,
                     )
-                    if output_file:
-                        all_credentials.extend(creds)
                 except Exception as e:
                     logger.error("Error processing %s: %s", archive.name, e)
                     stats.archives_failed += 1
+                    success = False
 
-                marker_fp.write(archive.name + "\n")
+                # Only mark successful archives as processed. Failed archives
+                # (password-protected, corrupt, transient errors) must be
+                # retried on a later run — marking them here permanently
+                # skipped them.
+                if success:
+                    marker_fp.write(archive.name + "\n")
 
                 if i % 10 == 0:
                     logger.info(
@@ -469,36 +489,24 @@ async def process_folder(
         # Cleanup temp directory
         if output_dir.exists():
             shutil.rmtree(output_dir, ignore_errors=True)
+        if csv_fp is not None:
+            csv_fp.close()
+            logger.info("Wrote %d credentials to %s", stats.credentials_new, output_file)
 
-    # Write output file if specified
-    if output_file and all_credentials:
-        write_credentials_csv(all_credentials, output_file)
-        logger.info("Wrote %d credentials to %s", len(all_credentials), output_file)
-
-    return stats, all_credentials
+    return stats, []
 
 
-def write_credentials_csv(credentials: list[dict], output_file: Path):
-    """Write credentials to a CSV file."""
-    if not credentials:
-        return
-
-    fieldnames = [
-        "url",
-        "domain",
-        "username",
-        "password",
-        "application",
-        "profile",
-        "source_archive",
-        "source_file",
-        "stealer_type",
-    ]
-
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(credentials)
+CSV_FIELDNAMES = [
+    "url",
+    "domain",
+    "username",
+    "password",
+    "application",
+    "profile",
+    "source_archive",
+    "source_file",
+    "stealer_type",
+]
 
 
 def print_summary(stats: ProcessingStats, credentials: list[dict]):
@@ -519,21 +527,16 @@ def print_summary(stats: ProcessingStats, credentials: list[dict]):
     print(f"  Duplicates:        {stats.credentials_duplicate}")
     print(f"Unique domains:      {len(stats.unique_domains)}")
 
-    if credentials:
-        # Top domains
-        domain_counts = Counter(c["domain"] for c in credentials if c.get("domain"))
+    if stats.domain_counter:
+        # Top domains (from this run's stats — no per-credential list kept)
         print("\nTop 20 domains:")
-        for domain, count in domain_counts.most_common(20):
+        for domain, count in stats.domain_counter.most_common(20):
             print(f"  {domain}: {count}")
 
-        # Stealer types
-        stealer_counts = Counter(
-            c.get("stealer_type") for c in credentials if c.get("stealer_type")
-        )
-        if stealer_counts:
-            print("\nStealer types detected:")
-            for stealer, count in stealer_counts.most_common():
-                print(f"  {stealer}: {count}")
+    if stats.stealer_counter:
+        print("\nStealer types detected:")
+        for stealer, count in stats.stealer_counter.most_common():
+            print(f"  {stealer}: {count}")
 
     print("=" * 60)
 

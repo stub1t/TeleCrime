@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import re
+import threading
 import time
 from collections import Counter
 from collections.abc import AsyncGenerator, Iterator
@@ -20,7 +21,6 @@ from telecrime.models import ArchiveGroup, ExtractionJob, ParsedCredential
 from telecrime.models.system_info import SystemInfoRecord
 from telecrime.pipeline.orchestrator import PipelineContext, PipelineStage
 from telecrime.states import ExtractionStatus, GroupStatus
-from telecrime.stealer.models import Credential
 from telecrime.stealer.parser import (
     _open_credential_file,
     iter_credentials_file,
@@ -73,16 +73,75 @@ def _iter_line_chunks(
 
 
 def _parse_lines_chunk_worker(args: tuple[list[str], str]) -> list:
-    """Worker entry point: parse a chunk of lines into credential tuples.
+    """Worker entry point: parse a chunk of lines into pre-processed tuples.
 
-    Kept at module level so the ProcessPoolExecutor can pickle it. Credentials
-    are returned as tuples (smaller than pickling dataclasses).
+    Kept at module level so the ProcessPoolExecutor can pickle it. The worker
+    does the NUL-strip/truncation AND both SHA-256 hashes (the CPU-bound half
+    of the row pipeline) so the main process only assembles COPY rows.
+    Tuple shape mirrors what the sequential path builds in _flush_batch:
+    (url, domain_row, username, password, email_domain, application, profile,
+     credential_hash, soft_credential_hash). soft_credential_hash input is
+    the domain-or-url (untruncated) exactly like the sequential path.
     """
     lines, source_file = args
-    return [
-        (c.url, c.username, c.password, c.application, c.profile)
-        for c in parse_credential_lines(iter(lines), source_file)
-    ]
+    out = []
+    for c in parse_credential_lines(iter(lines), source_file):
+        url = c.url or ""
+        if "\x00" in url:
+            url = url.replace("\x00", "")
+        url_val = url[:1024]
+        d = c.domain
+        if d:
+            if "\x00" in d:
+                d = d.replace("\x00", "")
+            domain_row_val = d[:255]
+        else:
+            domain_row_val = None
+        un = c.username or ""
+        if "\x00" in un:
+            un = un.replace("\x00", "")
+        user_val = un[:255]
+        pw = c.password or ""
+        if "\x00" in pw:
+            pw = pw.replace("\x00", "")
+        pass_val = pw[:255]
+        domain_or_url = c.domain or c.url or ""
+        if "\x00" in domain_or_url:
+            domain_or_url = domain_or_url.replace("\x00", "")
+        hash_input = domain_or_url[:255]
+        _ed = c.email_domain
+        if _ed:
+            if "\x00" in _ed:
+                _ed = _ed.replace("\x00", "")
+            email_domain_val = _ed[:255]
+        else:
+            email_domain_val = None
+        _app = c.application
+        if _app:
+            if "\x00" in _app:
+                _app = _app.replace("\x00", "")
+            app_val = _app[:100]
+        else:
+            app_val = None
+        _prof = c.profile
+        if _prof:
+            if "\x00" in _prof:
+                _prof = _prof.replace("\x00", "")
+            prof_val = _prof[:100]
+        else:
+            prof_val = None
+        out.append((
+            url_val,
+            domain_row_val,
+            user_val,
+            pass_val,
+            email_domain_val,
+            app_val,
+            prof_val,
+            ParsedCredential.compute_hash(hash_input, user_val, pass_val),
+            ParsedCredential.compute_soft_hash(domain_or_url, user_val, pass_val),
+        ))
+    return out
 
 
 def _save_system_info(session, job_id: int, sysinfo) -> None:
@@ -206,7 +265,7 @@ class ParseStage(PipelineStage):
         file_path: Path,
         source_file: str,
         workers: int,
-    ) -> AsyncGenerator[tuple[str, str, str, str | None, str | None], None]:
+    ) -> AsyncGenerator[tuple[str, str | None, str, str, str | None, str | None, str | None, str, str], None]:
         """Parse a large file across worker processes, streaming results in order.
 
         The file is split into line chunks (cut only at labeled-block boundary
@@ -216,9 +275,9 @@ class ParseStage(PipelineStage):
         asyncio.Queue; this async generator drains the queue in submission
         order, keeping memory bounded and never blocking the event loop.
 
-        Yields (url, username, password, application, profile) tuples so the
-        caller's batch-flush hot loop consumes the same shape as the sequential
-        path.
+        Yields pre-processed tuples (url, domain, username, password,
+        email_domain, application, profile, credential_hash, soft_hash) so the
+        caller's batch-flush hot loop assembles COPY rows directly.
         """
         fh = _open_credential_file(file_path, "utf-8")
         if fh is None:
@@ -237,16 +296,32 @@ class ParseStage(PipelineStage):
 
         chunks_q: _queue.Queue = _queue.Queue(maxsize=workers * 2)
         sentinel = object()
+        # Set when the consumer stops early (early-skip break, pool failure):
+        # the reader must then stop putting instead of blocking forever on a
+        # full queue — otherwise the generator's `finally: await read_task`
+        # hangs the whole pipeline permanently (the watchdog cannot recover a
+        # hung-but-alive process).
+        stop_event = threading.Event()
 
         def _read_chunks() -> None:
             try:
                 for chunk in _iter_line_chunks(fh):
-                    chunks_q.put(chunk)  # blocks until consumer drains
+                    while not stop_event.is_set():
+                        try:
+                            chunks_q.put(chunk, timeout=0.5)
+                            break
+                        except _queue.Full:
+                            continue
+                    if stop_event.is_set():
+                        break
             except Exception as exc:
                 logger.warning("Parallel parse reader failed: %s", exc)
             finally:
                 fh.close()
-                chunks_q.put(sentinel)
+                try:
+                    chunks_q.put_nowait(sentinel)
+                except _queue.Full:
+                    pass
 
         read_task = loop.run_in_executor(None, _read_chunks)
 
@@ -318,7 +393,19 @@ class ParseStage(PipelineStage):
                             "falling back to sequential"
                         )
             finally:
-                await read_task
+                # Stop the reader and unblock it: it may be mid-put on a full
+                # queue (consumer stopped via early-skip or a pool failure).
+                # Bounded wait — a wedged reader must not hang the pipeline.
+                stop_event.set()
+                try:
+                    while True:
+                        chunks_q.get_nowait()
+                except _queue.Empty:
+                    pass
+                try:
+                    await asyncio.wait_for(asyncio.shield(read_task), timeout=5)
+                except (TimeoutError, Exception):
+                    pass
 
     async def run(self, ctx: PipelineContext) -> bool:
         """Parse credential files from successful extractions."""
@@ -366,6 +453,11 @@ class ParseStage(PipelineStage):
                         )
                     logger.error("Error parsing job %d: %s", job.id, e)
                     ctx.errors.append(f"Parse error for job {job.id}: {e}")
+                    # The unparsed remainder of this job's files is only on
+                    # disk. Tell finalize to leave the group EXTRACTED so the
+                    # next run re-parses it instead of deleting the files.
+                    if job.group_id is not None:
+                        ctx.parse_failed_group_ids.add(job.group_id)
         finally:
             _reset_pg_bulk_settings(ctx.session)
 
@@ -570,90 +662,117 @@ class ParseStage(PipelineStage):
 
                 rows: list[dict[str, object]] = []
                 rows_append = rows.append
-                for cred in b:
-                    # Inline truncate_field: NUL-byte check + slice. Field-level
-                    # truncate_field call overhead is significant at 500/sec ×
-                    # ~150M rows; inlining trims function call + arg packing
-                    # cost from the inner loop.
-                    d = cred.domain
-                    if d:
-                        if "\x00" in d:
-                            d = d.replace("\x00", "")
-                        domain_trunc = d[:255]
-                    else:
-                        domain_trunc = None
-                    u = cred.url
-                    if u:
-                        if "\x00" in u:
-                            u = u.replace("\x00", "")
-                        url_val = u[:1024]
-                    else:
-                        url_val = ""
-                    un = cred.username
-                    if un:
-                        if "\x00" in un:
-                            un = un.replace("\x00", "")
-                        user_val = un[:255]
-                    else:
-                        user_val = ""
-                    pw = cred.password
-                    if pw:
-                        if "\x00" in pw:
-                            pw = pw.replace("\x00", "")
-                        pass_val = pw[:255]
-                    else:
-                        pass_val = ""
-                    domain_or_url = cred.domain or cred.url or ""
-                    if domain_or_url:
-                        if "\x00" in domain_or_url:
-                            _dou_clean = domain_or_url.replace("\x00", "")
-                            domain_val = _dou_clean[:255]
+
+                if isinstance(b[0], tuple):
+                    # Parallel path: workers already NUL-stripped, truncated and
+                    # hashed; just assemble COPY rows.
+                    for t in b:
+                        (url_val, domain_trunc, user_val, pass_val,
+                         email_domain_val, app_val, prof_val, h, soft_h) = t
+                        row = {
+                            "url": url_val,
+                            "domain": domain_trunc,
+                            "username": user_val,
+                            "password": pass_val,
+                            "email_domain": email_domain_val,
+                            "application": app_val,
+                            "profile": prof_val,
+                            "extraction_job_id": _job_id,
+                            "source_file": _file_path_str,
+                            "source_archive": _source_archive,
+                            "source_conversation_id": _src_conv,
+                            "source_message_id": _src_msg,
+                            "stealer_type": _stealer,
+                            "credential_hash": h,
+                        }
+                        if has_soft_hash_column:
+                            row["soft_credential_hash"] = soft_h
+                        rows_append(row)
+                else:
+                    for cred in b:
+                        # Inline truncate_field: NUL-byte check + slice. Field-level
+                        # truncate_field call overhead is significant at 500/sec ×
+                        # ~150M rows; inlining trims function call + arg packing
+                        # cost from the inner loop.
+                        d = cred.domain
+                        if d:
+                            if "\x00" in d:
+                                d = d.replace("\x00", "")
+                            domain_trunc = d[:255]
                         else:
-                            domain_val = domain_or_url[:255]
-                    else:
-                        domain_val = ""
-                    _ed = cred.email_domain
-                    if _ed:
-                        if "\x00" in _ed:
-                            _ed = _ed.replace("\x00", "")
-                        email_domain_val = _ed[:255]
-                    else:
-                        email_domain_val = None
-                    _app = cred.application
-                    if _app:
-                        if "\x00" in _app:
-                            _app = _app.replace("\x00", "")
-                        app_val = _app[:100]
-                    else:
-                        app_val = None
-                    _prof = cred.profile
-                    if _prof:
-                        if "\x00" in _prof:
-                            _prof = _prof.replace("\x00", "")
-                        prof_val = _prof[:100]
-                    else:
-                        prof_val = None
-                    row = {
-                        "url": url_val,
-                        "domain": domain_trunc,
-                        "username": user_val,
-                        "password": pass_val,
-                        "email_domain": email_domain_val,
-                        "application": app_val,
-                        "profile": prof_val,
-                        "extraction_job_id": _job_id,
-                        "source_file": _file_path_str,
-                        "source_archive": _source_archive,
-                        "source_conversation_id": _src_conv,
-                        "source_message_id": _src_msg,
-                        "stealer_type": _stealer,
-                        "credential_hash": _hash(domain_val, user_val, pass_val),
-                    }
-                    if _soft_hash is not None:
-                        row["soft_credential_hash"] = _soft_hash(
-                            domain_or_url, user_val, pass_val
-                        )
-                    rows_append(row)
+                            domain_trunc = None
+                        u = cred.url
+                        if u:
+                            if "\x00" in u:
+                                u = u.replace("\x00", "")
+                            url_val = u[:1024]
+                        else:
+                            url_val = ""
+                        un = cred.username
+                        if un:
+                            if "\x00" in un:
+                                un = un.replace("\x00", "")
+                            user_val = un[:255]
+                        else:
+                            user_val = ""
+                        pw = cred.password
+                        if pw:
+                            if "\x00" in pw:
+                                pw = pw.replace("\x00", "")
+                            pass_val = pw[:255]
+                        else:
+                            pass_val = ""
+                        domain_or_url = cred.domain or cred.url or ""
+                        if domain_or_url:
+                            if "\x00" in domain_or_url:
+                                _dou_clean = domain_or_url.replace("\x00", "")
+                                domain_val = _dou_clean[:255]
+                            else:
+                                domain_val = domain_or_url[:255]
+                        else:
+                            domain_val = ""
+                        _ed = cred.email_domain
+                        if _ed:
+                            if "\x00" in _ed:
+                                _ed = _ed.replace("\x00", "")
+                            email_domain_val = _ed[:255]
+                        else:
+                            email_domain_val = None
+                        _app = cred.application
+                        if _app:
+                            if "\x00" in _app:
+                                _app = _app.replace("\x00", "")
+                            app_val = _app[:100]
+                        else:
+                            app_val = None
+                        _prof = cred.profile
+                        if _prof:
+                            if "\x00" in _prof:
+                                _prof = _prof.replace("\x00", "")
+                            prof_val = _prof[:100]
+                        else:
+                            prof_val = None
+                        row = {
+                            "url": url_val,
+                            "domain": domain_trunc,
+                            "username": user_val,
+                            "password": pass_val,
+                            "email_domain": email_domain_val,
+                            "application": app_val,
+                            "profile": prof_val,
+                            "extraction_job_id": _job_id,
+                            "source_file": _file_path_str,
+                            "source_archive": _source_archive,
+                            "source_conversation_id": _src_conv,
+                            "source_message_id": _src_msg,
+                            "stealer_type": _stealer,
+                            "credential_hash": _hash(domain_val, user_val, pass_val),
+                        }
+                        if _soft_hash is not None:
+                            row["soft_credential_hash"] = _soft_hash(
+                                domain_or_url, user_val, pass_val
+                            )
+                        rows_append(row)
 
                 # Yield before the blocking INSERT so concurrent tasks (prefetch
                 # downloads, progress heartbeat) get a chance to run.
@@ -732,17 +851,7 @@ class ParseStage(PipelineStage):
                     ):
                         if file_skipped_as_dup:
                             break
-                        url, username, password, application, profile = tup
-                        batch.append(
-                            Credential(
-                                url=url,
-                                username=username,
-                                password=password,
-                                application=application,
-                                profile=profile,
-                                source_file=str(file_path),
-                            )
-                        )
+                        batch.append(tup)
                         file_cred_count += 1
 
                         if len(batch) >= _BATCH_SIZE:
@@ -854,12 +963,18 @@ class ParseStage(PipelineStage):
         "stealer_type", "credential_hash",
     )
 
+    # Most fields contain no control characters; one C-level scan per value
+    # (no allocation) avoids 4 str.replace dispatches per field.
+    _COPY_ESCAPE_NEEDED = re.compile(r"[\\\t\n\r]")
+
     @staticmethod
     def _copy_escape(value: object) -> str:
         """Escape a single field for PostgreSQL COPY text format."""
         if value is None:
             return "\\N"
         s = str(value)
+        if not ParseStage._COPY_ESCAPE_NEEDED.search(s):
+            return s
         # COPY text-mode requires escaping these control bytes.
         return (
             s.replace("\\", "\\\\")
@@ -913,14 +1028,11 @@ class ParseStage(PipelineStage):
                             "ON COMMIT DROP"
                         )
                         cursor.execute("TRUNCATE _pc_staging")
-                        # Deduplicate within the batch *before* hitting the live
-                        # table: repeated hashes in one chunk (common in ULP dumps)
-                        # are rejected here instead of scanning the full
-                        # credential hash index for each copy.
-                        cursor.execute(
-                            "CREATE UNIQUE INDEX IF NOT EXISTS _pc_staging_hash "
-                            "ON _pc_staging (credential_hash)"
-                        )
+                        # No unique index on the staging table: the Python-side
+                        # _seen_hashes set already drops duplicate credential
+                        # hashes before COPY, and PostgreSQL treats NULLs as
+                        # distinct, so the index never rejects anything. The
+                        # INSERT-SELECT below only needs the staging rows.
 
                         buf = io.StringIO()
                         write = buf.write

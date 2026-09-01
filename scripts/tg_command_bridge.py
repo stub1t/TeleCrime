@@ -21,9 +21,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -31,7 +31,6 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parent.parent
 
 LOGGER_NAME = "tg_command_bridge"
-import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(LOGGER_NAME)
@@ -87,7 +86,6 @@ async def _run_opencode(
     fixed --session ID blocks when this TUI holds the same session open, so we
     rely on --continue instead.
     """
-    import re
 
     # Allow service managers to provide a non-standard binary location without
     # baking a particular user's home directory into the bridge.
@@ -110,7 +108,7 @@ async def _run_opencode(
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             try:
                 out, _ = await proc.communicate()
@@ -177,8 +175,8 @@ async def main() -> None:
     _load_env()
     sys.path.insert(0, str(REPO_DIR))
 
-    from telecrime.config import load_config
     from telecrime.adapters.telegram import TelegramAdapter
+    from telecrime.config import load_config
 
     config = load_config()
     data_dir = config.data_dir

@@ -57,6 +57,11 @@ class PipelineContext:
     credentials_parsed: int = 0
     duplicates_skipped: int = 0
     errors: list[str] = field(default_factory=list)
+    # Group IDs whose parse failed part-way (ParseStage swallowed the error).
+    # FinalizeStage must NOT delete their extracted files / mark them CLEANED —
+    # the unparsed remainder is only recoverable from disk and is re-parsed on
+    # the next run.
+    parse_failed_group_ids: set[int] = field(default_factory=set)
 
     async def notify(self, message: str):
         """Send a notification if notifier is available."""

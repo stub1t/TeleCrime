@@ -109,12 +109,20 @@ except Exception:
 
 FROZEN=0
 if [ -n "$SIG" ] && [ -f "$SNAP" ]; then
-  PREV=$(cat "$SNAP")
-  if [ "$PREV" = "$SIG" ]; then
+  PREV_SIG=""
+  PREV_TS=0
+  read -r PREV_SIG PREV_TS < <(cat "$SNAP")
+  NOW_TS=$(date +%s)
+  # Two-consecutive-identical-signatures must be observed at least 9 minutes
+  # apart. The cron watchdog (10-min) and the monitor loop (5-min) interleave,
+  # so consecutive *invocations* can be ~2 seconds apart — without the time
+  # gate, a momentary gap between downloads (dl_speed=0, no DB query, same
+  # signature 2 s later) would false-kill a healthy pipeline in acquire.
+  if [ "$PREV_SIG" = "$SIG" ] && [ $((NOW_TS - PREV_TS)) -ge 540 ]; then
     FROZEN=1
   fi
 fi
-echo "$SIG" > "$SNAP"
+echo "$SIG $NOW_TS" > "$SNAP"
 
 # Pipeline stage — the extract and parse phases are legitimate long-running
 # states: 7z/unrar on 50k+ file archives can take 1-2 h, and parsing a
@@ -230,23 +238,42 @@ if [ "$NEED_HEAL" = "1" ]; then
 fi
 
 # --- 4. Containers down? ---
+# "Up (unhealthy)" is NOT healthy: the container runs but its healthcheck
+# fails (e.g. web's 5s urllib probe timing out) — and since worker depends_on
+# web:service_healthy, an unhealthy web blocks every worker heal. Restart
+# unhealthy containers too.
 for svc in db web worker; do
-  if ! compose ps "$svc" 2>/dev/null | grep -q "Up"; then
-    log "HEAL: container '$svc' not up — starting"
-    compose up -d "$svc" 2>/dev/null
+  STATUS=$(compose ps "$svc" 2>/dev/null)
+  if ! echo "$STATUS" | grep -q "Up" || echo "$STATUS" | grep -q "unhealthy"; then
+    log "HEAL: container '$svc' not healthy (restarting)"
+    compose up -d --force-recreate "$svc" 2>/dev/null
+    sleep 5
   fi
 done
 
 # --- 5. External drive still mounted? ---
 # The DB volume and the data dir live on the LUKS drive at /mnt/telecrime.
 # If it drops (USB timeout during heavy I/O) or was never mounted after boot,
-# try to bring it back: the already-open mapper mounts directly; otherwise
-# systemd-cryptsetup unlocks it via the keyfile (once luksAddKey has run).
+# try to bring it back. The mapper may be the crypttab name (telecrime-data)
+# or the udisks2-opened luks-UUID name — try any open mapper.
 if ! mountpoint -q /mnt/telecrime; then
   log "CRITICAL: /mnt/telecrime not mounted — attempting drive recovery"
-  sudo -n mount /dev/mapper/telecrime-data /mnt/telecrime 2>/dev/null \
-    || sudo -n systemctl start systemd-cryptsetup@telecrime-data.service 2>/dev/null
-  sleep 5
+  OPEN_MAPPER=$(ls /dev/mapper/ 2>/dev/null | grep -v 'control\|TeleCrime' | head -1)
+  RECOVERED=0
+  if [ -n "$OPEN_MAPPER" ]; then
+    if sudo -n mount "/dev/mapper/$OPEN_MAPPER" /mnt/telecrime 2>/dev/null; then
+      RECOVERED=1
+    fi
+  fi
+  if [ "$RECOVERED" = "0" ]; then
+    # Volume not open — try the crypttab path (needs the keyfile keyslot).
+    sudo -n systemctl start systemd-cryptsetup@telecrime-data.service 2>/dev/null
+    sleep 3
+    if sudo -n mount /dev/mapper/telecrime-data /mnt/telecrime 2>/dev/null; then
+      RECOVERED=1
+    fi
+  fi
+  sleep 2
   if mountpoint -q /mnt/telecrime; then
     log "drive recovered: /mnt/telecrime is mounted again"
     # DB and worker both depend on the bind-mounted volume; restart them so

@@ -679,7 +679,10 @@ class TestExtractStageDirect:
 
         # Must not raise; password path must be reached (extract attempted).
         extractor.extract.assert_awaited()
-        assert group.status in (GroupStatus.FAILED, GroupStatus.EXTRACTING)
+        # Password-protected groups return to READY so a later run (or a
+        # password learned meanwhile) can retry them instead of stranding
+        # them in EXTRACTING.
+        assert group.status in (GroupStatus.READY, GroupStatus.FAILED)
 
 
 class TestPlanStage:
@@ -1252,7 +1255,11 @@ class TestParseParallelChunking:
             (c.url, c.username, c.password, c.application, c.profile)
             for c in parse_credential_lines(iter(lines), "/tmp/x.txt")
         ]
-        assert worker_result == sequential
+        # Worker returns pre-processed tuples:
+        # (url, domain, username, password, email_domain, application, profile,
+        #  credential_hash, soft_credential_hash)
+        worker_creds = [(t[0], t[2], t[3], t[5], t[6]) for t in worker_result]
+        assert worker_creds == sequential
         assert len(worker_result) >= 2
 
 

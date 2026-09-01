@@ -180,12 +180,21 @@ class UnrarExtractor(ArchiveExtractor):
         output_dir: Path,
         target_extensions: list[str] | None,
     ) -> list[Path]:
-        if target_extensions:
-            files: list[Path] = []
-            for ext in self._normalize_extensions(target_extensions):
-                files.extend(f for f in output_dir.rglob(f"*.{ext}") if f.is_file() and f.stat().st_size > 0)
-            return files
-        return [f for f in output_dir.rglob("*") if f.is_file() and f.stat().st_size > 0]
+        exts = self._normalize_extensions(target_extensions) if target_extensions else None
+        # Single directory walk, one stat per file (previously one full rglob
+        # walk per extension + f.is_file() and f.stat() per file).
+        files: list[Path] = []
+        for f in output_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            if exts is not None and f.suffix.lower().lstrip(".") not in exts:
+                continue
+            try:
+                if f.stat().st_size > 0:
+                    files.append(f)
+            except OSError:
+                continue
+        return files
 
     async def list_contents(
         self,

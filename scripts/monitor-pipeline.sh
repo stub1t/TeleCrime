@@ -23,7 +23,10 @@ log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >> "$LOG"; }
 log "monitor started (interval ${INTERVAL}s)"
 
 while true; do
-  "$SCRIPT_DIR/unattended-watchdog.sh" > /dev/null 2>&1
+  # Bounded watchdog run: a heal (docker kill + compose up) must not stretch
+  # the 5-min cadence into a 30-min blind spot.
+  timeout 120 "$SCRIPT_DIR/unattended-watchdog.sh" > /dev/null 2>&1 || \
+    log "WARNING: watchdog run exceeded 120s or failed"
 
   # Memory pressure: < 1 GB available means the host is close to swap thrash.
   read -r mem_avail swap_used < <(free -m | awk '/^Mem:/{a=$7} /^Swap:/{s=$3} END{print a, s}')

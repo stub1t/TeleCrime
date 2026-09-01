@@ -356,6 +356,12 @@ class ExtractStage(PipelineStage):
 
         elif result.requires_password:
             job.status = ExtractionStatus.PASSWORD_NEEDED
+            # Return the group to READY so startup recovery and future runs
+            # retry it (a password learned from a later archive in the same
+            # conversation should unlock it). Leaving it EXTRACTING would
+            # strand it — neither the READY sweep nor the EXTRACTED sweep
+            # picks it up for the rest of the run.
+            group.status = GroupStatus.READY
             msg_text = _get_group_message_text(group)
             msg_suffix = f" | Message: {msg_text[:300]}" if msg_text else ""
             if passwords:

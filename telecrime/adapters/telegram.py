@@ -550,59 +550,140 @@ class TelegramAdapter(BaseAdapter):
         cases where Telethon's reconnection loop hangs indefinitely and absorbs
         asyncio cancellations, which would otherwise defeat asyncio.wait_for.
         """
-        try:
-            message = await self._run_with_reconnect(
-                "fetching message media metadata",
-                lambda: self.client.get_messages(conversation_id, ids=message_id),
-            )
+        message = await self._run_with_reconnect(
+            "fetching message media metadata",
+            lambda: self.client.get_messages(conversation_id, ids=message_id),
+        )
 
-            if not message:
-                raise RuntimeError("Message not found in Telegram (deleted or inaccessible)")
-            if not message.media:
-                raise RuntimeError("Message has no media attachment")
+        if not message:
+            raise RuntimeError("Message not found in Telegram (deleted or inaccessible)")
+        if not message.media:
+            raise RuntimeError("Message has no media attachment")
 
-            # Parallel chunk download for large documents (premium accounts get
-            # much higher per-account throughput than a single sequential stream).
-            file_size = getattr(
-                getattr(message.media, "document", None), "size", 0
-            ) or 0
-            chunk_count = self.config.download.parallel_chunks
-            use_parallel = (
-                file_size >= self.config.download.parallel_min_bytes
-                and chunk_count > 1
-            )
+        # Parallel chunk download for large documents (premium accounts get
+        # much higher per-account throughput than a single sequential stream).
+        file_size = getattr(
+            getattr(message.media, "document", None), "size", 0
+        ) or 0
+        chunk_count = self.config.download.parallel_chunks
+        use_parallel = (
+            file_size >= self.config.download.parallel_min_bytes
+            and chunk_count > 1
+        )
 
-            last_progress_time = [time.monotonic()]
+        last_progress_time = [time.monotonic()]
 
-            def progress(current, total):
-                last_progress_time[0] = time.monotonic()
-                if progress_callback:
-                    progress_callback(current, total)
+        def progress(current, total):
+            last_progress_time[0] = time.monotonic()
+            if progress_callback:
+                progress_callback(current, total)
 
-            if use_parallel:
-                download_task = asyncio.create_task(
-                    self._run_with_reconnect(
-                        "downloading message media",
-                        lambda: self._download_media_parallel(
-                            self.client,
-                            message,
-                            destination,
-                            chunk_count,
-                            file_size,
-                            progress,
-                        ),
-                        timeout=max(timeout_seconds or 30, 30),
-                        retries=1,
-                    )
-                )
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "Parallel download of %d bytes via %d chunk streams",
-                        file_size,
+        if use_parallel:
+            download_task = asyncio.create_task(
+                self._run_with_reconnect(
+                    "downloading message media",
+                    lambda: self._download_media_parallel(
+                        self.client,
+                        message,
+                        destination,
                         chunk_count,
-                    )
-            else:
-                download_task = asyncio.create_task(
+                        file_size,
+                        progress,
+                    ),
+                    timeout=max(timeout_seconds or 30, 30),
+                    retries=1,
+                )
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Parallel download of %d bytes via %d chunk streams",
+                    file_size,
+                    chunk_count,
+                )
+        else:
+            download_task = asyncio.create_task(
+                self._run_with_reconnect(
+                    "downloading message media",
+                    lambda: self.client.download_media(
+                        message,
+                        file=destination,
+                        progress_callback=progress,
+                    ),
+                    timeout=max(timeout_seconds or 30, 30),
+                    retries=1,
+                )
+            )
+
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
+
+        async def _monitor(task) -> None:
+            try:
+                while not task.done():
+                    wait_secs = 30.0
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            task.cancel()
+                            raise TimeoutError(
+                                f"Download timed out after {timeout_seconds}s"
+                            )
+                        wait_secs = min(wait_secs, remaining)
+
+                    await asyncio.wait({task}, timeout=wait_secs)
+
+                    if task.done():
+                        break
+
+                    stalled = time.monotonic() - last_progress_time[0]
+                    if stalled > stall_seconds:
+                        task.cancel()
+                        raise TimeoutError(
+                            f"Download stalled for {stalled:.0f}s with no progress"
+                        )
+
+                # Propagate any exception from the task
+                task.result()
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        # Use asyncio.wait instead of awaiting directly —
+                        # Telethon's reconnection loop can swallow
+                        # CancelledError, causing an indefinite hang. Give it
+                        # 5 s to honour the cancel, then abandon.
+                        await asyncio.wait({task}, timeout=5.0)
+                    except Exception:
+                        pass
+                # If the task was cancelled (stall or hard timeout), disconnect
+                # so Telethon's auto_reconnect loop doesn't keep firing during
+                # subsequent pipeline stages that don't use Telegram.
+                # _ensure_connected will reconnect transparently on the next
+                # Telegram operation.
+                if task.cancelled() and self.client:
+                    try:
+                        await self.client.disconnect()
+                    except Exception:
+                        pass
+
+        if use_parallel:
+            try:
+                await _monitor(download_task)
+            except Exception as e:
+                # Parallel path can fail e.g. when the account is throttled
+                # for concurrent getFile requests — fall back to the classic
+                # single-stream download rather than failing the artifact.
+                logger.warning(
+                    "Parallel download failed (%s: %s), falling back to "
+                    "sequential download",
+                    type(e).__name__,
+                    e,
+                )
+                try:
+                    destination.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                last_progress_time[0] = time.monotonic()
+                fallback_task = asyncio.create_task(
                     self._run_with_reconnect(
                         "downloading message media",
                         lambda: self.client.download_media(
@@ -614,100 +695,13 @@ class TelegramAdapter(BaseAdapter):
                         retries=1,
                     )
                 )
+                await _monitor(fallback_task)
+        else:
+            await _monitor(download_task)
 
-            deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
-
-            async def _monitor(task) -> None:
-                try:
-                    while not task.done():
-                        wait_secs = 30.0
-                        if deadline is not None:
-                            remaining = deadline - time.monotonic()
-                            if remaining <= 0:
-                                task.cancel()
-                                raise TimeoutError(
-                                    f"Download timed out after {timeout_seconds}s"
-                                )
-                            wait_secs = min(wait_secs, remaining)
-
-                        await asyncio.wait({task}, timeout=wait_secs)
-
-                        if task.done():
-                            break
-
-                        stalled = time.monotonic() - last_progress_time[0]
-                        if stalled > stall_seconds:
-                            task.cancel()
-                            raise TimeoutError(
-                                f"Download stalled for {stalled:.0f}s with no progress"
-                            )
-
-                    # Propagate any exception from the task
-                    task.result()
-                finally:
-                    if not task.done():
-                        task.cancel()
-                        try:
-                            # Use asyncio.wait instead of awaiting directly —
-                            # Telethon's reconnection loop can swallow
-                            # CancelledError, causing an indefinite hang. Give it
-                            # 5 s to honour the cancel, then abandon.
-                            await asyncio.wait({task}, timeout=5.0)
-                        except Exception:
-                            pass
-                    # If the task was cancelled (stall or hard timeout), disconnect
-                    # so Telethon's auto_reconnect loop doesn't keep firing during
-                    # subsequent pipeline stages that don't use Telegram.
-                    # _ensure_connected will reconnect transparently on the next
-                    # Telegram operation.
-                    if task.cancelled() and self.client:
-                        try:
-                            await self.client.disconnect()
-                        except Exception:
-                            pass
-
-            if use_parallel:
-                try:
-                    await _monitor(download_task)
-                except Exception as e:
-                    # Parallel path can fail e.g. when the account is throttled
-                    # for concurrent getFile requests — fall back to the classic
-                    # single-stream download rather than failing the artifact.
-                    logger.warning(
-                        "Parallel download failed (%s: %s), falling back to "
-                        "sequential download",
-                        type(e).__name__,
-                        e,
-                    )
-                    try:
-                        destination.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    last_progress_time[0] = time.monotonic()
-                    fallback_task = asyncio.create_task(
-                        self._run_with_reconnect(
-                            "downloading message media",
-                            lambda: self.client.download_media(
-                                message,
-                                file=destination,
-                                progress_callback=progress,
-                            ),
-                            timeout=max(timeout_seconds or 30, 30),
-                            retries=1,
-                        )
-                    )
-                    await _monitor(fallback_task)
-            else:
-                await _monitor(download_task)
-
-            if not destination.exists():
-                raise RuntimeError("Download task completed but file not found on disk")
-            return True
-
-        except TimeoutError:
-            raise
-        except Exception:
-            raise
+        if not destination.exists():
+            raise RuntimeError("Download task completed but file not found on disk")
+        return True
 
     async def resolve_forwarded_source(
         self,

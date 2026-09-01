@@ -92,8 +92,18 @@ class FinalizeStage(PipelineStage):
             len(failed_groups),
         )
 
-        # Process successful extractions
+        # Process successful extractions. Groups whose parse failed part-way
+        # (ctx.parse_failed_group_ids) stay EXTRACTED: their credential files
+        # are the only copy of the unparsed remainder, and the next run's
+        # parse stage re-processes them.
         for group in extracted_groups:
+            if group.id in ctx.parse_failed_group_ids:
+                logger.warning(
+                    "Skipping finalize for group %d — parse incomplete, "
+                    "keeping extracted files for re-parse",
+                    group.id,
+                )
+                continue
             try:
                 await self._finalize_extracted_group(ctx, group)
             except Exception as e:
@@ -143,10 +153,13 @@ class FinalizeStage(PipelineStage):
             return False
 
         if group.status == GroupStatus.EXTRACTED:
-            await self._finalize_extracted_group(ctx, group)
-            return True
-
-        if group.status == GroupStatus.EXTRACTED:
+            if group.id in ctx.parse_failed_group_ids:
+                logger.warning(
+                    "Skipping finalize for group %d — parse incomplete, "
+                    "keeping extracted files for re-parse",
+                    group.id,
+                )
+                return False
             await self._finalize_extracted_group(ctx, group)
             return True
 
