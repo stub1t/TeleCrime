@@ -245,10 +245,46 @@ fi
 # "Up (unhealthy)" is NOT healthy: the container runs but its healthcheck
 # fails (e.g. web's 5s urllib probe timing out) — and since worker depends_on
 # web:service_healthy, an unhealthy web blocks every worker heal. Restart
-# unhealthy containers too.
+# unhealthy containers too — but with a 30-min cooldown per container: a
+# slow-starting/crash-recovering container (or a wedged data drive) must not
+# be force-recreated on every 5-10 min cycle, which interrupts recovery and
+# severs the running pipeline's DB connections.
+DRIVE_WEDGED=0
+if [ -d /proc ]; then
+  # A stuck write on the data drive blocks postgres entirely; recreating the
+  # db container then just re-enters crash recovery on the same wedged volume.
+  # Detect drive-writer kernel threads (dmcrypt_write / jbd2) in D-state.
+  for _comm in /proc/[0-9]*/comm; do
+    [ -r "$_comm" ] || continue
+    _name=$(cat "$_comm" 2>/dev/null) || continue
+    case "$_name" in
+      dmcrypt_write*|jbd2/*)
+        _pid=$(basename "$(dirname "$_comm")")
+        if [ -r "/proc/$_pid/stat" ] && grep -qE '^[0-9]+ \([^)]*\) D' "/proc/$_pid/stat" 2>/dev/null; then
+          DRIVE_WEDGED=1
+          break
+        fi
+        ;;
+    esac
+  done
+fi
+
 for svc in db web worker; do
   STATUS=$(compose ps "$svc" 2>/dev/null)
   if ! echo "$STATUS" | grep -q "Up" || echo "$STATUS" | grep -q "unhealthy"; then
+    LAST=/tmp/telecrime-heal-$svc.last
+    NOW_TS=$(date +%s)
+    PREV_TS=0
+    [ -f "$LAST" ] && PREV_TS=$(cat "$LAST")
+    if [ $((NOW_TS - PREV_TS)) -lt 1800 ]; then
+      log "HEAL skipped: '$svc' still unhealthy, last heal ${PREV_TS}s ago (cooldown 30m)"
+      continue
+    fi
+    if [ "$svc" = "db" ] && [ "$DRIVE_WEDGED" = "1" ]; then
+      log "CRITICAL: db unhealthy but data drive write is hung (D-state) — not recreating; drive needs attention"
+      continue
+    fi
+    echo "$NOW_TS" > "$LAST"
     log "HEAL: container '$svc' not healthy (restarting)"
     compose up -d --force-recreate "$svc" 2>/dev/null
     sleep 5
