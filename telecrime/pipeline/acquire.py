@@ -93,15 +93,39 @@ class AcquireStage(PipelineStage):
         recovered = 0
         for artifact in stuck:
             filename = artifact.attachment.filename if artifact.attachment else None
+            expected_size = artifact.attachment.size if artifact.attachment else None
             existing_path: Path | None = None
 
+            def _candidate_matches(candidate: Path) -> bool:
+                """Only trust an on-disk file when its size matches the
+                expected artifact size — a same-named file from ANOTHER
+                artifact (different content) must not be attributed here."""
+                if expected_size is None:
+                    return False
+                try:
+                    return candidate.stat().st_size == expected_size
+                except OSError:
+                    return False
+
             # Check if the download already completed but the commit was missed.
-            if artifact.local_path and Path(artifact.local_path).exists():
+            if (
+                artifact.local_path
+                and Path(artifact.local_path).exists()
+                and _candidate_matches(Path(artifact.local_path))
+            ):
                 existing_path = Path(artifact.local_path)
             elif filename:
-                candidate = downloads_dir / self._sanitize_filename(filename)
-                if candidate.exists():
-                    existing_path = candidate
+                # Also search collision-suffixed names (foo_1.zip ...): a
+                # crash after the rename but before the commit leaves the
+                # artifact DOWNLOADING with no local_path while the completed
+                # file sits under a suffixed name.
+                safe = self._sanitize_filename(filename)
+                stem, suffix = Path(safe).stem, Path(safe).suffix
+                for i in range(100):
+                    cand = downloads_dir / safe if i == 0 else downloads_dir / f"{stem}_{i}{suffix}"
+                    if cand.exists() and _candidate_matches(cand):
+                        existing_path = cand
+                        break
 
             if existing_path is not None:
                 # File is on disk — mark COMPLETED without re-downloading.
@@ -298,8 +322,15 @@ class AcquireStage(PipelineStage):
             usage = shutil.disk_usage(ctx.config.downloads_dir)
             free_mb = usage.free / (1024 * 1024)
             return free_mb >= min_free_mb
-        except Exception:
-            return True
+        except Exception as e:
+            # Unknown disk state (unmounted dir, stat failure) is NOT "enough
+            # disk" — downloading into a possibly-full/unavailable volume is
+            # worse than waiting.
+            logger.warning(
+                "Disk usage check failed (%s) — treating as insufficient space",
+                e,
+            )
+            return False
 
     async def _download_artifact(self, ctx: PipelineContext, artifact: DownloadArtifact) -> bool:
         """Download a single artifact.
@@ -534,6 +565,18 @@ class AcquireStage(PipelineStage):
                 if temp_path is not None:
                     try:
                         temp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                # Persist PENDING + clear the stale temp_path so the dashboard
+                # doesn't show a phantom DOWNLOADING artifact with a dangling
+                # path for the rest of the run.
+                try:
+                    artifact.temp_path = None
+                    artifact.status = DownloadStatus.PENDING
+                    ctx.session.commit()
+                except Exception:
+                    try:
+                        ctx.session.rollback()
                     except Exception:
                         pass
                 raise

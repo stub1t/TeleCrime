@@ -503,16 +503,26 @@ def _artifact_group_id(session: "Session", artifact_id: int) -> "int | None":
     ).scalar_one_or_none()
 
 
-def _next_pending_artifact(session: "Session"):
+def _next_pending_artifact(session: "Session", exclude_ids: set[int] | None = None):
     """Pick the next artifact to download, prioritising group completion.
 
     Strategy: find incomplete groups that already have downloaded parts, then
     pick a pending artifact from the group closest to completion (fewest
     remaining parts).  Falls back to ULP-first FIFO when no partially-downloaded
     groups exist.
+
+    exclude_ids: artifact ids already being downloaded by an in-flight task.
+    An artifact sitting in FAILED during a retry backoff is still picked by
+    status — without this exclusion the fill loop would start a SECOND download
+    of the same artifact (double bandwidth, retry-counter corruption).
     """
     # Sub-query: for each incomplete group, count pending parts
     _retriable = (DownloadStatus.PENDING, DownloadStatus.FAILED)
+    _id_excl = (
+        ~DownloadArtifact.id.in_(exclude_ids)
+        if exclude_ids
+        else True
+    )
     pending_count = (
         select(
             ArchiveGroupPart.group_id.label("group_id"),
@@ -566,6 +576,7 @@ def _next_pending_artifact(session: "Session"):
             .where(
                 ArchiveGroupPart.group_id == best_group,
                 DownloadArtifact.status.in_(_retriable),
+                _id_excl,
             )
             .options(joinedload(DownloadArtifact.attachment))
             .order_by(_download_priority(FileAttachment.filename), DownloadArtifact.id)
@@ -598,6 +609,7 @@ def _next_pending_artifact(session: "Session"):
         .join(ArchiveGroup, ArchiveGroup.id == ArchiveGroupPart.group_id)
         .where(
             DownloadArtifact.status.in_(_retriable),
+            _id_excl,
             ~ArchiveGroup.id.in_(stale_group_ids),
         )
         .options(joinedload(DownloadArtifact.attachment))
@@ -721,6 +733,7 @@ async def run_sequential_pipeline(
                 return
 
             for task, artifact in list(_prefetch_queue):
+                _in_flight_ids.discard(artifact.id)
                 if task.done():
                     try:
                         if task.result():
@@ -827,13 +840,18 @@ async def run_sequential_pipeline(
                         and p.artifact.status == DownloadStatus.COMPLETED
                         and p.artifact.attachment.platform_file_unique_id
                     }
-                    _covered = {
+                    _failed_uids = {
                         p.artifact.attachment.platform_file_unique_id
                         for p in _g.parts
                         if p.artifact.status == DownloadStatus.FAILED_TERMINAL
                         and p.artifact.attachment
                         and p.artifact.attachment.platform_file_unique_id
-                    } <= _completed_ids
+                    }
+                    # Coverage is NOT vacuous: all-failed parts with no
+                    # platform_file_unique_id must not be treated as covered by
+                    # an empty completed set (that would promote a group with
+                    # no usable archive to READY, re-extracting it forever).
+                    _covered = bool(_failed_uids) and _failed_uids <= _completed_ids
                     if statuses <= {DownloadStatus.COMPLETED}:
                         _g.status = GroupStatus.READY
                         _promoted += 1
@@ -921,6 +939,23 @@ async def run_sequential_pipeline(
                     )
                 session.commit()
 
+            # Startup recovery: reset PASSWORD_NEEDED jobs back to PENDING so
+            # their (READY) groups are picked up by this run's READY sweeps.
+            # Without this, the PASSWORD_NEEDED exclusion in the sweeps would
+            # strand the group forever (batch mode has no other retry path).
+            _pwd_retry = session.execute(
+                update(ExtractionJob)
+                .where(ExtractionJob.status == ExtractionStatus.PASSWORD_NEEDED)
+                .values(status=ExtractionStatus.PENDING)
+                .returning(ExtractionJob.id)
+            ).all()
+            if _pwd_retry:
+                session.commit()
+                logger.info(
+                    "Startup recovery: reset %d PASSWORD_NEEDED jobs → PENDING for retry",
+                    len(_pwd_retry),
+                )
+
             total_pending = (
                 session.execute(
                     select(func.count(DownloadArtifact.id)).where(
@@ -971,6 +1006,10 @@ async def run_sequential_pipeline(
                 int(os.environ.get("TELECRIME_READY_GROUP_CONCURRENCY", "3")),
             )
             _prefetch_queue: list[tuple[asyncio.Task, DownloadArtifact]] = []
+            # Artifact ids currently downloading (or mid-retry-backoff) by a
+            # prefetch task — excluded from _next_pending_artifact so the fill
+            # loop never starts a second download of the same artifact.
+            _in_flight_ids: set[int] = set()
             engine = session.get_bind()
 
             # Track last re-ingest times. Initialised to now so the first reingest fires
@@ -1123,6 +1162,7 @@ async def run_sequential_pipeline(
                         break
                     # Pop the next prefetched (task, artifact) pair from the queue.
                     _next_task, artifact = _prefetch_queue.pop(0)
+                    _in_flight_ids.discard(artifact.id)
                     # Await with a hard cap: a permanently-stuck Telethon reconnection
                     # loop can prevent the stall detector from firing, which would block
                     # the main pipeline forever.  The cap scales with the artifact size
@@ -1272,9 +1312,10 @@ async def run_sequential_pipeline(
                                 len(_prefetch_queue) < _effective_prefetch
                                 and processed + len(_prefetch_queue) + 1 < archives_to_process
                             ):
-                                next_pending = _next_pending_artifact(session)
+                                next_pending = _next_pending_artifact(session, exclude_ids=_in_flight_ids)
                                 if not next_pending:
                                     break
+                                _in_flight_ids.add(next_pending.id)
                                 if len(_download_pool) > 1:
                                     _dl_adapter = _download_pool[
                                         _pool_index % len(_download_pool)
@@ -1369,6 +1410,7 @@ async def run_sequential_pipeline(
                         if not _task.done():
                             _task.cancel()
                             await asyncio.wait({_task}, timeout=5.0)
+                    _in_flight_ids.clear()
                     _prefetch_queue.clear()
 
             await _drain_prefetch_queue(reset_pending=shutdown_after_current_archive)

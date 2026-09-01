@@ -463,6 +463,11 @@ async def process_folder(
                 # retried on a later run — marking them here permanently
                 # skipped them.
                 if success:
+                    if csv_writer is not None:
+                        # CSV is buffered; flush before the marker so a crash
+                        # between the two can't leave the marker claiming rows
+                        # that never hit disk.
+                        csv_fp.flush()
                     marker_fp.write(archive.name + "\n")
 
                 if i % 10 == 0:

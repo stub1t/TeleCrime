@@ -576,7 +576,7 @@ def status(
     config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
 ) -> None:
     """Show pipeline status and statistics."""
-    config, engine = get_config_and_engine(config_path)
+    _, engine = get_config_and_engine(config_path)
 
     from telecrime.models import (
         ArchiveGroup,
@@ -769,7 +769,7 @@ def retry(
     from telecrime.models import DownloadArtifact, ExtractionJob
     from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
 
-    config, engine = get_config_and_engine(config_path)
+    _, engine = get_config_and_engine(config_path)
 
     with get_session(engine) as session:
         reset_count = 0
@@ -989,7 +989,7 @@ def clean(
     force: bool = typer.Option(False, "--force", "-f", help="Don't ask for confirmation"),
 ) -> None:
     """Clean up downloaded files."""
-    config, engine = get_config_and_engine(config_path)
+    config, _ = get_config_and_engine(config_path)
 
     if not downloads:
         console.print("[yellow]Specify --downloads to clean[/yellow]")
@@ -1017,7 +1017,7 @@ def creds(
 
     from telecrime.models import ParsedCredential
 
-    config, engine = get_config_and_engine(config_path)
+    _, engine = get_config_and_engine(config_path)
 
     with get_session(engine) as session:
         total = session.query(ParsedCredential).count()
@@ -1100,7 +1100,7 @@ def search(
     from telecrime.fts import fts_available, fts_count, fts_search
     from telecrime.models import ParsedCredential
 
-    config, engine = get_config_and_engine(config_path)
+    _, engine = get_config_and_engine(config_path)
 
     # Default to searching all fields if none specified
     if not domain and not username and not url:
@@ -1231,7 +1231,7 @@ def domains(
 
     from telecrime.models import ParsedCredential
 
-    config, engine = get_config_and_engine(config_path)
+    _, engine = get_config_and_engine(config_path)
 
     with get_session(engine) as session:
         q = session.query(
@@ -1281,7 +1281,7 @@ def stats_stealers(
 
     from telecrime.models import Conversation, ParsedCredential
 
-    config, engine = get_config_and_engine(config_path)
+    _, engine = get_config_and_engine(config_path)
 
     with get_session(engine) as session:
         total = session.query(ParsedCredential).count()
@@ -1437,7 +1437,7 @@ def export(
 
     from telecrime.models import ParsedCredential
 
-    config, engine = get_config_and_engine(config_path)
+    _, engine = get_config_and_engine(config_path)
 
     with get_session(engine) as session:
         q = session.query(ParsedCredential)
@@ -1860,7 +1860,7 @@ def reparse_stealers_cmd(
     """Backfill stealer_type on ParsedCredential rows where it is NULL."""
     from telecrime.scheduler import _reparse_stealers_impl
 
-    config, engine = get_config_and_engine(config_path)
+    _, engine = get_config_and_engine(config_path)
     result = _reparse_stealers_impl(engine, limit=limit, dry_run=dry_run)
     console.print(f"[green]{result}[/green]")
 

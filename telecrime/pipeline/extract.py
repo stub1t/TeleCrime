@@ -641,8 +641,13 @@ class ExtractStage(PipelineStage):
             free_mb = usage.free / (1024 * 1024)
             return free_mb >= ctx.config.extraction.min_free_disk_mb
         except Exception as e:
-            logger.warning("Disk usage check failed: %s", e)
-            return True
+            # Unknown disk state (unmounted dir, stat failure) is NOT "enough
+            # disk" — proceed only when we can verify headroom.
+            logger.warning(
+                "Disk usage check failed (%s) — treating as insufficient space",
+                e,
+            )
+            return False
 
     _RECORD_BATCH = 500
 

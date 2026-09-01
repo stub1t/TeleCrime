@@ -8,6 +8,10 @@ from telecrime.extractor.interface import ArchiveExtractor, ExtractionResult
 
 logger = logging.getLogger(__name__)
 
+# Keep only this much of 7z stdout/stderr when parsing results (error
+# detection needs the tail; the full output is unbounded for huge archives).
+_TAIL_BYTES = 64 * 1024
+
 
 class SevenZipExtractor(ArchiveExtractor):
     """Wrapper for 7-Zip command-line tool."""
@@ -69,12 +73,28 @@ class SevenZipExtractor(ArchiveExtractor):
             )
 
             try:
+                # Drain both pipes concurrently, keeping only a bounded tail:
+                # 7z emits one line per extracted file — a 100k-file archive
+                # would otherwise hold the whole output (hundreds of MB) in
+                # RAM while parse workers run on this 15GB laptop.
+                async def _read_tail(stream) -> bytes:
+                    buf = b""
+                    while True:
+                        chunk = await stream.read(65536)
+                        if not chunk:
+                            break
+                        buf = (buf + chunk)[-_TAIL_BYTES:]
+                    return buf
+
                 if timeout_seconds:
                     stdout, stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=timeout_seconds
+                        asyncio.gather(_read_tail(process.stdout), _read_tail(process.stderr)),
+                        timeout=timeout_seconds,
                     )
                 else:
-                    stdout, stderr = await process.communicate()
+                    stdout, stderr = await asyncio.gather(
+                        _read_tail(process.stdout), _read_tail(process.stderr)
+                    )
             except TimeoutError:
                 process.kill()
                 return ExtractionResult(

@@ -109,13 +109,11 @@ def ensure_runtime_schema(engine) -> list[str]:
                 changes.append("added parsed_credentials.soft_credential_hash")
                 parsed_cols.add("soft_credential_hash")
             soft_hash_ready = "soft_credential_hash" in parsed_cols
-            conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS "
-                    "ix_parsed_credentials_soft_credential_hash "
-                    "ON parsed_credentials (soft_credential_hash)"
-                )
-            )
+            # NOTE: no CREATE INDEX for soft_credential_hash here — migration
+            # s9t0u1v2w3x4 deliberately dropped the 13 GB B-tree (0 index scans
+            # ever; INSERT maintenance cost). Re-creating it (non-CONCURRENTLY,
+            # blocking writes on 300M+ rows) would undo that on every
+            # init/repair.
 
         if has_table("watchlist_items"):
             watchlist_cols = columns("watchlist_items")

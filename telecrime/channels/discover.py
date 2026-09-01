@@ -2,6 +2,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -448,47 +449,102 @@ def persist_discovery_state(session: Session, scan_result: DiscoveryScanResult) 
     session.commit()
 
 
+_CHANNEL_STATS_LAST_RUN = "channel_stats.last_run"
+
+
 def update_channel_stats(session: Session) -> None:
-    """Update channel statistics from credential data."""
-    message_counts = {
-        platform_id: count
-        for platform_id, count in session.execute(
-            select(
-                Conversation.platform_id,
-                func.count(Message.id),
-            )
-            .join(Message, Message.conversation_id == Conversation.id, isouter=True)
-            .where(Conversation.platform_id != None)
-            .group_by(Conversation.platform_id)
-        ).all()
-    }
+    """Update channel statistics from credential data.
 
-    credential_counts = {
-        platform_id: count
-        for platform_id, count in session.execute(
-            select(
-                Conversation.platform_id,
-                func.count(ParsedCredential.id),
-            )
-            .join(
-                ParsedCredential,
-                ParsedCredential.source_conversation_id == Conversation.id,
-                isouter=True,
-            )
-            .where(Conversation.platform_id != None)
-            .group_by(Conversation.platform_id)
-        ).all()
-    }
+    Incremental: after the first (full) run, only rows created since the
+    previous run are aggregated via the created_at indexes. The old version
+    re-scanned the whole 319M-row parsed_credentials table every hour.
+    """
+    from telecrime.models import TelegramChannel
 
+    now = datetime.now(UTC)
+    last_run = _get_state_ts(session, _CHANNEL_STATS_LAST_RUN)
     channels = session.execute(
         select(TelegramChannel).where(TelegramChannel.platform_id != None)
     ).scalars()
 
-    for channel in channels:
-        platform_id = getattr(channel, "platform_id")
-        setattr(channel, "messages_seen", message_counts.get(platform_id, 0) or 0)
-        setattr(channel, "credentials_extracted", credential_counts.get(platform_id, 0) or 0)
+    if last_run is None:
+        # First run: absolute counts (full scan, once).
+        message_counts = {
+            platform_id: count
+            for platform_id, count in session.execute(
+                select(
+                    Conversation.platform_id,
+                    func.count(Message.id),
+                )
+                .join(Message, Message.conversation_id == Conversation.id, isouter=True)
+                .where(Conversation.platform_id != None)
+                .group_by(Conversation.platform_id)
+            ).all()
+        }
+        credential_counts = {
+            platform_id: count
+            for platform_id, count in session.execute(
+                select(
+                    Conversation.platform_id,
+                    func.count(ParsedCredential.id),
+                )
+                .join(
+                    ParsedCredential,
+                    ParsedCredential.source_conversation_id == Conversation.id,
+                    isouter=True,
+                )
+                .where(Conversation.platform_id != None)
+                .group_by(Conversation.platform_id)
+            ).all()
+        }
+        for channel in channels:
+            platform_id = getattr(channel, "platform_id")
+            setattr(channel, "messages_seen", message_counts.get(platform_id, 0) or 0)
+            setattr(channel, "credentials_extracted", credential_counts.get(platform_id, 0) or 0)
+    else:
+        # Incremental deltas since the last run — index-scanned, tiny.
+        message_deltas = {
+            platform_id: count
+            for platform_id, count in session.execute(
+                select(Conversation.platform_id, func.count(Message.id))
+                .join(Message, Message.conversation_id == Conversation.id)
+                .where(
+                    Conversation.platform_id != None,
+                    Message.created_at >= last_run,
+                )
+                .group_by(Conversation.platform_id)
+            ).all()
+        }
+        credential_deltas = {
+            platform_id: count
+            for platform_id, count in session.execute(
+                select(Conversation.platform_id, func.count(ParsedCredential.id))
+                .join(
+                    ParsedCredential,
+                    ParsedCredential.source_conversation_id == Conversation.id,
+                )
+                .where(
+                    Conversation.platform_id != None,
+                    ParsedCredential.created_at >= last_run,
+                )
+                .group_by(Conversation.platform_id)
+            ).all()
+        }
+        for channel in channels:
+            platform_id = getattr(channel, "platform_id")
+            setattr(
+                channel,
+                "messages_seen",
+                int(channel.messages_seen or 0) + message_deltas.get(platform_id, 0),
+            )
+            setattr(
+                channel,
+                "credentials_extracted",
+                int(channel.credentials_extracted or 0)
+                + credential_deltas.get(platform_id, 0),
+            )
 
+    _set_state_ts(session, _CHANNEL_STATS_LAST_RUN, now)
     session.commit()
 
 
@@ -609,3 +665,23 @@ def _set_state_int(session: Session, key: str, value: int) -> None:
         session.add(PipelineState(key=key, value_int=value))
     else:
         state.value_int = value
+
+
+def _get_state_ts(session: Session, key: str) -> datetime | None:
+    """Read an ISO-timestamp checkpoint from pipeline state."""
+    state = session.get(PipelineState, key)
+    if state is None or not state.value_text:
+        return None
+    try:
+        return datetime.fromisoformat(state.value_text)
+    except ValueError:
+        return None
+
+
+def _set_state_ts(session: Session, key: str, value: datetime) -> None:
+    """Write an ISO-timestamp checkpoint into pipeline state."""
+    state = session.get(PipelineState, key)
+    if state is None:
+        session.add(PipelineState(key=key, value_text=value.isoformat()))
+    else:
+        state.value_text = value.isoformat()

@@ -159,8 +159,25 @@ def _iso_age_seconds(value: object) -> float | None:
     return (datetime.now(UTC) - dt).total_seconds()
 
 
+def _errors_json_count(raw: str | None) -> int:
+    """Count errors stored in a PipelineRun.errors_json without crashing on
+    malformed/legacy values (null, partial JSON, plain text)."""
+    if not raw:
+        return 0
+    try:
+        parsed = json.loads(raw)
+        return len(parsed) if isinstance(parsed, list) else 0
+    except (ValueError, TypeError):
+        return 0
+
+
 def _parse_query(raw: str) -> tuple[str, dict[str, list[str]]]:
-    tokens = shlex.split(raw)
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        # Unbalanced quote (e.g. `foo"bar`) — treat the whole input as one
+        # term instead of 500-ing every search/export endpoint.
+        tokens = [raw]
     filters: dict[str, list[str]] = {}
     terms: list[str] = []
     allowed = {"domain", "stealer", "application", "email_domain", "username", "url", "since"}
@@ -1261,11 +1278,11 @@ def _check_watchlist(engine, *, incremental_only: bool = False) -> None:
         if not items:
             return
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-            # SET (not SET LOCAL) applies for the whole connection; SET LOCAL
-            # required a transaction we didn't have, so previously the global
-            # 5-min statement_timeout silently still applied to every query.
+            # Bound (not disable) the per-item timeout: a pathological item
+            # (e.g. match_type "any" with a single-char query) would otherwise
+            # hold a backend indefinitely with no external watchdog to cancel.
             try:
-                conn.execute(text("SET statement_timeout = 0"))
+                conn.execute(text("SET statement_timeout = '300s'"))
             except Exception:
                 pass
             for item in items:
@@ -2285,7 +2302,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     "started_at": run.started_at,
                     "duration_seconds": run.duration_seconds or 0,
                     "credentials_parsed": run.credentials_parsed,
-                    "error_count": len(json.loads(run.errors_json or "[]")),
+                    "error_count": _errors_json_count(run.errors_json),
                 }
                 for run in recent_runs
             ]
@@ -4492,12 +4509,18 @@ def create_app(database_url: str | None = None) -> FastAPI:
         )
 
     @app.post("/api/watchlist")
-    async def watchlist_add(request: Request):
+    def watchlist_add(request: Request):
+        """Add a watchlist item.
+
+        Plain def (not async): the initial count is a synchronous full-table
+        ILIKE COUNT that can take minutes — in the threadpool it can't stall
+        the event loop, and a 30s statement timeout bounds it.
+        """
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
-            body = await request.json()
+            body = request.json()
         else:
-            form = await request.form()
+            form = request.form()
             body = dict(form)
         label = (body.get("label") or "").strip()
         query = (body.get("query") or "").strip()
@@ -4510,7 +4533,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
             match_type = "any"
 
         with engine.connect() as conn:
-            count = _watchlist_count(conn, query, match_type)
+            conn.execute(text("SET LOCAL statement_timeout = '30s'"))
+            try:
+                count = _watchlist_count(conn, query, match_type)
+            except Exception:
+                # Query too expensive for the 30s budget — accept the item
+                # with an unknown count; the background worker fills it in.
+                count = 0
 
         with get_session(engine) as session:
             session.add(WatchlistItem(
@@ -4570,7 +4599,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 return JSONResponse({"error": "not found"}, status_code=404)
             changed = False
             if "enabled" in body:
-                item.enabled = bool(body["enabled"])
+                # HTMX sends form-urlencoded strings ("0"/"1"), and
+                # bool("0") is True — the toggle could never disable an item.
+                item.enabled = str(body["enabled"]).lower() in ("1", "true", "on")
                 changed = True
             if "label" in body and str(body["label"]).strip():
                 item.label = str(body["label"]).strip()

@@ -103,7 +103,8 @@ class TestSevenZipExtractor:
 
             with patch("asyncio.create_subprocess_exec") as mock_exec:
                 mock_process = AsyncMock()
-                mock_process.communicate = AsyncMock(return_value=(b"", b""))
+                mock_process.stdout = _AsyncLineReader(b"")
+                mock_process.stderr = _AsyncLineReader(b"")
                 mock_process.returncode = 1
                 mock_exec.return_value = mock_process
 
@@ -343,7 +344,8 @@ Folder = +
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
             mock_process = MagicMock()
-            mock_process.communicate = MagicMock()
+            mock_process.stdout = _AsyncLineReader(b"")
+            mock_process.stderr = _AsyncLineReader(b"")
             mock_process.returncode = 0
             mock_process.kill = MagicMock()
             mock_exec.return_value = mock_process
@@ -367,7 +369,8 @@ Folder = +
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
             mock_process = AsyncMock()
-            mock_process.communicate = AsyncMock(return_value=(b"", b""))
+            mock_process.stdout = _AsyncLineReader(b"")
+            mock_process.stderr = _AsyncLineReader(b"")
             mock_process.returncode = 0
             mock_exec.return_value = mock_process
 
@@ -391,7 +394,8 @@ Folder = +
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
             mock_process = MagicMock()
-            mock_process.communicate = MagicMock()
+            mock_process.stdout = _AsyncLineReader(b"")
+            mock_process.stderr = _AsyncLineReader(b"")
             mock_process.returncode = 0
             mock_process.kill = MagicMock()
             mock_exec.return_value = mock_process

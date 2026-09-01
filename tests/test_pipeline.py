@@ -831,7 +831,7 @@ class TestAcquireStage:
         )
         session.add(msg)
         session.flush()
-        fa = FileAttachment(message_id=msg.id, filename="archive.rar", platform_file_id="fid_99")
+        fa = FileAttachment(message_id=msg.id, filename="archive.rar", platform_file_id="fid_99", size=20)
         session.add(fa)
         session.flush()
 

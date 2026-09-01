@@ -105,7 +105,7 @@ def group_by_pattern(attachments: list[FileAttachment]) -> list[GroupingResult]:
 
     for attachment in attachments:
         filename = attachment.filename or ""
-        base_name, part_number, expected_total = extract_base_and_part(filename)
+        base_name, part_number, _ = extract_base_and_part(filename)
 
         if base_name:
             # Normalize base name for grouping
