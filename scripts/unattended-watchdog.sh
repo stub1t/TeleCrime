@@ -245,7 +245,19 @@ if [ "$NEED_HEAL" = "1" ]; then
   # with no timeout — an unhealthy web would park this heal (and hold the
   # flock) indefinitely. db is already running at this point.
   timeout 120 compose up -d --no-deps worker 2>/dev/null
-  log "HEAL done: worker restarted"
+  sleep 5
+  if ! compose ps -q worker 2>/dev/null | grep -q .; then
+    # First attempt failed (e.g. container create stalled on a wedged volume
+    # and the timeout killed compose) — retry once.
+    log "HEAL: worker did not start after first attempt — retrying"
+    timeout 120 compose up -d --no-deps worker 2>/dev/null
+    sleep 5
+  fi
+  if compose ps -q worker 2>/dev/null | grep -q .; then
+    log "HEAL done: worker restarted"
+  else
+    log "HEAL FAILED: worker container not running after retry"
+  fi
 fi
 
 # --- 4. Containers down? ---
@@ -257,10 +269,14 @@ fi
 # be force-recreated on every 5-10 min cycle, which interrupts recovery and
 # severs the running pipeline's DB connections.
 DRIVE_WEDGED=0
+WEDGE_SNAP=/tmp/telecrime-wedge-pids.txt
+CURRENT_WEDGED=""
 if [ -d /proc ]; then
   # A stuck write on the data drive blocks postgres entirely; recreating the
   # db container then just re-enters crash recovery on the same wedged volume.
-  # Detect drive-writer kernel threads (dmcrypt_write / jbd2) in D-state.
+  # Transient D-state is NORMAL under heavy write load (postgres checkpoint,
+  # COPY bursts) — only a drive-writer thread stuck in D-state on TWO
+  # consecutive checks (≥5-10 min apart) indicates a real wedge.
   for _comm in /proc/[0-9]*/comm; do
     [ -r "$_comm" ] || continue
     _name=$(cat "$_comm" 2>/dev/null) || continue
@@ -268,12 +284,24 @@ if [ -d /proc ]; then
       dmcrypt_write*|jbd2/*)
         _pid=$(basename "$(dirname "$_comm")")
         if [ -r "/proc/$_pid/stat" ] && grep -qE '^[0-9]+ \([^)]*\) D' "/proc/$_pid/stat" 2>/dev/null; then
-          DRIVE_WEDGED=1
-          break
+          CURRENT_WEDGED="$CURRENT_WEDGED $_pid"
         fi
         ;;
     esac
   done
+fi
+if [ -n "$CURRENT_WEDGED" ] && [ -f "$WEDGE_SNAP" ]; then
+  # Same pid(s) still in D-state since the previous check → genuine wedge.
+  PREV_WEDGED=$(cat "$WEDGE_SNAP" 2>/dev/null)
+  for _p in $CURRENT_WEDGED; do
+    case " $PREV_WEDGED " in
+      *" $_p "*) DRIVE_WEDGED=1 ;;
+    esac
+  done
+fi
+echo "$CURRENT_WEDGED" > "$WEDGE_SNAP"
+if [ "$DRIVE_WEDGED" = "1" ]; then
+  log "CRITICAL: data drive write appears hung (same D-state thread across two checks) — pausing container heals"
 fi
 
 for svc in db web worker; do
