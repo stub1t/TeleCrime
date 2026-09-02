@@ -1647,12 +1647,13 @@ class TelecrimeWorker:
                 return
 
             # On SQLite (single-writer), skip heavy jobs while the pipeline holds
-            # the write lock. On PostgreSQL, only VACUUM needs exclusive access;
-            # reparse_stealers uses row-level locks and periodic commits so it is
-            # safe to run concurrently.
+            # the write lock. On PostgreSQL, VACUUM ANALYZE is safe during
+            # inserts (AUTOCOMMIT) and has been starved for months by this
+            # gate — the analyze drift was visible on the live table. Exempt
+            # vacuum here; it re-enables on SQLite via the pipeline-lock check
+            # inside _run_vacuum_job.
             _heavy_jobs = (
                 {
-                    "vacuum",
                     "channel_join",
                     "reparse_stealers",
                     "watchlist_notify",
@@ -1664,7 +1665,7 @@ class TelecrimeWorker:
             if (
                 name not in {"pipeline", "pipeline_watchdog", "pipeline_health"}
                 and _blocks
-                and self._is_pipeline_running()
+                and (self._is_pipeline_running() or bool(read_progress().get("running")))
             ):
                 lock.release()
                 logger.info("Job %s skipped — pipeline is running", name)

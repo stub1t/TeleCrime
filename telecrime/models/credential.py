@@ -52,11 +52,13 @@ class ParsedCredential(Base):
     source_archive = Column(String(512), nullable=True, index=True)
 
     # Original message/conversation tracking
+    # NOTE: index intentionally NOT declared — migration x4y5z6a7b8c9 dropped
+    # ix_parsed_credentials_source_conversation_id (zero scans, 1.5GB).
+    # Re-adding it here would resurrect it on the next create_all/autogenerate.
     source_conversation_id = Column(
         Integer,
         ForeignKey("conversations.id", ondelete="SET NULL"),
         nullable=True,
-        index=True,
     )
     source_message_id = Column(
         Integer,

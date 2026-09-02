@@ -61,12 +61,8 @@ class ExtractionConfig:
 class DownloadConfig:
     """Download settings."""
 
-    verify_hash: bool = True
     max_retries: int = 3
     retry_delay_seconds: int = 5
-    # Number of archives to pre-download while current archive is being processed.
-    # Max 3 (higher values risk Telegram rate-limiting / temporary ban).
-    prefetch_count: int = 2
     # Number of parallel upload.getFile chunk streams used per large download.
     # Telegram throttles a single sequential stream (~1-2 MB/s); parallel chunk
     # striping multiplies throughput (measured ~5-7 MB/s with 8 streams on a

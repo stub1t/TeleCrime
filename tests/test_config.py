@@ -158,7 +158,6 @@ class TestDownloadConfig:
         """Test default download config values."""
         config = DownloadConfig()
 
-        assert config.verify_hash is True
         assert config.max_retries == 3
         assert config.retry_delay_seconds == 5
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 from telecrime.extractor.interface import ArchiveExtractor, ExtractionResult
@@ -43,11 +44,16 @@ class SevenZipExtractor(ArchiveExtractor):
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Build command
+        # -mmt=on uses ALL logical CPUs (4-8 LZMA2 threads on this laptop,
+        # each holding dictionary-sized buffers — multi-GB archives can spike
+        # 1-2GB of RAM alongside parse workers). Cap via TELECRIME_7Z_THREADS.
+        _threads = os.environ.get("TELECRIME_7Z_THREADS", "").strip()
+        _mmt = f"-mmt={_threads}" if _threads.isdigit() and int(_threads) >= 1 else "-mmt=2"
         cmd = [
             self.executable,
             "x",  # Extract with full paths
             "-y",  # Yes to all prompts
-            "-mmt=on",  # Multi-threaded decompression (LZMA/LZMA2/7z formats)
+            _mmt,  # Multi-threaded decompression (bounded)
             f"-o{output_dir}",  # Output directory
         ]
 
@@ -104,6 +110,13 @@ class SevenZipExtractor(ArchiveExtractor):
                 )
             stdout_text = stdout.decode("utf-8", errors="replace")
             stderr_text = stderr.decode("utf-8", errors="replace")
+
+            # MUST await exit before reading returncode: the child-watcher
+            # callback can lag after both pipes EOF, leaving returncode None —
+            # `None or 0` then misclassifies a failed 7z run (wrong password,
+            # data error) as success, the group is marked EXTRACTED and the
+            # archive deleted by finalize → permanent data loss.
+            await process.wait()
 
             return self._parse_result(
                 process.returncode or 0,

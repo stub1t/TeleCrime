@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, not_, or_
 from sqlalchemy.orm import Query, Session
@@ -58,6 +58,18 @@ def build_subscription_query(
             TelegramChannel.username.isnot(None),
             TelegramChannel.invite_link.isnot(None),
         ),
+    )
+
+    # Backoff for transient join failures (flood wait, network errors): a
+    # candidate that failed a join stays is_accessible=True and was re-selected
+    # on every poll — repeated attempts against the same channel risk a
+    # Telegram ban. Skip candidates checked within the last 10 minutes.
+    _check_cutoff = datetime.now(UTC) - timedelta(minutes=10)
+    query = query.filter(
+        or_(
+            TelegramChannel.last_checked.is_(None),
+            TelegramChannel.last_checked < _check_cutoff,
+        )
     )
 
     if stealer_only:

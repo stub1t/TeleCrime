@@ -427,7 +427,7 @@ class ParseStage(PipelineStage):
         """Parse credential files from successful extractions."""
         logger.info("Starting credential parsing")
 
-        jobs = self._get_jobs(ctx)
+        jobs = self._iter_jobs(ctx)
 
         if not jobs:
             logger.info("No completed extractions to parse")
@@ -486,7 +486,7 @@ class ParseStage(PipelineStage):
 
     async def run_group(self, ctx: PipelineContext, group_id: int) -> tuple[int, int]:
         """Parse completed extraction jobs for a single EXTRACTED group."""
-        jobs = self._get_jobs(ctx, group_id=group_id)
+        jobs = self._iter_jobs(ctx, group_id=group_id)
         if not jobs:
             return 0, 0
 
@@ -515,23 +515,38 @@ class ParseStage(PipelineStage):
 
         return total_credentials, total_duplicates
 
-    def _get_jobs(self, ctx: PipelineContext, group_id: int | None = None) -> list[ExtractionJob]:
-        """Return completed extraction jobs whose groups are still EXTRACTED."""
-        query = (
-            select(ExtractionJob)
-            .join(ArchiveGroup)
-            .where(
-                ExtractionJob.status == ExtractionStatus.COMPLETED,
-                ArchiveGroup.status == GroupStatus.EXTRACTED,
+    def _iter_jobs(self, ctx: PipelineContext, group_id: int | None = None):
+        """Yield completed extraction jobs whose groups are still EXTRACTED.
+
+        Keyset-paged by ExtractionJob.id (limit 50) so a large crash backlog
+        is never materialized in memory at once (each job pulls all its
+        ExtractedOutput rows via selectinload).
+        """
+        last_id = 0
+        while True:
+            query = (
+                select(ExtractionJob)
+                .join(ArchiveGroup)
+                .where(
+                    ExtractionJob.status == ExtractionStatus.COMPLETED,
+                    ArchiveGroup.status == GroupStatus.EXTRACTED,
+                    ExtractionJob.id > last_id,
+                )
+                .options(
+                    selectinload(ExtractionJob.outputs),
+                    selectinload(ExtractionJob.group),
+                )
+                .order_by(ExtractionJob.id)
+                .limit(50)
             )
-            .options(
-                selectinload(ExtractionJob.outputs),
-                selectinload(ExtractionJob.group),
-            )
-        )
-        if group_id is not None:
-            query = query.where(ArchiveGroup.id == group_id)
-        return list(ctx.session.execute(query).scalars().all())
+            if group_id is not None:
+                query = query.where(ArchiveGroup.id == group_id)
+            jobs = list(ctx.session.execute(query).scalars().all())
+            if not jobs:
+                return
+            yield from jobs
+            last_id = jobs[-1].id
+            ctx.session.expunge_all()
 
     async def _parse_job_outputs(
         self,
@@ -856,7 +871,11 @@ class ParseStage(PipelineStage):
                         else:
                             dup_batches_seen = 0
 
-            if file_size >= _PARALLEL_PARSE_MIN_BYTES and workers > 1:
+            # workers >= 1: even a single worker process overlaps the CPU-bound regex +
+            # hashing with the main process's DB inserts — the guard must not
+            # be `> 1`, which silently fell back to the fully-serialized
+            # sequential path whenever TELECRIME_PARSE_WORKERS=1.
+            if file_size >= _PARALLEL_PARSE_MIN_BYTES and workers >= 1:
                 try:
                     logger.info(
                         "Parsing %s in parallel (%d workers, %.1f MB)",
@@ -1042,6 +1061,13 @@ class ParseStage(PipelineStage):
                         cursor.execute("SET statement_timeout = 600000")
                         cursor.execute("SET lock_timeout = 0")
                         cursor.execute("SET synchronous_commit = off")
+                        # Session-level SETs from _apply_pg_bulk_settings are
+                        # lost when the pooled connection is recycled between
+                        # commits — re-apply on the raw connection too. A
+                        # default 32MB gin_pending_list_limit means 4x more
+                        # GIN flush stalls on the 23GB username trigram index.
+                        cursor.execute("SET gin_pending_list_limit = 134217728")
+                        cursor.execute("SET maintenance_work_mem = '1GB'")
                         # Reuse the staging temp table across chunks within the
                         # same transaction for fewer DDL ticks.
                         cursor.execute(

@@ -618,6 +618,23 @@ def _next_pending_artifact(session: "Session", exclude_ids: set[int] | None = No
     ).scalar_one_or_none()
 
 
+def _pwd_needed_exists_expr() -> Any:
+    """Correlated EXISTS: group has an extraction job stuck in PASSWORD_NEEDED.
+
+    Used by the READY sweeps (extract + sequential loop) so password-failed
+    groups are retried once per run (after startup recovery resets the job to
+    PENDING) instead of being re-extracted every pass.
+    """
+    return (
+        select(ExtractionJob.id)
+        .where(
+            ExtractionJob.group_id == ArchiveGroup.id,
+            ExtractionJob.status == ExtractionStatus.PASSWORD_NEEDED,
+        )
+        .exists()
+    )
+
+
 def _read_shutdown_request():
     from telecrime.scheduler import read_shutdown_request
 
@@ -1069,14 +1086,7 @@ async def run_sequential_pipeline(
                 # subsequent downloads have room.
                 # Exclude PASSWORD_NEEDED groups: they are retried once per
                 # run (next run), not re-extracted every loop iteration.
-                _pwd_needed_exists = (
-                    select(ExtractionJob.id)
-                    .where(
-                        ExtractionJob.group_id == ArchiveGroup.id,
-                        ExtractionJob.status == ExtractionStatus.PASSWORD_NEEDED,
-                    )
-                    .exists()
-                )
+                _pwd_needed_exists = _pwd_needed_exists_expr()
                 ready_groups = (
                     session.execute(
                         select(ArchiveGroup.id)

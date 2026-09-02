@@ -50,7 +50,10 @@ mkdir -p "$DATA_DIR"
 LOG="$DATA_DIR/watchdog.log"
 PROGRESS="$DATA_DIR/pipeline_progress.json"
 SNAP=/tmp/telecrime-watchdog-snap.txt   # last observed progress signature
-STALE_HEARTBEAT_SEC=600      # pipeline must touch progress file this often
+# Heartbeat freshness must match the scheduler's configured stale threshold
+# (TELECRIME_PIPELINE_STALE_SECONDS) rather than a hardcoded 600.
+STALE_HEARTBEAT_SEC="$(dotenv_value TELECRIME_PIPELINE_STALE_SECONDS)"
+STALE_HEARTBEAT_SEC="${STALE_HEARTBEAT_SEC:-1200}"
 NO_DB_ACTIVITY_SEC=300       # pipeline must have an active query this often
 HEAL_LOCK=/tmp/telecrime-heal.lock
 
@@ -102,7 +105,8 @@ SIG=$(python3 -c "
 import json, sys
 try:
     d = json.load(open('$PROGRESS'))
-    print(f\"{d.get('credentials',0)}|{d.get('duplicates',0)}|{d.get('archive_index',0)}|{(d.get('current_archive') or '')[:60]}|{int(d.get('dl_pct') or 0)}\")
+    arch = (d.get('current_archive') or '')[:60].replace('\n', ' ').replace('\r', ' ')
+    print(f\"{d.get('credentials',0)}|{d.get('duplicates',0)}|{d.get('archive_index',0)}|{arch}|{int(d.get('dl_pct') or 0)}\")
 except Exception:
     print('')
 " 2>/dev/null || echo "")
@@ -237,7 +241,10 @@ if [ "$NEED_HEAL" = "1" ]; then
     sleep 5
     docker rm -f "$CID" 2>/dev/null
   fi
-  compose up -d worker 2>/dev/null
+  # --no-deps: `compose up -d worker` would wait on `web: service_healthy`
+  # with no timeout — an unhealthy web would park this heal (and hold the
+  # flock) indefinitely. db is already running at this point.
+  timeout 120 compose up -d --no-deps worker 2>/dev/null
   log "HEAL done: worker restarted"
 fi
 
@@ -277,17 +284,21 @@ for svc in db web worker; do
     PREV_TS=0
     [ -f "$LAST" ] && PREV_TS=$(cat "$LAST")
     if [ $((NOW_TS - PREV_TS)) -lt 1800 ]; then
-      log "HEAL skipped: '$svc' still unhealthy, last heal ${PREV_TS}s ago (cooldown 30m)"
+      log "HEAL skipped: '$svc' still unhealthy, last heal $((NOW_TS - PREV_TS))s ago (cooldown 30m)"
       continue
     fi
-    if [ "$svc" = "db" ] && [ "$DRIVE_WEDGED" = "1" ]; then
-      log "CRITICAL: db unhealthy but data drive write is hung (D-state) — not recreating; drive needs attention"
+    if [ "$DRIVE_WEDGED" = "1" ]; then
+      log "CRITICAL: '$svc' unhealthy AND data drive write is hung (D-state) — not recreating; drive needs attention"
       continue
     fi
     echo "$NOW_TS" > "$LAST"
     log "HEAL: container '$svc' not healthy (restarting)"
     compose up -d --force-recreate "$svc" 2>/dev/null
     sleep 5
+  else
+    # Healthy — clear the cooldown marker so a genuinely-new failure isn't
+    # held back for 30 min by a previous heal.
+    rm -f "/tmp/telecrime-heal-$svc.last"
   fi
 done
 

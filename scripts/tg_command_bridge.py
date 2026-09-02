@@ -201,7 +201,18 @@ async def main() -> None:
     await adapter.connect(timeout=60)
     client = adapter.client
     assert client is not None
-    me = await client.get_me()
+    # get_me outside the loop's try: a transient network/auth failure at
+    # startup must not kill the bridge permanently (no supervisor restarts it).
+    me = None
+    for _attempt in range(3):
+        try:
+            me = await client.get_me()
+            break
+        except Exception as exc:
+            logger.warning("get_me failed (attempt %d/3): %s", _attempt + 1, exc)
+            await asyncio.sleep(5)
+    if me is None:
+        raise ConnectionError("Could not reach Telegram after 3 attempts")
     logger.info("Bridge connected as %s (id=%s)", me.first_name, me.id)
 
     state = {}
@@ -215,8 +226,16 @@ async def main() -> None:
     busy_until = 0.0
     while True:
         try:
-            msgs = await client.iter_messages(me, limit=10, min_id=last_seen_id).collect()
-            for msg in reversed(msgs):
+            # Paginate: iter_messages(limit=10) drops older unread messages
+            # when >10 arrive between polls and last_seen_id then jumps past
+            # them — operator commands were silently lost under load.
+            new_msgs: list = []
+            async for page in client.iter_messages(me, limit=100, min_id=last_seen_id):
+                new_msgs.append(page)
+                if len(new_msgs) >= 200:
+                    break
+            new_msgs.reverse()
+            for msg in new_msgs:
                 last_seen_id = max(last_seen_id, msg.id)
                 text = msg.text or ""
                 if not text.startswith(args.prefix):

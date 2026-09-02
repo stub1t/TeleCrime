@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -4509,18 +4510,17 @@ def create_app(database_url: str | None = None) -> FastAPI:
         )
 
     @app.post("/api/watchlist")
-    def watchlist_add(request: Request):
+    async def watchlist_add(request: Request):
         """Add a watchlist item.
 
-        Plain def (not async): the initial count is a synchronous full-table
-        ILIKE COUNT that can take minutes — in the threadpool it can't stall
-        the event loop, and a 30s statement timeout bounds it.
+        The initial count is a synchronous full-table ILIKE COUNT — run it in
+        the threadpool so it can't stall the event loop, with a 30s bound.
         """
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
-            body = request.json()
+            body = await request.json()
         else:
-            form = request.form()
+            form = await request.form()
             body = dict(form)
         label = (body.get("label") or "").strip()
         query = (body.get("query") or "").strip()
@@ -4532,14 +4532,17 @@ def create_app(database_url: str | None = None) -> FastAPI:
         if match_type not in ("any", "domain", "user", "url"):
             match_type = "any"
 
-        with engine.connect() as conn:
-            conn.execute(text("SET LOCAL statement_timeout = '30s'"))
-            try:
-                count = _watchlist_count(conn, query, match_type)
-            except Exception:
-                # Query too expensive for the 30s budget — accept the item
-                # with an unknown count; the background worker fills it in.
-                count = 0
+        def _initial_count() -> int:
+            with engine.connect() as conn:
+                conn.execute(text("SET LOCAL statement_timeout = '30s'"))
+                try:
+                    return _watchlist_count(conn, query, match_type)
+                except Exception:
+                    # Query too expensive for the 30s budget — accept the item
+                    # with an unknown count; the background worker fills it in.
+                    return 0
+
+        count = await asyncio.to_thread(_initial_count)
 
         with get_session(engine) as session:
             session.add(WatchlistItem(

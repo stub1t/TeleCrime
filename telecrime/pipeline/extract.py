@@ -87,20 +87,14 @@ class ExtractStage(PipelineStage):
         # Groups whose job is PASSWORD_NEEDED are retried once per run (next
         # run), not re-extracted every pass — a password learned mid-run is
         # picked up by the next run's READY sweep.
-        _pwd_needed_exists = (
-            select(ExtractionJob.id)
-            .where(
-                ExtractionJob.group_id == ArchiveGroup.id,
-                ExtractionJob.status == ExtractionStatus.PASSWORD_NEEDED,
-            )
-            .exists()
-        )
+        from telecrime.pipeline.orchestrator import _pwd_needed_exists_expr
+
         ready_ids = (
             ctx.session.execute(
                 select(ArchiveGroup.id)
                 .where(
                     ArchiveGroup.status == GroupStatus.READY,
-                    ~_pwd_needed_exists,
+                    ~_pwd_needed_exists_expr(),
                 )
             )
             .scalars()
