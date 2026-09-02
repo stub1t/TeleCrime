@@ -451,7 +451,7 @@ class TestExtractPasswordsFromContext:
 
         import asyncio
         candidates = asyncio.run(extract_passwords_from_context(
-            session, msg, test_config
+            session, msg
         ))
 
         values = {c.value for c in candidates}
@@ -479,7 +479,7 @@ class TestExtractPasswordsFromContext:
 
         import asyncio
         candidates = asyncio.run(extract_passwords_from_context(
-            session, msg, test_config
+            session, msg
         ))
 
         values = {c.value for c in candidates}
@@ -506,7 +506,7 @@ class TestExtractPasswordsFromContext:
 
         import asyncio
         candidates = asyncio.run(extract_passwords_from_context(
-            session, msg, test_config,
+            session, msg,
             attachment_filename="logs_pass_9f3x2k.zip",
         ))
 
@@ -541,7 +541,7 @@ class TestExtractPasswordsFromContext:
 
         import asyncio
         candidates = asyncio.run(extract_passwords_from_context(
-            session, main_msg, test_config
+            session, main_msg
         ))
 
         nearby_c = [c for c in candidates if c.extraction_method == "nearby"]
@@ -571,7 +571,7 @@ class TestExtractPasswordsFromContext:
 
         import asyncio
         candidates = asyncio.run(extract_passwords_from_context(
-            session, msg, test_config
+            session, msg
         ))
 
         values = [c.value for c in candidates]

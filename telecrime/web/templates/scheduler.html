@@ -390,7 +390,16 @@
     document.getElementById('statErrors').textContent = data.errors || 0;
 
     var results = data.recent_results || [];
-    document.getElementById('pipelineResults').innerHTML = results.map(function(r) { return '<span>' + r + '</span>'; }).join('');
+    // Escape before innerHTML: recent_results contains attacker-controlled
+    // archive filenames — unescaped, a channel posting '<img onerror=...>.zip'
+    // would execute script in every dashboard viewer's session.
+    var resultEl = document.getElementById('pipelineResults');
+    resultEl.innerHTML = '';
+    results.forEach(function(r) {
+      var span = document.createElement('span');
+      span.textContent = r;
+      resultEl.appendChild(span);
+    });
   }
 
   function poll() {

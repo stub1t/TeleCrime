@@ -20,35 +20,51 @@ class EnrichStage(PipelineStage):
         """Run the enrich stage."""
         logger.info("Starting enrichment (forwarded origin resolution)")
 
-        # Find messages with forwarded content that have archive attachments
-        forwarded_messages = ctx.session.execute(
-            select(Message)
-            .where(
-                Message.is_forwarded == True,
-                Message.is_processed == False,
+        # Process forwarded messages in keyset pages so a large backlog is
+        # never materialized at once, and commit per page so no single read
+        # snapshot is held across the (network-bound) origin resolutions.
+        last_id = 0
+        total = 0
+        while True:
+            forwarded_messages = (
+                ctx.session.execute(
+                    select(Message)
+                    .where(
+                        Message.is_forwarded == True,
+                        Message.is_processed == False,
+                        Message.id > last_id,
+                    )
+                    .options(joinedload(Message.attachments))
+                    .order_by(Message.id)
+                    .limit(100)
+                )
+                .unique()
+                .scalars()
+                .all()
             )
-            .options(joinedload(Message.attachments))
-        ).unique().scalars().all()
+            if not forwarded_messages:
+                break
 
-        if not forwarded_messages:
-            logger.info("No forwarded messages to process")
-            return True
+            for message in forwarded_messages:
+                # Only process if message has archive attachments
+                has_archives = any(a.is_archive_candidate for a in message.attachments)
+                if not has_archives:
+                    message.is_processed = True
+                    continue
 
-        logger.info("Found %d forwarded messages to enrich", len(forwarded_messages))
+                if message.forwarded_from_id:
+                    await self._resolve_origin(ctx, message)
 
-        for message in forwarded_messages:
-            # Only process if message has archive attachments
-            has_archives = any(a.is_archive_candidate for a in message.attachments)
-            if not has_archives:
                 message.is_processed = True
-                continue
 
-            if message.forwarded_from_id:
-                await self._resolve_origin(ctx, message)
+            total += len(forwarded_messages)
+            last_id = forwarded_messages[-1].id
+            ctx.session.commit()
 
-            message.is_processed = True
-
-        ctx.session.commit()
+        if total:
+            logger.info("Enriched %d forwarded messages", total)
+        else:
+            logger.info("No forwarded messages to process")
         return True
 
     async def _resolve_origin(self, ctx: PipelineContext, message: Message) -> None:

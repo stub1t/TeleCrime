@@ -352,7 +352,7 @@ class ExtractStage(PipelineStage):
                     job.last_error_message = "No files matching target extensions (nested archives had no txt)"
                     return True
 
-            await self._record_outputs(ctx, job, group, txt_files, output_dir)
+            await self._record_outputs(ctx, job, group, txt_files)
             group.status = GroupStatus.EXTRACTED
             job.status = ExtractionStatus.COMPLETED
             logger.info(
@@ -401,7 +401,7 @@ class ExtractStage(PipelineStage):
                         "Recovered %d txt files from nested archives despite outer extraction error",
                         len(nested_txts),
                     )
-                    await self._record_outputs(ctx, job, group, nested_txts, output_dir)
+                    await self._record_outputs(ctx, job, group, nested_txts)
                     group.status = GroupStatus.EXTRACTED
                     job.status = ExtractionStatus.COMPLETED
                     return True
@@ -442,7 +442,7 @@ class ExtractStage(PipelineStage):
             group.status = GroupStatus.FAILED
             return False
 
-        await self._record_outputs(ctx, job, group, [dest], output_dir)
+        await self._record_outputs(ctx, job, group, [dest])
         group.status = GroupStatus.EXTRACTED
         job.status = ExtractionStatus.COMPLETED
         logger.info("Direct txt file linked: %s", txt_path.name)
@@ -600,7 +600,6 @@ class ExtractStage(PipelineStage):
         new_candidates = await extract_passwords_from_context(
             ctx.session,
             message,
-            ctx.config,
             archive_name=group.base_name,
             attachment_filename=attachment_filename,
         )
@@ -651,7 +650,6 @@ class ExtractStage(PipelineStage):
         job: ExtractionJob,
         group: ArchiveGroup,
         extracted_files: list[Path],
-        output_dir: Path,
     ) -> None:
         """Record extracted output files.
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import itertools
 import logging
 import multiprocessing
 import os
@@ -428,10 +429,12 @@ class ParseStage(PipelineStage):
         logger.info("Starting credential parsing")
 
         jobs = self._iter_jobs(ctx)
-
-        if not jobs:
+        # `not jobs` is dead on a generator — peek the first page instead.
+        first = next(jobs, None)
+        if first is None:
             logger.info("No completed extractions to parse")
             return True
+        jobs = itertools.chain([first], jobs)
 
         total_credentials = 0
         total_duplicates = 0

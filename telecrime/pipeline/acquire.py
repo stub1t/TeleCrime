@@ -9,7 +9,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import joinedload
 
 from telecrime.logging_utils import log_context
@@ -234,10 +234,28 @@ class AcquireStage(PipelineStage):
             ctx.session.execute(
                 select(DownloadArtifact.id)
                 .join(DownloadArtifact.attachment)
+                .outerjoin(
+                    ArchiveGroupPart,
+                    ArchiveGroupPart.artifact_id == DownloadArtifact.id,
+                )
+                .outerjoin(ArchiveGroup, ArchiveGroup.id == ArchiveGroupPart.group_id)
                 .where(
                     DownloadArtifact.status.in_(
                         [DownloadStatus.PENDING, DownloadStatus.FAILED]
-                    )
+                    ),
+                    # Never re-download parts whose group is already terminal
+                    # or cleaned: finalize deleted the archive and the group
+                    # will never be extracted — re-downloading (and the sweep
+                    # unlink) repeated forever every run.
+                    or_(
+                        ArchiveGroup.id.is_(None),
+                        ArchiveGroup.status.notin_(
+                            [
+                                GroupStatus.CLEANED,
+                                GroupStatus.FAILED_TERMINAL,
+                            ]
+                        ),
+                    ),
                 )
                 .order_by(
                     _download_priority(FileAttachment.filename),

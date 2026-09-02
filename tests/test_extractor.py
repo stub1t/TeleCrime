@@ -12,12 +12,18 @@ class _AsyncLineReader:
     def __init__(self, data: bytes):
         lines = data.splitlines()
         self._lines = iter(lines if lines else [b""])
+        self._buf = data
 
     async def readline(self) -> bytes:
         try:
             return next(self._lines) + b"\n"
         except StopIteration:
             return b""
+
+    async def read(self, n: int = -1) -> bytes:
+        out = self._buf[:n] if n >= 0 else self._buf
+        self._buf = self._buf[n:] if n >= 0 else b""
+        return out
 
 from telecrime.extractor.interface import ExtractionResult
 from telecrime.extractor.seven_zip import SevenZipExtractor
@@ -111,6 +117,34 @@ class TestSevenZipExtractor:
                 await extractor.extract(archive, output_dir)
 
         assert output_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_extract_awaits_wait_before_reading_returncode(self, tmp_path):
+        """Regression: the child-watcher can lag after pipe EOF, leaving
+        returncode None. Reading it before `await process.wait()` misclassified
+        failed 7z runs (wrong password, data error) as exit 0 → groups marked
+        EXTRACTED → archives deleted by finalize → permanent data loss.
+        """
+        extractor = SevenZipExtractor()
+        archive = tmp_path / "protected.zip"
+        archive.touch()
+        output_dir = tmp_path / "out"
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_process = AsyncMock()
+            mock_process.stdout = _AsyncLineReader(b"")
+            mock_process.stderr = _AsyncLineReader(b"Wrong password")
+            # Simulate the watcher lag: returncode stays None until wait() is
+            # awaited, then becomes 2 (wrong password).
+            mock_process.returncode = None
+            mock_process.wait = AsyncMock(side_effect=lambda: setattr(mock_process, "returncode", 2) or 0)
+            mock_exec.return_value = mock_process
+
+            result = await extractor.extract(archive, output_dir)
+
+        assert result.success is False
+        assert result.wrong_password is True
+        assert mock_process.wait.await_count == 1
 
     def test_parse_result_wrong_password(self):
         """Test parsing wrong password error."""
@@ -347,6 +381,7 @@ Folder = +
             mock_process.stdout = _AsyncLineReader(b"")
             mock_process.stderr = _AsyncLineReader(b"")
             mock_process.returncode = 0
+            mock_process.wait = AsyncMock(return_value=0)
             mock_process.kill = MagicMock()
             mock_exec.return_value = mock_process
 
@@ -397,6 +432,7 @@ Folder = +
             mock_process.stdout = _AsyncLineReader(b"")
             mock_process.stderr = _AsyncLineReader(b"")
             mock_process.returncode = 0
+            mock_process.wait = AsyncMock(return_value=0)
             mock_process.kill = MagicMock()
             mock_exec.return_value = mock_process
 

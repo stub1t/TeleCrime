@@ -890,8 +890,13 @@ def _run_vacuum_job(engine) -> str:
         pruned = cast(CursorResult[Any], result).rowcount
         session.commit()
 
-    # VACUUM cannot run inside a transaction block on PostgreSQL
+    # VACUUM cannot run inside a transaction block on PostgreSQL, and the DB's
+    # statement_timeout (5 min) would cancel a full-table VACUUM ANALYZE on
+    # this 240GB database mid-flight (verified: "canceling statement due to
+    # statement timeout while vacuuming first_seen_index"). Disable the
+    # timeout on this connection only.
     with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
+        conn.execute(_sa.text("SET statement_timeout = 0"))
         conn.execute(_sa.text("VACUUM ANALYZE"))
     return f"VACUUM completed, pruned {pruned:,} stale extracted_output rows"
 
@@ -1665,7 +1670,10 @@ class TelecrimeWorker:
             if (
                 name not in {"pipeline", "pipeline_watchdog", "pipeline_health"}
                 and _blocks
-                and (self._is_pipeline_running() or bool(read_progress().get("running")))
+                and (
+                    self._is_pipeline_running()
+                    or bool((read_progress() or {}).get("running"))
+                )
             ):
                 lock.release()
                 logger.info("Job %s skipped — pipeline is running", name)

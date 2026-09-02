@@ -220,3 +220,4 @@ tasks/
 # Don't ignore alembic/versions/ - migrations should be committed
 # But ignore any SQLite databases that might end up there
 alembic/*.db
+.tmp-tests/

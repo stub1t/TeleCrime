@@ -150,7 +150,7 @@ def truncate_field(value: str | None, limit: int) -> str | None:
     return value[:limit]
 
 
-def _detect_encoding(file_path: Path, hint: str) -> list[str]:
+def _detect_encoding(hint: str) -> list[str]:
     """Return encoding list to try, with hint first and deduped."""
     # utf-16-le handles UTF-16 LE files without BOM (common in some stealers)
     chain = [hint, "utf-8", "utf-16", "utf-16-le", "latin-1", "cp1252"]
@@ -364,7 +364,7 @@ def _open_credential_file(file_path: Path, encoding: str) -> TextIO | None:
         logger.debug("Skipping binary file: %s", file_path)
         return None
 
-    enc_chain = _detect_encoding(file_path, encoding)
+    enc_chain = _detect_encoding(encoding)
     for enc in enc_chain:
         # Decode probe must be STRICT: opening with errors="replace" never
         # raises, so the fallback chain was dead code and non-UTF8 files were
@@ -419,38 +419,6 @@ def parse_credential_lines(
     for cred in _iter_credentials_from_lines(lines, source_file):
         if not _is_garbage_credential(cred.username, cred.password):
             yield cred
-
-
-def parse_credentials_file(file_path: Path, encoding: str = "utf-8") -> list[Credential]:
-    """Parse credentials from a file using a streaming line-by-line approach.
-
-    Internally iterates the file without loading it all into memory.
-    Returns the same list[Credential] API as before.
-
-    Args:
-        file_path: Path to the credentials file
-        encoding: Preferred encoding (default utf-8); fallback chain is tried
-
-    Returns:
-        List of parsed Credential objects (deduplicated)
-    """
-    try:
-        seen: set[tuple[str, str, str]] = set()
-        unique_creds: list[Credential] = []
-
-        for cred in _iter_credentials_from_file(file_path, encoding):
-            if _is_garbage_credential(cred.username, cred.password):
-                continue
-            key = (cred.url, cred.username, cred.password)
-            if key not in seen:
-                seen.add(key)
-                unique_creds.append(cred)
-
-        return unique_creds
-
-    except Exception as e:
-        logger.error("Error parsing credentials file %s: %s", file_path, e)
-        return []
 
 
 def parse_credentials_text(

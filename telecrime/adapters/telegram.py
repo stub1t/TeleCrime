@@ -329,8 +329,17 @@ class TelegramAdapter(BaseAdapter):
                     is_accessible=is_accessible,
                 )
         except asyncio.CancelledError:
-            logger.warning("iter_conversations cancelled by Telethon (connection dropped) — stopping iteration")
-            return
+            # A connection drop must NOT look like a completed scan: silently
+            # returning here let IngestStage advance its checkpoint past
+            # unfetched messages and report success — on 24h-deletion channels
+            # the remainder is then lost forever. Surface it so the run fails
+            # and the conversation is re-ingested on the next run.
+            logger.error(
+                "iter_conversations cancelled by Telethon (connection dropped) — aborting scan"
+            )
+            raise RuntimeError(
+                "Telegram conversation scan truncated: connection dropped mid-iteration"
+            ) from None
 
     def _get_conversation_type(self, entity) -> str:
         """Determine conversation type from entity."""
@@ -376,11 +385,14 @@ class TelegramAdapter(BaseAdapter):
 
                 yield msg_info, files
         except asyncio.CancelledError:
-            logger.warning(
-                "iter_messages cancelled by Telethon (connection dropped) for conv %s — stopping iteration",
+            logger.error(
+                "iter_messages cancelled by Telethon (connection dropped) for conv %s — aborting iteration",
                 conversation_id,
             )
-            return
+            raise RuntimeError(
+                f"Telegram message iteration truncated for conversation {conversation_id}: "
+                "connection dropped mid-iteration"
+            ) from None
 
     def _extract_message_info(
         self, message: TelegramMessage, conversation_id: int

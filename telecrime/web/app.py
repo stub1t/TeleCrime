@@ -53,6 +53,7 @@ from telecrime.models.system_info import SystemInfoRecord
 from telecrime.models.watchlist import WatchlistItem
 from telecrime.pipeline.progress import read_progress
 from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus, PasswordScope
+from telecrime.utils.credential_dedup import soft_dedupe_credentials
 from telecrime.web.exporting import _csv_stream, _export_value, _markdown_table, _serialize_row
 
 logger = logging.getLogger(__name__)
@@ -69,23 +70,6 @@ class SearchResults:
     channels: list[TelegramChannel]
 
 
-def _soft_dedupe_credentials(
-    credentials: list[ParsedCredential],
-    *,
-    limit: int | None = None,
-) -> list[ParsedCredential]:
-    """Collapse equivalent credentials for search and export surfaces."""
-    seen: set[str | int] = set()
-    unique: list[ParsedCredential] = []
-    for cred in credentials:
-        key = cred.soft_credential_hash or cred.credential_hash or cred.id
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(cred)
-        if limit is not None and len(unique) >= limit:
-            break
-    return unique
 
 
 _db_column_cache: dict[tuple[str, str, str], bool] = {}
@@ -699,7 +683,7 @@ def _search_for_export(
                 limit=limit_credentials,
             )
             if credential_ids:
-                credentials = _soft_dedupe_credentials(
+                credentials = soft_dedupe_credentials(
                     _load_ordered_records(session, ParsedCredential, credential_ids),
                     limit=limit_credentials,
                 )
@@ -744,7 +728,7 @@ def _search_for_export(
                 pass
             logger.warning("search export: credential LIKE fallback timed out: %r", exc)
             fallback_rows = []
-        credentials = _soft_dedupe_credentials(
+        credentials = soft_dedupe_credentials(
             fallback_rows,
             limit=limit_credentials,
         )
@@ -2809,7 +2793,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 credentials_page = []
                 if fts_used and credential_ids is not None:
                     if credential_ids:
-                        credentials_page = _soft_dedupe_credentials(
+                        credentials_page = soft_dedupe_credentials(
                             _load_ordered_records(
                                 session,
                                 ParsedCredential,
@@ -2850,7 +2834,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                             pass
                         logger.warning("search: credential LIKE fallback timed out: %r", exc)
                         like_results = []
-                    credentials_page = _soft_dedupe_credentials(
+                    credentials_page = soft_dedupe_credentials(
                         like_results,
                         limit=page_size + 1,
                     )

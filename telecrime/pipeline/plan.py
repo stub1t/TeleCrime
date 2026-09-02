@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import re
 from collections import defaultdict
 from collections.abc import Sequence
 
@@ -302,6 +303,81 @@ class PlanStage(PipelineStage):
                     )
                 existing.status = GroupStatus.INCOMPLETE
             return existing
+
+        # Late-arriving split part: the group fingerprint changes when a part
+        # is added, so the fingerprint lookup above misses it. A lone
+        # "Archive.part2.rar" (or a new multi-part set) whose base name matches
+        # an INCOMPLETE group in the same conversation is its missing piece —
+        # link it instead of creating a stranded standalone group (which would
+        # fail extraction and lose the archive permanently).
+        _is_split_set = len(unique_attachments) > 1 or any(
+            re.search(r"\.part\d+", (a.filename or ""), re.IGNORECASE)
+            for a in unique_attachments
+        )
+        if _is_split_set:
+            _new_conv_ids = {
+                a.message.conversation_id
+                for a in unique_attachments
+                if a.message
+            }
+            _by_name = (
+                ctx.session.execute(
+                    select(ArchiveGroup)
+                    .where(
+                        ArchiveGroup.status == GroupStatus.INCOMPLETE,
+                        ArchiveGroup.base_name == result.base_name,
+                    )
+                    .options(
+                        joinedload(ArchiveGroup.parts).joinedload(ArchiveGroupPart.artifact)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for _candidate in _by_name:
+                _cand_conv_ids = {
+                    p.artifact.attachment.message.conversation_id
+                    for p in _candidate.parts
+                    if p.artifact
+                    and p.artifact.attachment
+                    and p.artifact.attachment.message
+                }
+                if (
+                    _new_conv_ids
+                    and _cand_conv_ids
+                    and not (_new_conv_ids & _cand_conv_ids)
+                ):
+                    continue  # different conversation — don't merge
+                _linked_late = False
+                for idx, attachment in enumerate(unique_attachments):
+                    artifact = artifact_map.get(attachment.id)
+                    if artifact is None:
+                        continue
+                    _already = ctx.session.execute(
+                        select(ArchiveGroupPart).where(
+                            ArchiveGroupPart.artifact_id == artifact.id
+                        )
+                    ).scalar_one_or_none()
+                    if _already:
+                        continue
+                    ctx.session.add(
+                        ArchiveGroupPart(
+                            group_id=_candidate.id,
+                            artifact_id=artifact.id,
+                            part_index=result.part_numbers.get(attachment.id, idx)
+                            if result.part_numbers
+                            else idx,
+                            role="part" if len(unique_attachments) > 1 else "main",
+                        )
+                    )
+                    _linked_late = True
+                if _linked_late:
+                    logger.info(
+                        "Linked late parts %s into existing group %s",
+                        [a.filename for a in unique_attachments],
+                        _candidate.base_name,
+                    )
+                    return _candidate
 
         # Create new group
         group = ArchiveGroup(

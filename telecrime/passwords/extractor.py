@@ -7,7 +7,6 @@ from pathlib import Path
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from telecrime.config import Config
 from telecrime.models import Conversation, Message, PasswordCandidate
 from telecrime.states import PasswordScope
 
@@ -96,7 +95,6 @@ def extract_inline_passwords(text: str) -> list[tuple[str, float]]:
 async def extract_passwords_from_context(
     session: Session,
     message: Message,
-    config: Config,
     nearby_count: int = 10,
     archive_name: str | None = None,
     attachment_filename: str | None = None,

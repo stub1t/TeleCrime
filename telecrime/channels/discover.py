@@ -461,7 +461,6 @@ def update_channel_stats(session: Session) -> None:
     """
     from telecrime.models import TelegramChannel
 
-    now = datetime.now(UTC)
     last_run = _get_state_ts(session, _CHANNEL_STATS_LAST_RUN)
     channels = session.execute(
         select(TelegramChannel).where(TelegramChannel.platform_id != None)
@@ -544,6 +543,10 @@ def update_channel_stats(session: Session) -> None:
                 + credential_deltas.get(platform_id, 0),
             )
 
+    # Capture the watermark AFTER the delta queries: rows created between the
+    # query start and now would otherwise be counted this run AND next run
+    # (created_at >= last_run) — permanent upward drift of the stats.
+    now = datetime.now(UTC)
     _set_state_ts(session, _CHANNEL_STATS_LAST_RUN, now)
     session.commit()
 

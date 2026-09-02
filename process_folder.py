@@ -514,7 +514,7 @@ CSV_FIELDNAMES = [
 ]
 
 
-def print_summary(stats: ProcessingStats, credentials: list[dict]):
+def print_summary(stats: ProcessingStats):
     """Print processing summary."""
     print("\n" + "=" * 60)
     print("PROCESSING SUMMARY")
@@ -617,7 +617,7 @@ def main():
     )
 
     # Print summary
-    print_summary(stats, credentials)
+    print_summary(stats)
 
     # Set exit code based on results
     if stats.archives_failed > 0 and stats.archives_processed == 0:

@@ -12,6 +12,7 @@ from telecrime import __version__
 from telecrime.config import load_config, save_config
 from telecrime.database import ensure_runtime_schema, get_engine, get_session, init_db
 from telecrime.logging_utils import configure_logging
+from telecrime.utils.credential_dedup import soft_dedupe_credentials
 
 app = typer.Typer(
     name="telecrime",
@@ -19,23 +20,6 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
-
-
-def _soft_dedupe_credentials(credentials):
-    """Collapse semantically equivalent credentials for search output."""
-    seen: set[str | int] = set()
-    unique = []
-    for cred in credentials:
-        key = (
-            getattr(cred, "soft_credential_hash", None)
-            or getattr(cred, "credential_hash", None)
-            or cred.id
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(cred)
-    return unique
 
 
 def get_config_and_engine(config_path: Path | None = None):
@@ -1144,7 +1128,7 @@ def search(
                         session.query(ParsedCredential).filter(ParsedCredential.id.in_(ids)).all()
                     )
                     ordered = {cred_id: idx for idx, cred_id in enumerate(ids)}
-                    results = _soft_dedupe_credentials(
+                    results = soft_dedupe_credentials(
                         sorted(rows, key=lambda cred: ordered[cred.id])
                     )[:limit]
                 else:
@@ -1174,7 +1158,7 @@ def search(
             if source:
                 q = q.filter(ParsedCredential.source_archive.ilike(f"%{source}%"))
             total = q.count()
-            results = _soft_dedupe_credentials(q.limit(limit * 5).all())[:limit]
+            results = soft_dedupe_credentials(q.limit(limit * 5).all(), limit=limit)
 
         if not results:
             console.print(f"[yellow]No results for '{query}'[/yellow]")

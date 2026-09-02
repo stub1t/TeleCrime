@@ -898,6 +898,22 @@ async def run_sequential_pipeline(
                     _terminal,
                 )
 
+            # Sequential mode has no AcquireStage.run — without this call,
+            # stale zero-progress INCOMPLETE groups (the _next_pending_artifact
+            # fallback deliberately deprioritizes them) were never cleaned up,
+            # stranding them forever.
+            try:
+                _stale_cleaned = AcquireStage().cleanup_stale_incomplete_groups(
+                    session, max_age_days=30
+                )
+                if _stale_cleaned:
+                    logger.info(
+                        "Startup recovery: cleaned %d stale INCOMPLETE groups",
+                        _stale_cleaned,
+                    )
+            except Exception as _e:
+                logger.warning("cleanup_stale_incomplete_groups failed: %s", _e)
+
             # Startup recovery: reset any groups stuck in EXTRACTING (crash
             # during extraction) or transiently FAILED (retryable extraction
             # error) back to READY so they are re-processed this run.  Groups
