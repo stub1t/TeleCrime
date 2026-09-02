@@ -164,13 +164,20 @@ def _pg_single_token_candidates(token: str, params: dict[str, object]) -> str:
     params["tok_0"] = f"%{token}%"
     params.setdefault("branch_limit", 500)
     branches = [
-        f"(SELECT id FROM parsed_credentials WHERE {col} ILIKE :tok_0 LIMIT :branch_limit)"
+        f"(SELECT id FROM parsed_credentials WHERE {col} ILIKE :tok_0 ORDER BY id DESC LIMIT :branch_limit)"
         for col in _PG_SEARCH_COLUMNS
     ]
     return "WITH matched_ids AS (" + " UNION ".join(branches) + ") "
 
 
 def _pg_multi_token_candidates(tokens: list[str], params: dict[str, object]) -> str:
+    # Same bounded-branch treatment as the single-token path: without a
+    # per-branch LIMIT, a common token (e.g. "mail") scans the whole 319M-row
+    # table per column and the 30s statement_timeout cancels it — the CLI
+    # then falls back to an unbounded ILIKE count. ORDER BY id DESC biases the
+    # sampled intersection toward the newest rows, which the final
+    # ORDER BY id DESC LIMIT wants anyway.
+    params.setdefault("branch_limit", 500)
     branches: list[str] = []
     for token_idx, token in enumerate(tokens):
         param_name = f"tok_{token_idx}"
@@ -180,7 +187,9 @@ def _pg_multi_token_candidates(tokens: list[str], params: dict[str, object]) -> 
                 "SELECT id, "
                 f"{token_idx} AS token_idx "
                 "FROM parsed_credentials "
-                f"WHERE {col} ILIKE :{param_name}"
+                f"WHERE {col} ILIKE :{param_name} "
+                "ORDER BY id DESC "
+                "LIMIT :branch_limit"
             )
     return (
         "WITH token_matches AS ("

@@ -32,7 +32,7 @@ from sqlalchemy import and_, case, extract, func, inspect, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
-from telecrime.database import get_engine, get_session
+from telecrime.database import get_cached_engine, get_engine, get_session
 from telecrime.fts import ensure_fts
 from telecrime.models import (
     ArchiveGroup,
@@ -1090,7 +1090,7 @@ def _pipeline_running_for_heavy_web_work() -> bool:
 def _stats_worker(engine_url: str, presets: list[tuple[int, int]], interval: int) -> None:
     # Short initial delay so the web process is fully up before we start queries.
     time.sleep(5)
-    engine = get_engine(engine_url)
+    engine = get_cached_engine(engine_url)
     first_pass = True
     # When the pipeline is running, yield fully — stats GROUP BY on 157M rows competes
     # badly with bulk INSERT I/O and can block for hours. Re-check every 60s.
@@ -1218,7 +1218,7 @@ def _compute_home_cache_payload(engine) -> dict[str, object]:
 
 def _home_worker(engine_url: str, interval: int) -> None:
     time.sleep(2)
-    engine = get_engine(engine_url)
+    engine = get_cached_engine(engine_url)
     while True:
         if _pipeline_running_for_heavy_web_work():
             time.sleep(min(interval, 60))
@@ -1233,7 +1233,7 @@ def _home_worker(engine_url: str, interval: int) -> None:
 def _watchlist_worker(engine_url: str, interval: int) -> None:
     """Background worker to check watchlist items for new matches."""
     time.sleep(10)
-    engine = get_engine(engine_url)
+    engine = get_cached_engine(engine_url)
     while True:
         try:
             _check_watchlist(

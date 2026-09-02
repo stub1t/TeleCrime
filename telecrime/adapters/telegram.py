@@ -36,7 +36,7 @@ from telecrime.adapters.base import (
     MessageInfo,
 )
 from telecrime.config import Config
-from telecrime.pipeline.progress import patch_progress
+from telecrime.pipeline.progress import patch_progress, read_progress
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,23 @@ class TelegramAdapter(BaseAdapter):
             logger.info("Disconnected from Telegram")
 
     def _set_runtime_note(self, note: str, *, kind: str) -> None:
-        if self._reconnect_since is None:
+        # The "since" stamp must be file-global, not per-instance: multiple
+        # adapter instances (pipeline + scheduler jobs) share the progress
+        # file. If instance A's stamp survived in instance memory while B
+        # cleared the note, A's next set would resurrect the OLD timestamp —
+        # inflating the note age by the whole gap and triggering the health
+        # job's kill threshold much earlier than reality.
+        try:
+            current = read_progress() or {}
+            existing_since = current.get("runtime_note_since")
+            if (
+                not existing_since
+                or current.get("runtime_note_kind") != kind
+            ):
+                self._reconnect_since = datetime.now(UTC).isoformat()
+            else:
+                self._reconnect_since = existing_since
+        except Exception:
             self._reconnect_since = datetime.now(UTC).isoformat()
         patch_progress(
             runtime_note=note,

@@ -611,6 +611,12 @@ def _next_pending_artifact(session: "Session", exclude_ids: set[int] | None = No
             DownloadArtifact.status.in_(_retriable),
             _id_excl,
             ~ArchiveGroup.id.in_(stale_group_ids),
+            # Never pick parts whose group is terminal/cleaned: the archive is
+            # gone and the group will never be extracted — re-downloading (and
+            # finalize's sweep unlink) repeated forever every run.
+            ArchiveGroup.status.notin_(
+                [GroupStatus.CLEANED, GroupStatus.FAILED_TERMINAL]
+            ),
         )
         .options(joinedload(DownloadArtifact.attachment))
         .order_by(_download_priority(FileAttachment.filename), ArchiveGroup.updated_at.desc())

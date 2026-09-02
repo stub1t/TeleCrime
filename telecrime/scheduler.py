@@ -578,20 +578,44 @@ def _format_pipeline_progress(progress: dict[str, Any], *, pid: int | None) -> s
     )
 
 
-def _check_disk_status(config) -> str:
-    try:
+def _check_disk_status(config, timeout_seconds: float = 4.0) -> str:
+    """Check free disk on the data dir.
+
+    Runs statvfs in a worker thread with a timeout: on a wedged data drive
+    (D-state dm-crypt), shutil.disk_usage blocks indefinitely — and the
+    scheduler runs jobs sequentially in one thread, so the whole job loop
+    (health, notify, channel_join, pipeline starts) froze for the entire
+    wedge duration. Returns "" on success; a "disk critical" string when
+    low; "disk wedged/unavailable" when the check could not complete.
+    """
+    import concurrent.futures as _futures
+
+    def _usage() -> str:
         usage = shutil.disk_usage(config.data_dir)
+        free_gb = usage.free / (1024 ** 3)
+        total_gb = usage.total / (1024 ** 3)
+        pct_used = 100 * (usage.used / usage.total)
+        threshold = getattr(config.extraction, "scheduler_min_free_disk_gb", 10.0)
+        if free_gb >= threshold:
+            return ""
+        return (
+            f"disk critical: {free_gb:.1f} GB free of "
+            f"{total_gb:.0f} GB ({pct_used:.0f}% used)"
+        )
+
+    try:
+        with _futures.ThreadPoolExecutor(max_workers=1) as ex:
+            result = ex.submit(_usage).result(timeout=timeout_seconds)
+        return result
+    except _futures.TimeoutError:
+        logger.warning(
+            "Disk space check timed out (%ss) — data dir likely wedged",
+            timeout_seconds,
+        )
+        return "disk wedged/unavailable"
     except Exception as exc:
         logger.warning("Disk space check failed: %s", exc)
         return ""
-
-    free_gb = usage.free / (1024 ** 3)
-    total_gb = usage.total / (1024 ** 3)
-    pct_used = 100 * (usage.used / usage.total)
-    threshold = getattr(config.extraction, "scheduler_min_free_disk_gb", 10.0)
-    if free_gb >= threshold:
-        return ""
-    return f"disk critical: {free_gb:.1f} GB free of {total_gb:.0f} GB ({pct_used:.0f}% used)"
 
 
 def _check_pipeline_health(config) -> PipelineHealth:
@@ -638,7 +662,9 @@ def _check_pipeline_health(config) -> PipelineHealth:
         # and the pipeline is otherwise making progress (parse/finalize/etc).
         # Without this guard the watchdog keeps trying to kill a healthy
         # subprocess for a note that hasn't been valid for hours.
-        and (meaningful_age is None or meaningful_age > min(stale_threshold, 600))
+        # Fail-safe: an UNKNOWN age must not trigger the kill either.
+        and meaningful_age is not None
+        and meaningful_age > min(stale_threshold, 600)
     ):
         reasons.append(f"telegram reconnect wait exceeded {int(runtime_note_since_age)}s")
     pipeline_started_age = _iso_age_seconds(pipeline_status.last_run) if pipeline_status else None
@@ -656,10 +682,21 @@ def _check_pipeline_health(config) -> PipelineHealth:
     ):
         reasons.append("scheduler marked pipeline running but no lock or pid exists")
 
+    disk_status = _check_disk_status(config)
+    if disk_status.startswith("disk wedged"):
+        # The data drive is wedged (D-state): the pipeline cannot write
+        # progress, so every liveness signal looks stale — killing and
+        # restarting into the wedge only churns (reset downloads, fresh run
+        # into degraded I/O). Suppress kill reasons until the drive recovers.
+        logger.warning(
+            "Suppressing pipeline health-kill: %s", disk_status
+        )
+        reasons = []
+
     return PipelineHealth(
         reasons=reasons,
         progress_summary=_format_pipeline_progress(progress, pid=pid),
-        disk_status=_check_disk_status(config),
+        disk_status=disk_status,
     )
 
 

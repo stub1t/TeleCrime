@@ -1138,27 +1138,37 @@ def search(
                 has_fts = False  # fall through to ILIKE
 
         if not has_fts:
-            from sqlalchemy import or_
+            try:
+                from sqlalchemy import or_
 
-            q = session.query(ParsedCredential)
-            text_conditions = []
-            if domain:
-                text_conditions.append(ParsedCredential.domain.ilike(f"%{query}%"))
-            if username:
-                text_conditions.append(ParsedCredential.username.ilike(f"%{query}%"))
-            if url:
-                text_conditions.append(ParsedCredential.url.ilike(f"%{query}%"))
-            q = q.filter(or_(*text_conditions))
-            if stealer:
-                q = q.filter(ParsedCredential.stealer_type == stealer)
-            if app:
-                q = q.filter(ParsedCredential.application.ilike(f"%{app}%"))
-            if email_domain:
-                q = q.filter(ParsedCredential.email_domain.ilike(f"%{email_domain}%"))
-            if source:
-                q = q.filter(ParsedCredential.source_archive.ilike(f"%{source}%"))
-            total = q.count()
-            results = soft_dedupe_credentials(q.limit(limit * 5).all(), limit=limit)
+                q = session.query(ParsedCredential)
+                text_conditions = []
+                if domain:
+                    text_conditions.append(ParsedCredential.domain.ilike(f"%{query}%"))
+                if username:
+                    text_conditions.append(ParsedCredential.username.ilike(f"%{query}%"))
+                if url:
+                    text_conditions.append(ParsedCredential.url.ilike(f"%{query}%"))
+                q = q.filter(or_(*text_conditions))
+                if stealer:
+                    q = q.filter(ParsedCredential.stealer_type == stealer)
+                if app:
+                    q = q.filter(ParsedCredential.application.ilike(f"%{app}%"))
+                if email_domain:
+                    q = q.filter(ParsedCredential.email_domain.ilike(f"%{email_domain}%"))
+                if source:
+                    q = q.filter(ParsedCredential.source_archive.ilike(f"%{source}%"))
+                total = q.count()
+                results = soft_dedupe_credentials(q.limit(limit * 5).all(), limit=limit)
+            except Exception as exc:
+                # Never hang the CLI on an unbounded ILIKE count over 319M
+                # rows (the FTS fallback path has no 30s statement_timeout).
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                console.print(f"[yellow]Search failed: {exc}[/yellow]")
+                return
 
         if not results:
             console.print(f"[yellow]No results for '{query}'[/yellow]")

@@ -605,7 +605,7 @@ def main():
         sys.exit(1)
 
     # Run processing
-    stats, credentials = asyncio.run(
+    stats, _ = asyncio.run(
         process_folder(
             args.folder,
             output_file=args.output,

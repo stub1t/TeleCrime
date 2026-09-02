@@ -3,6 +3,7 @@
 import weakref
 from collections.abc import Generator
 from contextlib import contextmanager
+from functools import lru_cache
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.dialects.postgresql import insert as _pg_insert
@@ -45,6 +46,20 @@ def get_engine(database_url: str | None = None):
         max_overflow=10,
         pool_pre_ping=True,
     )
+
+
+@lru_cache(maxsize=8)
+def get_cached_engine(database_url: str):
+    """URL-keyed engine with pool reuse.
+
+    The web process creates 4 engines (app + 3 background workers); without
+    caching that is up to 60 pooled connections against PG's default
+    max_connections=100. SQLite URLs are never cached (in-memory test DBs
+    must stay isolated).
+    """
+    if database_url.startswith("sqlite:"):
+        return get_engine(database_url)
+    return get_engine(database_url)
 
 
 def get_session_factory(engine) -> sessionmaker[Session]:

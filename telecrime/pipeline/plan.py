@@ -2,11 +2,10 @@
 
 import hashlib
 import logging
-import re
 from collections import defaultdict
 from collections.abc import Sequence
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import joinedload
 
 from telecrime.grouping.patterns import GroupingResult, group_by_pattern
@@ -306,15 +305,32 @@ class PlanStage(PipelineStage):
 
         # Late-arriving split part: the group fingerprint changes when a part
         # is added, so the fingerprint lookup above misses it. A lone
-        # "Archive.part2.rar" (or a new multi-part set) whose base name matches
-        # an INCOMPLETE group in the same conversation is its missing piece —
-        # link it instead of creating a stranded standalone group (which would
-        # fail extraction and lose the archive permanently).
+        # "Archive.part2.rar" (or a new multi-part set) whose DERIVED base
+        # name matches an INCOMPLETE group in the same conversation is its
+        # missing piece — link it instead of creating a stranded standalone
+        # group (which would fail extraction and lose the archive).
+        from telecrime.grouping.patterns import SPLIT_PATTERNS, extract_base_and_part
+
+        def _derived_base(name: str) -> str | None:
+            base, _, _ = extract_base_and_part(name)
+            if base:
+                return base
+            for pattern, base_group, _pg in SPLIT_PATTERNS:
+                m = pattern.match(name)
+                if m:
+                    return m.group(base_group)
+            return None
+
+        _new_bases = {
+            _derived_base(a.filename or "")
+            for a in unique_attachments
+            if a.filename
+        }
         _is_split_set = len(unique_attachments) > 1 or any(
-            re.search(r"\.part\d+", (a.filename or ""), re.IGNORECASE)
+            _derived_base(a.filename or "") is not None
             for a in unique_attachments
         )
-        if _is_split_set:
+        if _is_split_set and _new_bases:
             _new_conv_ids = {
                 a.message.conversation_id
                 for a in unique_attachments
@@ -325,7 +341,17 @@ class PlanStage(PipelineStage):
                     select(ArchiveGroup)
                     .where(
                         ArchiveGroup.status == GroupStatus.INCOMPLETE,
-                        ArchiveGroup.base_name == result.base_name,
+                        # Prefix match: the existing group's stored base_name
+                        # may be the bare base ("Archive") or a part filename
+                        # ("Archive.part1.rar") depending on how it was created;
+                        # the derived-base comparison happens in Python below.
+                        or_(
+                            *[
+                                ArchiveGroup.base_name.like(f"{base}%")
+                                for base in _new_bases
+                                if base
+                            ]
+                        ),
                     )
                     .options(
                         joinedload(ArchiveGroup.parts).joinedload(ArchiveGroupPart.artifact)
@@ -335,6 +361,9 @@ class PlanStage(PipelineStage):
                 .all()
             )
             for _candidate in _by_name:
+                _cand_base = _derived_base(_candidate.base_name)
+                if _cand_base is None or _cand_base not in _new_bases:
+                    continue
                 _cand_conv_ids = {
                     p.artifact.attachment.message.conversation_id
                     for p in _candidate.parts
@@ -348,6 +377,35 @@ class PlanStage(PipelineStage):
                     and not (_new_conv_ids & _cand_conv_ids)
                 ):
                     continue  # different conversation — don't merge
+                # Same-name different-content guard: only merge when the new
+                # parts' indexes aren't already occupied, or the new set shares
+                # a physical file (platform_file_unique_id) with the group —
+                # otherwise a DIFFERENT "Mix.part1.rar"+"part2.rar" could be
+                # trapped into the stale group with duplicate part_index rows.
+                _cand_used_indexes = {
+                    p.part_index
+                    for p in _candidate.parts
+                    if p.part_index is not None
+                }
+                _new_ids = {
+                    a.platform_file_unique_id
+                    for a in unique_attachments
+                    if a.platform_file_unique_id
+                }
+                _cand_ids = {
+                    p.artifact.attachment.platform_file_unique_id
+                    for p in _candidate.parts
+                    if p.artifact
+                    and p.artifact.attachment
+                    and p.artifact.attachment.platform_file_unique_id
+                }
+                _same_archive = bool(_new_ids & _cand_ids)
+                _new_indexes = {
+                    result.part_numbers.get(a.id, idx)
+                    for idx, a in enumerate(unique_attachments)
+                }
+                if not _same_archive and (_new_indexes & _cand_used_indexes):
+                    continue  # different archive occupying the same part slot
                 _linked_late = False
                 for idx, attachment in enumerate(unique_attachments):
                     artifact = artifact_map.get(attachment.id)

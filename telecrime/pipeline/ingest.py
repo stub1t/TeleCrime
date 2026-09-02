@@ -108,6 +108,15 @@ class IngestStage(PipelineStage):
                         ctx.session.rollback()
                     except Exception:
                         pass
+                    # Surface truncation/errors so the run record shows the
+                    # failure (e.g. a connection drop mid-iteration means
+                    # messages beyond the checkpoint were NOT fetched and may
+                    # vanish on 24h-deletion channels). Continue with other
+                    # conversations; the checkpoint is preserved by the
+                    # rollback, so the next run re-fetches.
+                    ctx.errors.append(
+                        f"Ingest error for {conv_info.title}: {type(e).__name__}: {e}"
+                    )
 
             logger.info("Ingested %d conversations", ctx.conversations_processed)
             return True
