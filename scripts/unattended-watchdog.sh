@@ -196,9 +196,52 @@ fi
 
 log "check: pipeline_pid=$PIPELINE_PID alive=$PIPELINE_ALIVE heartbeat_age=${HEARTBEAT_AGE}s db_active=$DB_ACTIVE dl_active=$DL_ACTIVE frozen=$FROZEN sig=$SIG"
 
+# --- Drive-wedge detection (BEFORE the heal logic) ---
+# A hung drive (dm-crypt/jbd2 in persistent D-state) freezes postgres and the
+# pipeline's progress writes — the pipeline then LOOKS hung by every signal
+# below. Killing/restarting into the wedge churns (resets downloads, fresh run
+# into degraded I/O) and cannot help. Transient D-state is normal under heavy
+# write load, so only a drive-writer thread stuck across two checks counts.
+DRIVE_WEDGED=0
+WEDGE_SNAP=/tmp/telecrime-wedge-pids.txt
+CURRENT_WEDGED=""
+if [ -d /proc ]; then
+  for _comm in /proc/[0-9]*/comm; do
+    [ -r "$_comm" ] || continue
+    _name=$(cat "$_comm" 2>/dev/null) || continue
+    case "$_name" in
+      dmcrypt_write*|jbd2/*)
+        _pid=$(basename "$(dirname "$_comm")")
+        if [ -r "/proc/$_pid/stat" ] && grep -qE '^[0-9]+ \([^)]*\) D' "/proc/$_pid/stat" 2>/dev/null; then
+          CURRENT_WEDGED="$CURRENT_WEDGED $_pid"
+        fi
+        ;;
+    esac
+  done
+fi
+if [ -n "$CURRENT_WEDGED" ] && [ -f "$WEDGE_SNAP" ]; then
+  PREV_WEDGED=$(cat "$WEDGE_SNAP" 2>/dev/null)
+  for _p in $CURRENT_WEDGED; do
+    case " $PREV_WEDGED " in
+      *" $_p "*) DRIVE_WEDGED=1 ;;
+    esac
+  done
+fi
+echo "$CURRENT_WEDGED" > "$WEDGE_SNAP"
+if [ "$DRIVE_WEDGED" = "1" ]; then
+  log "CRITICAL: data drive write appears hung (same D-state thread across two checks) — pausing pipeline heals"
+fi
+
 # --- Heal logic ---
 NEED_HEAL=0
 REASON=""
+
+# During a wedge, a healthy pipeline looks hung (cannot write progress, no DB
+# activity — postgres itself is blocked). Stand down until the drive recovers.
+if [ "$DRIVE_WEDGED" = "1" ]; then
+  log "heal skipped: data drive wedged"
+fi
+if [ "$DRIVE_WEDGED" = "0" ]; then
 
 # NOTE: a MISSING pid file (PIPELINE_PID=0) is NOT a crash: the pipeline
 # removes it on every clean exit, so it is briefly absent during any normal
@@ -228,6 +271,7 @@ elif [ "$FROZEN" = "1" ] && [ "$DB_ACTIVE" = "0" ] && [ "$DL_ACTIVE" = "0" ]; th
          REASON="hung pipeline (progress frozen for two checks, no DB or download activity)"
        fi ;;
   esac
+fi
 fi
 
 if [ "$NEED_HEAL" = "1" ]; then
@@ -277,31 +321,12 @@ if [ -d /proc ]; then
   # Transient D-state is NORMAL under heavy write load (postgres checkpoint,
   # COPY bursts) — only a drive-writer thread stuck in D-state on TWO
   # consecutive checks (≥5-10 min apart) indicates a real wedge.
-  for _comm in /proc/[0-9]*/comm; do
-    [ -r "$_comm" ] || continue
-    _name=$(cat "$_comm" 2>/dev/null) || continue
-    case "$_name" in
-      dmcrypt_write*|jbd2/*)
-        _pid=$(basename "$(dirname "$_comm")")
-        if [ -r "/proc/$_pid/stat" ] && grep -qE '^[0-9]+ \([^)]*\) D' "/proc/$_pid/stat" 2>/dev/null; then
-          CURRENT_WEDGED="$CURRENT_WEDGED $_pid"
-        fi
-        ;;
-    esac
-  done
+  # (DRIVE_WEDGED is already computed above the heal logic; this block only
+  # re-logs for the container-heal section.)
+  :
 fi
-if [ -n "$CURRENT_WEDGED" ] && [ -f "$WEDGE_SNAP" ]; then
-  # Same pid(s) still in D-state since the previous check → genuine wedge.
-  PREV_WEDGED=$(cat "$WEDGE_SNAP" 2>/dev/null)
-  for _p in $CURRENT_WEDGED; do
-    case " $PREV_WEDGED " in
-      *" $_p "*) DRIVE_WEDGED=1 ;;
-    esac
-  done
-fi
-echo "$CURRENT_WEDGED" > "$WEDGE_SNAP"
 if [ "$DRIVE_WEDGED" = "1" ]; then
-  log "CRITICAL: data drive write appears hung (same D-state thread across two checks) — pausing container heals"
+  log "CRITICAL: data drive write appears hung — pausing container heals"
 fi
 
 for svc in db web worker; do

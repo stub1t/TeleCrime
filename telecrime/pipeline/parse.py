@@ -14,7 +14,7 @@ from collections.abc import AsyncGenerator, Iterator
 from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 
-from sqlalchemy import inspect, select, text
+from sqlalchemy import delete, inspect, select, text
 from sqlalchemy.orm import selectinload
 
 from telecrime.database import get_dialect_insert
@@ -477,6 +477,35 @@ class ParseStage(PipelineStage):
                     # next run re-parses it instead of deleting the files.
                     if job.group_id is not None:
                         ctx.parse_failed_group_ids.add(job.group_id)
+                    # CRITICAL partial-loss edge: the next run's per-file
+                    # pre-skip (parsed_source_files) skips a file as soon as
+                    # ANY of its rows exist. If a chunk insert failed after
+                    # earlier chunks of the SAME file succeeded (wedge-straddled
+                    # double chunk failure), the file would be skipped next run
+                    # and its ≤50K un-inserted rows lost forever. Delete the
+                    # job's already-inserted rows so the whole job re-parses
+                    # cleanly (ON CONFLICT dedups the re-inserts).
+                    try:
+                        removed = ctx.session.execute(
+                            delete(ParsedCredential).where(
+                                ParsedCredential.extraction_job_id == job.id
+                            )
+                        ).rowcount
+                        ctx.session.commit()
+                        logger.info(
+                            "Removed %d partial rows for failed job %d — will re-parse next run",
+                            removed or 0,
+                            job.id,
+                        )
+                    except Exception as del_err:
+                        logger.warning(
+                            "Could not clean partial rows for job %d: %s",
+                            job.id, del_err,
+                        )
+                        try:
+                            ctx.session.rollback()
+                        except Exception:
+                            pass
         finally:
             _reset_pg_bulk_settings(ctx.session)
 

@@ -198,6 +198,12 @@ def _apply_config_dict(config: Config, data: ConfigDict) -> None:
         dl = data["download"]
         if "max_retries" in dl:
             config.download.max_retries = dl["max_retries"]
+        if "retry_delay_seconds" in dl:
+            config.download.retry_delay_seconds = dl["retry_delay_seconds"]
+        if "download_session_names" in dl:
+            config.telegram.download_session_names = [
+                s.strip() for s in dl["download_session_names"] if s.strip()
+            ]
 
 
 def _apply_env_vars(config: Config) -> None:
@@ -210,6 +216,8 @@ def _apply_env_vars(config: Config) -> None:
         config.telegram.api_id = int(api_id)
     if api_hash := os.environ.get("TELECRIME_TELEGRAM_API_HASH"):
         config.telegram.api_hash = api_hash
+    if phone := os.environ.get("TELECRIME_TELEGRAM_PHONE"):
+        config.telegram.phone = phone
     if aux := os.environ.get("TELECRIME_TELEGRAM_AUX_SESSION_NAME"):
         config.telegram.aux_session_name = aux
     if sessions := os.environ.get("TELECRIME_DOWNLOAD_SESSIONS"):

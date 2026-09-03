@@ -1,6 +1,7 @@
 """Write real-time pipeline progress to a JSON file for dashboard display."""
 
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -9,6 +10,11 @@ from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
+
+logger = logging.getLogger(__name__)
+
+# Throttle state for _write_progress_data failure warnings.
+_last_progress_write_warn: dict[str, float] = {}
 
 _DEFAULT_DATA_DIR = Path(__file__).parent.parent.parent / "data"
 
@@ -64,8 +70,19 @@ def _write_progress_data(data: dict[str, object]) -> None:
             except OSError:
                 pass
             raise
-    except Exception:
-        pass
+    except Exception as exc:
+        # Swallowing silently made a healthy pipeline indistinguishable from a
+        # dead one: the heartbeat stops updating, the watchdog kills the run,
+        # and the real cause (disk full, permission change) never surfaces.
+        # Throttle to ~one line per 5 minutes.
+        now = time.time()
+        if now - _last_progress_write_warn.get("t", 0) > 300:
+            _last_progress_write_warn["t"] = now
+            logger.warning(
+                "Progress file write failed at %s: %s",
+                path,
+                exc,
+            )
 
 
 def patch_progress(**updates: object) -> None:

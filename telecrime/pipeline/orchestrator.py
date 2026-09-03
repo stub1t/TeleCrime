@@ -35,6 +35,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _BoundedErrorList(list):
+    """Errors list capped at 500 entries.
+
+    A long run with persistent per-conversation/per-archive failures would
+    otherwise grow unbounded in memory and dump multi-MB errors_json rows
+    (re-parsed on every dashboard home render).
+    """
+
+    _CAP = 500
+
+    def append(self, item) -> None:
+        if len(self) < self._CAP:
+            super().append(item)
+        elif len(self) == self._CAP:
+            super().append("... further errors truncated (limit 500) ...")
+
+
 @dataclass
 class PipelineContext:
     """Shared context passed through pipeline stages."""
@@ -57,7 +74,7 @@ class PipelineContext:
     archives_extracted: int = 0
     credentials_parsed: int = 0
     duplicates_skipped: int = 0
-    errors: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=_BoundedErrorList)
     # Group IDs whose parse failed part-way (ParseStage swallowed the error).
     # FinalizeStage must NOT delete their extracted files / mark them CLEANED —
     # the unparsed remainder is only recoverable from disk and is re-parsed on
@@ -1404,6 +1421,14 @@ async def run_sequential_pipeline(
                         try:
                             await channel_joiner.maybe_act(ctx)
                         except Exception as e:
+                            # Without the rollback, the poisoned session
+                            # surfaces later as a spurious per-archive error
+                            # that masks the real cause.
+                            try:
+                                session.rollback()
+                            except Exception:
+                                pass
+                            ctx.errors.append(f"Channel discovery: {type(e).__name__}: {e}")
                             logger.warning("Channel joiner error: %s", e)
 
                     processed += 1

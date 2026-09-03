@@ -382,6 +382,15 @@ class PlanStage(PipelineStage):
                 # a physical file (platform_file_unique_id) with the group —
                 # otherwise a DIFFERENT "Mix.part1.rar"+"part2.rar" could be
                 # trapped into the stale group with duplicate part_index rows.
+                # NOTE: part numbers must be DERIVED from the filenames — a
+                # lone part's GroupingResult always carries part_numbers={0},
+                # which would both collide with the existing group's part 0
+                # (blocking the merge) and assign the wrong part_index.
+                _new_part_numbers = {
+                    a.id: extract_base_and_part(a.filename or "")[1]
+                    for a in unique_attachments
+                    if a.filename
+                }
                 _cand_used_indexes = {
                     p.part_index
                     for p in _candidate.parts
@@ -401,7 +410,7 @@ class PlanStage(PipelineStage):
                 }
                 _same_archive = bool(_new_ids & _cand_ids)
                 _new_indexes = {
-                    result.part_numbers.get(a.id, idx)
+                    _new_part_numbers.get(a.id) if _new_part_numbers.get(a.id) is not None else idx
                     for idx, a in enumerate(unique_attachments)
                 }
                 if not _same_archive and (_new_indexes & _cand_used_indexes):
@@ -418,13 +427,18 @@ class PlanStage(PipelineStage):
                     ).scalar_one_or_none()
                     if _already:
                         continue
+                    _part_num = _new_part_numbers.get(attachment.id)
+                    if _part_num is None:
+                        _part_num = (
+                            result.part_numbers.get(attachment.id, idx)
+                            if result.part_numbers
+                            else idx
+                        )
                     ctx.session.add(
                         ArchiveGroupPart(
                             group_id=_candidate.id,
                             artifact_id=artifact.id,
-                            part_index=result.part_numbers.get(attachment.id, idx)
-                            if result.part_numbers
-                            else idx,
+                            part_index=_part_num,
                             role="part" if len(unique_attachments) > 1 else "main",
                         )
                     )

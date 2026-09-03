@@ -183,13 +183,16 @@ def _pg_multi_token_candidates(tokens: list[str], params: dict[str, object]) -> 
         param_name = f"tok_{token_idx}"
         params[param_name] = f"%{token}%"
         for col in _PG_SEARCH_COLUMNS:
+            # Parenthesized branches: PostgreSQL requires parens around
+            # ORDER BY/LIMIT inside UNION ALL (without them the whole query
+            # is a syntax error).
             branches.append(
-                "SELECT id, "
+                "(SELECT id, "
                 f"{token_idx} AS token_idx "
                 "FROM parsed_credentials "
                 f"WHERE {col} ILIKE :{param_name} "
                 "ORDER BY id DESC "
-                "LIMIT :branch_limit"
+                "LIMIT :branch_limit)"
             )
     return (
         "WITH token_matches AS ("

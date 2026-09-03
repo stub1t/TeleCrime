@@ -2551,6 +2551,21 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 return JSONResponse({"error": "Not in a failed state"}, status_code=409)
             artifact.status = DownloadStatus.PENDING
             artifact.error_message = None
+            # The artifact's group is terminal (FAILED_TERMINAL/CLEANED): the
+            # pickers exclude those groups, so the retried artifact would sit
+            # PENDING forever. Reopen the group for download.
+            part = session.execute(
+                select(ArchiveGroupPart).where(
+                    ArchiveGroupPart.artifact_id == artifact.id
+                )
+            ).scalar_one_or_none()
+            if part is not None:
+                group = session.get(ArchiveGroup, part.group_id)
+                if group is not None and group.status in (
+                    GroupStatus.FAILED_TERMINAL,
+                    GroupStatus.FAILED,
+                ):
+                    group.status = GroupStatus.INCOMPLETE
             session.commit()
         return JSONResponse({"ok": True})
 

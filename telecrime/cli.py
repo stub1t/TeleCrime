@@ -1,5 +1,6 @@
 """CLI interface for Telecrime."""
 
+import asyncio
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -80,7 +81,6 @@ def telegram_auth_aux(
     prompt for the verification code on the configured phone number and
     persist a new <aux_session_name>.session file in the data directory.
     """
-    import asyncio
 
     config, _ = get_config_and_engine(config_path)
     if not config.telegram.aux_session_name:
@@ -127,7 +127,6 @@ def telegram_auth_download(
     for each verification code and persist a <name>.session file in the data
     directory.
     """
-    import asyncio
 
     config, _ = get_config_and_engine(config_path)
     names = config.telegram.download_session_names
@@ -384,7 +383,6 @@ def run(
     Default mode (--sequential): Download, extract, parse each archive before moving to next.
     Batch mode (--batch): Download all, then extract all, then parse all.
     """
-    import asyncio
 
     from telecrime.pipeline.lock import PipelineAlreadyRunningError
 
@@ -453,7 +451,26 @@ def run(
                 progress_display = PipelineProgressWriter()
                 display = _FanoutDisplay(console_display, progress_display)
                 console.print("Connecting to Telegram...")
-                await adapter.connect()
+                # The session file lives on the data volume. A drive wedge
+                # (D-state write) makes connect() fail with a 30s timeout and
+                # a false "session may need re-authentication" — the session
+                # itself is intact, so retry with backoff across the wedge
+                # instead of crashing the whole pipeline run.
+                _connect_error: Exception | None = None
+                for _attempt in range(3):
+                    try:
+                        await adapter.connect()
+                        _connect_error = None
+                        break
+                    except Exception as _exc:
+                        _connect_error = _exc
+                        console.print(
+                            f"[yellow]Telegram connect failed (attempt {_attempt + 1}/3): "
+                            f"{_exc}[/yellow]"
+                        )
+                        await asyncio.sleep(30 * (_attempt + 1))
+                if _connect_error is not None:
+                    raise _connect_error
 
                 # Connect extra download sessions in parallel.
                 for dl_adapter in download_adapters:
@@ -1520,7 +1537,6 @@ def channels(
     ),
 ) -> None:
     """List and manage tracked Telegram channels."""
-    import asyncio
 
     from sqlalchemy import func
 

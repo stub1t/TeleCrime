@@ -604,9 +604,16 @@ def _check_disk_status(config, timeout_seconds: float = 4.0) -> str:
         )
 
     try:
-        with _futures.ThreadPoolExecutor(max_workers=1) as ex:
-            result = ex.submit(_usage).result(timeout=timeout_seconds)
-        return result
+        # NO `with` block: ThreadPoolExecutor.__exit__ calls shutdown(wait=True)
+        # which joins the worker — on a wedged drive the statvfs thread is in
+        # D-state forever, so the timeout would never fire and the caller would
+        # block for the entire wedge anyway. Fire-and-forget the shutdown.
+        _executor = _futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            result = _executor.submit(_usage).result(timeout=timeout_seconds)
+            return result
+        finally:
+            _executor.shutdown(wait=False, cancel_futures=True)
     except _futures.TimeoutError:
         logger.warning(
             "Disk space check timed out (%ss) — data dir likely wedged",

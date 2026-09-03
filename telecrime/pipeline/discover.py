@@ -14,13 +14,14 @@ logger = logging.getLogger(__name__)
 
 # Archive extensions and their types
 ARCHIVE_EXTENSIONS = {
-    # Standard archives
+    # Standard archives — .tgz must precede .gz (both end with ".gz", and a
+    # tgz is a tar container, not a bare gzip stream).
     ".zip": "zip",
     ".7z": "7z",
     ".rar": "rar",
     ".tar": "tar",
-    ".gz": "gzip",
     ".tgz": "tar",
+    ".gz": "gzip",
     ".bz2": "bzip2",
     ".xz": "xz",
     ".lzma": "lzma",
