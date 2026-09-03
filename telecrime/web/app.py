@@ -4974,14 +4974,14 @@ def create_app(database_url: str | None = None) -> FastAPI:
             base = session.query(TelegramChannel)
 
             if subscribed == "1":
-                base = base.filter(TelegramChannel.is_subscribed == True)  # noqa: E712
+                base = base.filter(TelegramChannel.is_subscribed == True)
             elif subscribed == "0":
-                base = base.filter(TelegramChannel.is_subscribed == False)  # noqa: E712
+                base = base.filter(TelegramChannel.is_subscribed == False)
 
             if active == "1":
-                base = base.filter(TelegramChannel.is_active == True)  # noqa: E712
+                base = base.filter(TelegramChannel.is_active == True)
             elif active == "0":
-                base = base.filter(TelegramChannel.is_active == False)  # noqa: E712
+                base = base.filter(TelegramChannel.is_active == False)
 
             if source:
                 base = base.filter(TelegramChannel.source == source)
@@ -4989,11 +4989,11 @@ def create_app(database_url: str | None = None) -> FastAPI:
             stats_row = base.with_entities(
                 func.count(TelegramChannel.id),
                 func.coalesce(
-                    func.sum(case((TelegramChannel.is_subscribed == True, 1), else_=0)),  # noqa: E712
+                    func.sum(case((TelegramChannel.is_subscribed == True, 1), else_=0)),
                     0,
                 ),
                 func.coalesce(
-                    func.sum(case((TelegramChannel.is_active == True, 1), else_=0)),  # noqa: E712
+                    func.sum(case((TelegramChannel.is_active == True, 1), else_=0)),
                     0,
                 ),
                 func.coalesce(func.sum(TelegramChannel.credentials_extracted), 0),

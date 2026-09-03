@@ -385,7 +385,7 @@ class TelegramNotifier:
     async def activity_summary(self, window_label: str, new_unique_credentials: int):
         """Hourly/daily summary of new unique credentials."""
         msg = (
-            f"{_header('📊', f'{window_label} summary')}\n"
+            f"{_header('📊', f'{_esc(window_label)} summary')}\n"
             f"• <b>New unique credentials:</b> {_fmt_int(new_unique_credentials)}"
         )
         await self.send(msg)

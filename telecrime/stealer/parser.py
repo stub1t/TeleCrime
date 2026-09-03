@@ -556,7 +556,7 @@ def _extract_fields(block: str) -> dict[str, str]:
 def _get_field(fields: dict[str, str], possible_names: list[str]) -> str | None:
     """Get a field value by trying multiple possible field names."""
     for name in possible_names:
-        if name in fields and fields[name]:
+        if fields.get(name):
             return fields[name]
     return None
 

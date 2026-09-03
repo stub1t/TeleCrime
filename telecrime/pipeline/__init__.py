@@ -16,16 +16,16 @@ from telecrime.pipeline.parse import ParseStage
 from telecrime.pipeline.plan import PlanStage
 
 __all__ = [
-    "Pipeline",
-    "PipelineStage",
-    "PipelineContext",
-    "create_default_pipeline",
-    "IngestStage",
-    "DiscoverStage",
-    "PlanStage",
     "AcquireStage",
+    "DiscoverStage",
     "EnrichStage",
     "ExtractStage",
-    "ParseStage",
     "FinalizeStage",
+    "IngestStage",
+    "ParseStage",
+    "Pipeline",
+    "PipelineContext",
+    "PipelineStage",
+    "PlanStage",
+    "create_default_pipeline",
 ]

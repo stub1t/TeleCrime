@@ -109,10 +109,53 @@ async def test_downloading_large_files_announced(notifier):
 
 
 @pytest.mark.asyncio
-async def test_archive_parsed_skips_empty_archives(notifier):
+async def test_archive_parsed_accumulates_until_flush(notifier):
+    """Single archive_parsed must NOT send — results accumulate in the digest."""
     n, send = notifier
     await n.archive_parsed("empty.zip", 0, 0, 0)
     send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_digest_flushes_by_count(monkeypatch):
+    """After the archive cap, archive_parsed auto-flushes the digest."""
+    monkeypatch.setenv("TELECRIME_NOTIFY_DIGEST_ARCHIVES", "3")
+    client = MagicMock()
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock()
+    n = TelegramNotifier(client=client, enabled=True)
+    for i in range(3):
+        await n.archive_parsed(f"a{i}.zip", 100, 0, 1)
+    client.send_message.assert_awaited_once()
+    text = client.send_message.call_args.args[1]
+    assert "Progress digest" in text
+    assert "300" in text  # 3 × 100 new
+
+
+@pytest.mark.asyncio
+async def test_flush_noop_when_nothing_pending(notifier):
+    n, send = notifier
+    await n.flush()
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_complete_flushes_digest_before_summary(notifier):
+    """pipeline_complete emits the pending digest first, then the summary."""
+    n, send = notifier
+    await n.archive_parsed("a.zip", 50, 0, 1)
+    await n.pipeline_complete({
+        "archives_extracted": 12,
+        "credentials_parsed": 50_000,
+        "duplicates_skipped": 10_000,
+        "errors": 0,
+        "elapsed_seconds": 600,
+    })
+    assert send.await_count == 2
+    first = send.call_args_list[0].args[1]
+    second = send.call_args_list[1].args[1]
+    assert "Progress digest" in first
+    assert "Pipeline complete" in second
 
 
 @pytest.mark.asyncio

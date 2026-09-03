@@ -365,7 +365,7 @@ async def process_folder(
     limit: int | None = None,
     db_url: str | None = None,
     config_path: Path | None = None,
-) -> tuple[ProcessingStats, list[dict]]:
+) -> ProcessingStats:
     """Process all archives in a folder."""
     stats = ProcessingStats()
 
@@ -498,7 +498,7 @@ async def process_folder(
             csv_fp.close()
             logger.info("Wrote %d credentials to %s", stats.credentials_new, output_file)
 
-    return stats, []
+    return stats
 
 
 CSV_FIELDNAMES = [
@@ -605,7 +605,7 @@ def main():
         sys.exit(1)
 
     # Run processing
-    stats, _ = asyncio.run(
+    stats = asyncio.run(
         process_folder(
             args.folder,
             output_file=args.output,

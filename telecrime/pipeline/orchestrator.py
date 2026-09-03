@@ -1538,12 +1538,21 @@ async def run_sequential_pipeline(
             # run the same way.
             if notifier:
                 try:
+                    _elapsed = None
+                    if run_record is not None and run_record.started_at is not None:
+                        _started = run_record.started_at
+                        if _started.tzinfo is None:
+                            _started = _started.replace(tzinfo=UTC)
+                        _elapsed = max(
+                            0, (datetime.now(UTC) - _started).total_seconds()
+                        )
                     await notifier.pipeline_complete(
                         {
                             "archives_extracted": processed,
                             "credentials_parsed": ctx.credentials_parsed,
                             "duplicates_skipped": ctx.duplicates_skipped,
                             "errors": len(ctx.errors),
+                            "elapsed_seconds": _elapsed,
                             "Conversations": ctx.conversations_processed,
                             "Messages": ctx.messages_processed,
                             "Files discovered": ctx.files_discovered,

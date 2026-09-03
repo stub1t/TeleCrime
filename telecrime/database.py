@@ -90,7 +90,7 @@ def get_session(engine) -> Generator[Session, None, None]:
 
 def init_db(engine) -> None:
     """Create all tables. Use Alembic for production migrations."""
-    from telecrime import models as _models  # noqa: F401
+    from telecrime import models as _models
 
     for model_name in _models.__all__:
         getattr(_models, model_name)

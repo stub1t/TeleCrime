@@ -669,7 +669,7 @@ class ExtractStage(PipelineStage):
                 source_msg_id = msg.id
 
         for i, file_path in enumerate(extracted_files):
-            sha256 = hashlib.sha256()  # noqa: S324
+            sha256 = hashlib.sha256()
             file_size = 0
             with open(file_path, "rb") as f:
                 while chunk := f.read(65536):

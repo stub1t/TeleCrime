@@ -76,10 +76,9 @@ async def test_process_folder_uses_configured_data_dir(tmp_path, test_config, mo
         lambda path, ignore_errors=False: removed.append(Path(path)),
     )
 
-    stats, credentials = await process_folder(source, config_path=tmp_path / "config.toml")
+    stats = await process_folder(source, config_path=tmp_path / "config.toml")
 
     assert stats.archives_found == 0
-    assert credentials == []
     assert (test_config.data_dir / f".processed_{source.name}.txt").exists()
     assert removed == [test_config.data_dir / f".extract_temp_{source.name}"]
 
