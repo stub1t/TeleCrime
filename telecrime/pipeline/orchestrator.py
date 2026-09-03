@@ -1533,6 +1533,26 @@ async def run_sequential_pipeline(
                 ctx.credentials_parsed,
             )
 
+            # Sequential mode never sent a completion notification (only the
+            # batch Pipeline.run path did). Flush the digest and close the
+            # run the same way.
+            if notifier:
+                try:
+                    await notifier.pipeline_complete(
+                        {
+                            "archives_extracted": processed,
+                            "credentials_parsed": ctx.credentials_parsed,
+                            "duplicates_skipped": ctx.duplicates_skipped,
+                            "errors": len(ctx.errors),
+                            "Conversations": ctx.conversations_processed,
+                            "Messages": ctx.messages_processed,
+                            "Files discovered": ctx.files_discovered,
+                            "Files downloaded": ctx.files_downloaded,
+                        }
+                    )
+                except Exception as e:
+                    logger.warning("Completion notification failed: %s", e)
+
             return ctx
         finally:
             _finish_pipeline_run(

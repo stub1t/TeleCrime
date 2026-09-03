@@ -86,7 +86,7 @@ async def test_stage_complete_announces_meaningful_stages(notifier):
     await n.stage_complete("acquire", stats={"downloads": 7})
     send.assert_awaited_once()
     text = send.call_args.args[1]
-    assert "<b>Stage complete: acquire</b>" in text
+    assert "<b>Stage complete — acquire</b>" in text
     assert "downloads" in text
     assert "7" in text
 
@@ -118,10 +118,13 @@ async def test_archive_parsed_skips_empty_archives(notifier):
 @pytest.mark.asyncio
 async def test_archive_parsed_shows_dedup_pct(notifier):
     n, send = notifier
+    # Per-archive results accumulate into a digest — flush to emit.
     await n.archive_parsed("a.zip", new_credentials=200, duplicates=800, unique_domains=15)
+    await n.flush()
     text = send.call_args.args[1]
     assert "200" in text and "800" in text
     assert "80% dedup" in text
+    assert "Progress digest" in text
 
 
 @pytest.mark.asyncio
@@ -129,6 +132,7 @@ async def test_archive_name_is_html_escaped(notifier):
     n, send = notifier
     # Adversarial archive name with HTML tags + ampersand.
     await n.archive_parsed("<script>x</script>&", 1, 0, 1)
+    await n.flush()
     text = send.call_args.args[1]
     # Tag must be escaped — never appear verbatim.
     assert "<script>" not in text

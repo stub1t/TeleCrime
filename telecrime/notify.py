@@ -1,29 +1,37 @@
 """Notification system for progress updates via Telegram Saved Messages.
 
-All messages render in Telegram's HTML parse mode (broader tag set than
-Markdown V2, no special-character escaping in literal text required outside
-the few HTML reserved chars). Each notification follows a consistent layout:
+Message design
+--------------
+All messages render in Telegram's HTML parse mode and follow one consistent
+skeleton so the feed reads like a log, not a pile of one-off formats:
 
-    <ICON> <b>Title</b>
-    <i>optional subtitle</i>
+    <ICON> <b>Title</b>                     ← what happened
+    <i>2026-09-03 13:30:00 UTC</i>          ← when
+    ──────────────────────────────
+    • <b>Key:</b> value                     ← the facts
+    • <b>Key:</b> value
 
-    • Key: value
-    • Key: value
-
-`<code>…</code>` is used for verbatim data (file names, queries, IDs) so it
-renders in monospace and can be tap-to-copy on mobile. Values that came from
-the outside world (archive names, channel titles, watchlist queries, error
-text) are HTML-escaped via `_esc` before interpolation so a `<` in a stealer
-log can't break the markup.
-
-Watchlist alert hits **redact password fields** by default — they sync to all
-your devices and a shoulder surfer can read your Saved Messages. The dashboard
-shows the full record.
+Rules:
+- `<code>…</code>` is used for verbatim data (file names, queries, IDs) so it
+  renders monospace and is tap-to-copy on mobile.
+- Anything that came from the outside world (archive names, channel titles,
+  watchlist queries, error text) is HTML-escaped via `_esc` before
+  interpolation — a `<` in a stealer log cannot break the markup.
+- Per-archive parsing results are NOT sent one-by-one: a run of thousands of
+  archives would flood the feed. `archive_parsed()` accumulates into a
+  digest and `flush()` emits it every N archives or M minutes (env-tunable).
+  High-signal events (errors, watchlist hits, start/complete, summaries) are
+  still sent immediately.
+- Watchlist alert hits **redact password fields** by default — they sync to
+  all your devices and a shoulder surfer can read Saved Messages. The
+  dashboard shows the full record.
 """
 
 import asyncio
 import html
 import logging
+import os
+from collections import Counter
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +44,13 @@ logger = logging.getLogger(__name__)
 # swallowing CancelledError during a drop/reconnect loop) can never block
 # the pipeline main thread forever in a notification send.
 _SEND_TIMEOUT_SECONDS = 30
+
+# Digest flush cadence (env-tunable: TELECRIME_NOTIFY_DIGEST_ARCHIVES /
+# TELECRIME_NOTIFY_DIGEST_SECONDS).
+_DIGEST_ARCHIVES_DEFAULT = 25
+_DIGEST_SECONDS_DEFAULT = 20 * 60
+
+_DIVIDER = "─" * 30
 
 
 def _esc(value: object) -> str:
@@ -109,6 +124,11 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _header(icon: str, title: str) -> str:
+    """The standard message header: icon + title + timestamp."""
+    return f"{icon} <b>{title}</b>\n<i>{_esc(_now_iso())}</i>\n{_DIVIDER}"
+
+
 class TelegramNotifier:
     """Send progress notifications to Telegram Saved Messages."""
 
@@ -122,6 +142,25 @@ class TelegramNotifier:
         self.client = client
         self.enabled = enabled
         self._me = None
+        # Digest accumulator for per-archive parse results.
+        try:
+            self._digest_archives_cap = max(
+                1, int(os.environ.get("TELECRIME_NOTIFY_DIGEST_ARCHIVES", _DIGEST_ARCHIVES_DEFAULT))
+            )
+        except ValueError:
+            self._digest_archives_cap = _DIGEST_ARCHIVES_DEFAULT
+        try:
+            self._digest_seconds_cap = max(
+                30, int(os.environ.get("TELECRIME_NOTIFY_DIGEST_SECONDS", _DIGEST_SECONDS_DEFAULT))
+            )
+        except ValueError:
+            self._digest_seconds_cap = _DIGEST_SECONDS_DEFAULT
+        self._digest_archives = 0
+        self._digest_new = 0
+        self._digest_dups = 0
+        self._digest_domains: Counter[str] = Counter()
+        self._digest_last_archive: str | None = None
+        self._digest_since: float | None = None
 
     async def _get_me(self):
         if self._me is None:
@@ -145,6 +184,78 @@ class TelegramNotifier:
         except (Exception, asyncio.CancelledError) as e:
             logger.warning("Failed to send notification: %s", e)
 
+    # -------------------------------------------------------------- digests
+
+    async def archive_parsed(
+        self,
+        archive_name: str,
+        new_credentials: int,
+        duplicates: int,
+        unique_domains: int,
+        top_domains: list[tuple[str, int]] | None = None,
+    ):
+        """Accumulate per-archive parse results into a progress digest.
+
+        Individual archives are NOT messaged (a 2,000-archive run would
+        flood Saved Messages). Results accumulate until `flush()` decides the
+        digest is due (every N archives or M minutes).
+        """
+        del unique_domains
+        self._digest_archives += 1
+        self._digest_new += new_credentials or 0
+        self._digest_dups += duplicates or 0
+        if top_domains:
+            for domain, count in top_domains:
+                if domain:
+                    self._digest_domains[domain] += count
+        self._digest_last_archive = archive_name
+
+        now = asyncio.get_event_loop().time()
+        if self._digest_since is None:
+            self._digest_since = now
+        if (
+            self._digest_archives >= self._digest_archives_cap
+            or (now - self._digest_since) >= self._digest_seconds_cap
+        ):
+            await self.flush()
+
+    async def flush(self):
+        """Send the accumulated progress digest (if any) and reset."""
+        if not self._digest_archives:
+            return
+        new = self._digest_new
+        dups = self._digest_dups
+        total = new + dups
+        dedup_pct = ""
+        if total:
+            dedup_pct = f" ({100.0 * dups / total:.0f}% dedup)"
+
+        lines = [
+            _header("📊", "Progress digest"),
+            "",
+            f"• <b>Archives parsed:</b> {_fmt_int(self._digest_archives)}",
+            f"• <b>New credentials:</b> {_fmt_int(new)}",
+            f"• <b>Duplicates:</b> {_fmt_int(dups)}{dedup_pct}",
+        ]
+        if self._digest_last_archive:
+            lines.append(
+                f"• <b>Last archive:</b> {_code(_trunc(self._digest_last_archive, 60))}"
+            )
+        if self._digest_domains:
+            top = self._digest_domains.most_common(5)
+            lines.append("")
+            lines.append("<b>Top domains</b>")
+            for domain, count in top:
+                lines.append(f"• {_esc(_trunc(domain, 48))} — {_fmt_int(count)}")
+
+        self._digest_archives = 0
+        self._digest_new = 0
+        self._digest_dups = 0
+        self._digest_domains.clear()
+        self._digest_last_archive = None
+        self._digest_since = None
+        await self.send("\n".join(lines))
+
     # ------------------------------------------------------------------ stages
 
     async def stage_start(self, stage_name: str):
@@ -164,7 +275,7 @@ class TelegramNotifier:
         """
         if stage_name in self._NOISY_STAGE_COMPLETIONS:
             return
-        lines = [f"✅ <b>Stage complete: {_esc(stage_name)}</b>"]
+        lines = [_header("✅", f"Stage complete — {_esc(stage_name)}")]
         if stats:
             lines.append("")
             for key, value in stats.items():
@@ -182,46 +293,12 @@ class TelegramNotifier:
         if size_mb is None or size_mb < 50:
             return
         msg = (
-            "📥 <b>Downloading</b>\n"
+            f"{_header('📥', 'Downloading')}\n"
             f"{_code(_trunc(filename, 80))}\n\n"
             f"• <b>Channel:</b> {_esc(_trunc(channel, 50))}\n"
             f"• <b>Size:</b> {size_mb:,.1f} MB"
         )
         await self.send(msg)
-
-    async def archive_parsed(
-        self,
-        archive_name: str,
-        new_credentials: int,
-        duplicates: int,
-        unique_domains: int,
-        top_domains: list[tuple[str, int]] | None = None,
-    ):
-        """One message per archive when parsing completes.
-
-        Suppressed when the archive had zero hits at all (all-duplicate
-        archives flooded Saved Messages with empty notifications).
-        """
-        if not new_credentials and not duplicates:
-            return
-        total = (new_credentials or 0) + (duplicates or 0)
-        dedup_pct = ""
-        if total:
-            pct = 100.0 * (duplicates or 0) / total
-            dedup_pct = f" ({pct:.0f}% dedup)"
-        lines = [
-            f"🔑 <b>{_esc(_trunc(archive_name, 80))}</b>",
-            "",
-            f"• <b>New:</b> {_fmt_int(new_credentials)}"
-            f"  <b>Dups:</b> {_fmt_int(duplicates)}{dedup_pct}",
-            f"• <b>Unique domains:</b> {_fmt_int(unique_domains)}",
-        ]
-        if top_domains:
-            lines.append("")
-            lines.append("<b>Top</b>")
-            for domain, cnt in top_domains[:5]:
-                lines.append(f"• {_esc(_trunc(domain, 48))} — {_fmt_int(cnt)}")
-        await self.send("\n".join(lines))
 
     async def error(self, message: str, stage: str | None = None):
         """Pipeline error — formatted with stage and timestamp."""
@@ -230,7 +307,7 @@ class TelegramNotifier:
             header += f" — <i>{_esc(stage)}</i>"
         body = (
             f"{header}\n"
-            f"<i>{_esc(_now_iso())}</i>\n\n"
+            f"<i>{_esc(_now_iso())}</i>\n{_DIVIDER}\n\n"
             f"<pre>{_esc(_trunc(message, 800))}</pre>"
         )
         await self.send(body)
@@ -246,7 +323,7 @@ class TelegramNotifier:
         """Channel discovery / join summary — suppressed when nothing happened."""
         if not new_discovered and not joined:
             return
-        lines = ["📡 <b>Channels</b>"]
+        lines = [_header("📡", "Channels")]
         if new_discovered:
             lines.append(f"• <b>New discovered:</b> {_fmt_int(new_discovered)}")
         if checked:
@@ -265,12 +342,8 @@ class TelegramNotifier:
         free_disk_gb: float | None = None,
     ):
         """Pipeline run started — header includes queue + disk snapshot."""
-        lines = [
-            "🚀 <b>Pipeline started</b>",
-            f"<i>{_esc(_now_iso())}</i>",
-            "",
-            f"• <b>Targets:</b> {_esc(', '.join(target_extensions or [])) or '—'}",
-        ]
+        lines = [_header("🚀", "Pipeline started")]
+        lines.append(f"• <b>Targets:</b> {_esc(', '.join(target_extensions or [])) or '—'}")
         if queue_size is not None:
             lines.append(f"• <b>Queue:</b> {_fmt_int(queue_size)} pending archives")
         if free_disk_gb is not None:
@@ -278,32 +351,33 @@ class TelegramNotifier:
         await self.send("\n".join(lines))
 
     async def pipeline_complete(self, stats: dict):
-        """Pipeline run completed — formatted stats + derived rate."""
+        """Pipeline run completed — flush pending digest, then formatted stats."""
+        # Flush any accumulated per-archive digest FIRST so the feed shows
+        # progress up to the end, then the final summary.
+        await self.flush()
+
         archives = stats.get("archives_extracted") or stats.get("archives") or 0
         creds = stats.get("credentials_parsed") or stats.get("credentials") or 0
         dups = stats.get("duplicates_skipped") or stats.get("duplicates") or 0
         errors = stats.get("errors") or 0
         elapsed = stats.get("elapsed_seconds")
 
-        lines = [
-            "🏁 <b>Pipeline complete</b>",
-            f"<i>{_esc(_now_iso())}</i>",
-            "",
-            f"• <b>Archives:</b> {_fmt_int(archives)}",
-            f"• <b>Credentials:</b> {_fmt_int(creds)} new, {_fmt_int(dups)} dups",
-            f"• <b>Errors:</b> {_fmt_int(errors)}",
-        ]
+        lines = [_header("🏁", "Pipeline complete")]
+        lines.append(f"• <b>Archives:</b> {_fmt_int(archives)}")
+        lines.append(f"• <b>Credentials:</b> {_fmt_int(creds)} new, {_fmt_int(dups)} dups")
+        lines.append(f"• <b>Errors:</b> {_fmt_int(errors)}")
         if elapsed is not None:
             lines.append(f"• <b>Duration:</b> {_fmt_duration(elapsed)}")
             lines.append(f"• <b>Rate:</b> {_fmt_rate(creds, elapsed)} creds")
         # Surface anything else the caller passed but we didn't recognise.
+        _known = {
+            "archives_extracted", "archives",
+            "credentials_parsed", "credentials",
+            "duplicates_skipped", "duplicates",
+            "errors", "elapsed_seconds",
+        }
         for key in stats:
-            if key in {
-                "archives_extracted", "archives",
-                "credentials_parsed", "credentials",
-                "duplicates_skipped", "duplicates",
-                "errors", "elapsed_seconds",
-            }:
+            if key in _known:
                 continue
             lines.append(f"• <b>{_esc(key)}:</b> {_esc(stats[key])}")
         await self.send("\n".join(lines))
@@ -311,8 +385,7 @@ class TelegramNotifier:
     async def activity_summary(self, window_label: str, new_unique_credentials: int):
         """Hourly/daily summary of new unique credentials."""
         msg = (
-            f"📊 <b>{_esc(window_label)} summary</b>\n"
-            f"<i>{_esc(_now_iso())}</i>\n\n"
+            f"{_header('📊', f'{window_label} summary')}\n"
             f"• <b>New unique credentials:</b> {_fmt_int(new_unique_credentials)}"
         )
         await self.send(msg)
@@ -324,7 +397,7 @@ class TelegramNotifier:
         if not alerts:
             return
 
-        lines = [f"🚨 <b>Watchlist hits — {len(alerts)} item(s)</b>"]
+        lines = [_header("🚨", f"Watchlist hits — {len(alerts)} item(s)")]
         for alert in alerts[:8]:
             label = _esc(_trunc(str(alert.get("label", "")), 60))
             query = _code(_trunc(str(alert.get("query", "")), 60))
@@ -356,9 +429,3 @@ class TelegramNotifier:
         if len(alerts) > 8:
             lines.append(f"\n…and {len(alerts) - 8} more watchlist items")
         await self.send("\n".join(lines))
-
-
-# Global notifier instance (set during pipeline init)
-_notifier: TelegramNotifier | None = None
-
-
