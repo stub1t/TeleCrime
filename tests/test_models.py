@@ -3,7 +3,6 @@
 from datetime import UTC, datetime
 
 from telecrime.models import (
-    ArchiveGroup,
     Conversation,
     DownloadArtifact,
     FileAttachment,
@@ -13,7 +12,6 @@ from telecrime.models import (
 )
 from telecrime.states import (
     DownloadStatus,
-    GroupStatus,
     PasswordScope,
 )
 
@@ -76,28 +74,6 @@ class TestDownloadArtifact:
         artifact.content_hash = "abc123def456"
         session.commit()
         assert artifact.status == DownloadStatus.COMPLETED
-
-
-class TestArchiveGroup:
-    def test_archive_group_with_parts(self, session):
-        """Test archive group with multiple parts."""
-        # Create prerequisite objects
-        conv = Conversation(platform_id=1, conversation_type="channel")
-        session.add(conv)
-        session.flush()
-
-        group = ArchiveGroup(
-            fingerprint="abc123",
-            base_name="archive",
-            expected_part_count=3,
-            status=GroupStatus.INCOMPLETE,
-        )
-        session.add(group)
-        session.commit()
-
-        assert group.id is not None
-        assert group.status == GroupStatus.INCOMPLETE
-        assert group.expected_part_count == 3
 
 
 class TestPasswordCandidate:

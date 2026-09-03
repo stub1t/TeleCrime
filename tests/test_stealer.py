@@ -1,5 +1,6 @@
 """Tests for stealer log parsing."""
 
+import pytest
 
 from telecrime.stealer.models import Credential, StealerLog
 from telecrime.stealer.parser import (
@@ -143,15 +144,16 @@ class TestPatterns:
         assert "victim1/Passwords.txt" in matches
         assert "victim2/All Passwords.txt" in matches
 
-    def test_detect_stealer_type_redline(self):
-        """Test RedLine detection."""
-        files = ["DomainDetects.txt", "Passwords.txt", "InstalledBrowsers.txt"]
-        assert detect_stealer_type(files) == "redline"
-
-    def test_detect_stealer_type_raccoon(self):
-        """Test Raccoon detection."""
-        files = ["MachineInfo.txt", "Passwords.txt"]
-        assert detect_stealer_type(files) == "raccoon"
+    @pytest.mark.parametrize(
+        "files, expected",
+        [
+            (["DomainDetects.txt", "Passwords.txt", "InstalledBrowsers.txt"], "redline"),
+            (["MachineInfo.txt", "Passwords.txt"], "raccoon"),
+        ],
+    )
+    def test_detect_stealer_type_by_files(self, files, expected):
+        """Detect stealer family from file signatures."""
+        assert detect_stealer_type(files) == expected
 
     def test_detect_stealer_from_content(self):
         """Test detection from content signatures."""
@@ -218,59 +220,39 @@ Password: watchme123
         assert creds[0].application == "Chrome"
         assert creds[0].profile == "Default"
 
-    def test_parse_colon_separated(self):
-        """Test parsing url:user:pass format."""
-        text = """
-https://example.com:user1:pass1
-https://other.com:user2:pass2
-"""
-        creds = parse_credentials_text(text)
-        assert len(creds) == 2
-        assert creds[0].url == "https://example.com"
-        assert creds[0].username == "user1"
-        assert creds[0].password == "pass1"
-
-    def test_parse_pipe_separated(self):
-        """Test parsing url | user | pass format."""
-        text = """
-https://site1.com | admin | secret
-https://site2.com | root | toor
-"""
-        creds = parse_credentials_text(text)
-        assert len(creds) == 2
-        assert creds[0].url == "https://site1.com"
-        assert creds[0].username == "admin"
-        assert creds[0].password == "secret"
-
-    def test_parse_semicolon_separated(self):
-        """Test parsing url;user;pass ULP/combo list format."""
-        text = """
-https://login.example.com;user@example.com;p@ssw0rd
-https://accounts.site.org;admin;hunter2
-"""
-        creds = parse_credentials_text(text)
-        assert len(creds) == 2
-        assert creds[0].url == "https://login.example.com"
-        assert creds[0].username == "user@example.com"
-        assert creds[0].password == "p@ssw0rd"
-        assert creds[1].url == "https://accounts.site.org"
-        assert creds[1].username == "admin"
-        assert creds[1].password == "hunter2"
-
-    def test_parse_semicolon_streaming(self, tmp_path):
-        """Semicolon format is parsed in streaming iter_credentials_file path."""
+    @pytest.mark.parametrize(
+        "text, url, username, password",
+        [
+            ("https://example.com:user1:pass1\nhttps://other.com:user2:pass2",
+             "https://example.com", "user1", "pass1"),
+            ("https://host:8080:user1:pass1", "https://host:8080", "user1", "pass1"),
+            ("https://site1.com | admin | secret\nhttps://site2.com | root | toor",
+             "https://site1.com", "admin", "secret"),
+            ("https://login.example.com;user@example.com;p@ssw0rd",
+             "https://login.example.com", "user@example.com", "p@ssw0rd"),
+        ],
+    )
+    def test_separator_formats_dual_path(self, tmp_path, text, url, username, password):
+        """Each separator format parses identically through the text parser AND
+        the production streaming path (regression: the streaming colon branch
+        had zero coverage and drifted from the text parser)."""
         from telecrime.stealer.parser import iter_credentials_file
 
+        # Text entry point
+        creds = parse_credentials_text(text)
+        assert creds
+        assert creds[0].url == url
+        assert creds[0].username == username
+        assert creds[0].password == password
+
+        # Streaming entry point (production)
         f = tmp_path / "Passwords.txt"
-        f.write_text(
-            "https://a.com;alice;pw1\nhttps://b.com;bob;pw2\n",
-            encoding="utf-8",
-        )
-        creds = list(iter_credentials_file(f))
-        assert len(creds) == 2
-        assert creds[0].url == "https://a.com"
-        assert creds[0].username == "alice"
-        assert creds[0].password == "pw1"
+        f.write_text(text + "\n", encoding="utf-8")
+        streamed = list(iter_credentials_file(f))
+        assert streamed
+        assert streamed[0].url == url
+        assert streamed[0].username == username
+        assert streamed[0].password == password
 
     def test_parse_semicolon_password_with_semicolon(self):
         """Password field may contain semicolons after the second delimiter."""
@@ -484,39 +466,33 @@ class TestExpandedStealerDetection:
     """Tests for expanded stealer family detection (E2)."""
 
     # File-based signatures
-    def test_detect_vidar_by_files(self):
-        assert detect_stealer_type(["userinfo.txt", "passwords.txt", "cookies.txt"]) == "vidar"
-
-    def test_detect_aurora_by_filename(self):
-        assert detect_stealer_type(["aurora_passwords.txt", "cookies.txt"]) == "aurora"
-
-    def test_detect_mystic_by_filename(self):
-        assert detect_stealer_type(["mystic_passwords.txt"]) == "mystic"
-
-    def test_detect_doenerium_by_filename(self):
-        assert detect_stealer_type(["doen_passwords.txt", "Passwords.txt"]) == "doenerium"
-
-    def test_detect_cryptbot_by_filename(self):
-        assert detect_stealer_type(["cryptbot_passwords.txt"]) == "cryptbot"
-
-    def test_detect_cinoshi_by_filename(self):
-        assert detect_stealer_type(["cinoshi_passwords.txt"]) == "cinoshi"
-
-    def test_detect_titan_by_filename(self):
-        assert detect_stealer_type(["titan_stealer_passwords.txt"]) == "titan"
+    @pytest.mark.parametrize(
+        "files, expected",
+        [
+            (["userinfo.txt", "passwords.txt", "cookies.txt"], "vidar"),
+            (["aurora_passwords.txt", "cookies.txt"], "aurora"),
+            (["mystic_passwords.txt"], "mystic"),
+            (["doen_passwords.txt", "Passwords.txt"], "doenerium"),
+            (["cryptbot_passwords.txt"], "cryptbot"),
+            (["cinoshi_passwords.txt"], "cinoshi"),
+            (["titan_stealer_passwords.txt"], "titan"),
+        ],
+    )
+    def test_detect_stealer_by_files(self, files, expected):
+        assert detect_stealer_type(files) == expected
 
     # Content-based signatures
-    def test_detect_aurora_from_content(self):
-        assert detect_stealer_type(["Passwords.txt"], content_sample="Aurora Stealer v1.0") == "aurora"
-
-    def test_detect_mystic_from_content(self):
-        assert detect_stealer_type(["Passwords.txt"], content_sample="MysticStealer build 2024") == "mystic"
-
-    def test_detect_doenerium_from_content(self):
-        assert detect_stealer_type(["Passwords.txt"], content_sample="Doenerium Grabber") == "doenerium"
-
-    def test_detect_titan_from_content(self):
-        assert detect_stealer_type(["Passwords.txt"], content_sample="titan stealer panel") == "titan"
+    @pytest.mark.parametrize(
+        "content, expected",
+        [
+            ("Aurora Stealer v1.0", "aurora"),
+            ("MysticStealer build 2024", "mystic"),
+            ("Doenerium Grabber", "doenerium"),
+            ("titan stealer panel", "titan"),
+        ],
+    )
+    def test_detect_stealer_from_content(self, content, expected):
+        assert detect_stealer_type(["Passwords.txt"], content_sample=content) == expected
 
     # SystemInfo self-identification (highest priority)
     def test_sysinfo_overrides_file_signature(self):

@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from telecrime.grouping.heuristics import (
     _derive_base_name,
     extract_caption_hints,
@@ -16,106 +18,39 @@ from telecrime.grouping.patterns import (
 class TestExtractBaseAndPart:
     """Tests for extract_base_and_part function."""
 
-    def test_rar_part_format(self):
-        """Test .partN.rar format."""
-        base, part, total = extract_base_and_part("archive.part1.rar")
-        assert base == "archive"
-        assert part == 1
-        assert total is None
+    @pytest.mark.parametrize(
+        "filename, base, part, total",
+        [
+            ("archive.part1.rar", "archive", 1, None),
+            ("archive.part01.rar", "archive", 1, None),
+            ("archive.part123.rar", "archive", 123, None),
+            ("archive.part1.zip", "archive", 1, None),
+            ("archive.part2.7z", "archive", 2, None),
+            ("archive.part01.zip", "archive", 1, None),
+            ("archive.r00", "archive", 0, None),
+            ("archive.r01", "archive", 1, None),
+            ("archive.r99", "archive", 99, None),
+            ("archive.7z.001", "archive", 1, None),
+            ("archive.7z.002", "archive", 2, None),
+            ("archive.zip.001", "archive", 1, None),
+            ("archive.z01", "archive", 1, None),
+            ("archive.001", "archive", 1, None),
+            ("large_file.003", "large_file", 3, None),
+            ("archive_vol1.zip", "archive", 1, None),
+            ("data-volume-2.rar", "data-volume-2", None, None),
+            ("archive_1of3.zip", "archive", 1, 3),
+            ("data-2of5.rar", "data", 2, 5),
+            ("ARCHIVE.PART1.RAR", "ARCHIVE", 1, None),
+            ("Data.7Z.001", "Data", 1, None),
+        ],
+    )
+    def test_extract_base_and_part(self, filename, base, part, total):
+        """Pure filename table for extract_base_and_part."""
+        result_base, result_part, result_total = extract_base_and_part(filename)
+        assert result_base == base
+        assert result_part == part
+        assert result_total == total
 
-        base, part, total = extract_base_and_part("archive.part01.rar")
-        assert base == "archive"
-        assert part == 1
-
-        base, part, total = extract_base_and_part("archive.part123.rar")
-        assert base == "archive"
-        assert part == 123
-
-    def test_zip_and_7z_part_formats(self):
-        """.partN.zip/.partN.7z must be detected as splits too.
-
-        Regression: only .partN.rar matched, so .partN.zip/.7z archives
-        (the dominant Telegram repost format) were planned as N standalone
-        groups and every part failed extraction.
-        """
-        base, part, total = extract_base_and_part("archive.part1.zip")
-        assert base == "archive"
-        assert part == 1
-
-        base, part, total = extract_base_and_part("archive.part2.7z")
-        assert base == "archive"
-        assert part == 2
-
-        base, part, total = extract_base_and_part("archive.part01.zip")
-        assert base == "archive"
-        assert part == 1
-
-    def test_rar_old_style(self):
-        """Test .r00, .r01 format."""
-        base, part, total = extract_base_and_part("archive.r00")
-        assert base == "archive"
-        assert part == 0
-
-        base, part, total = extract_base_and_part("archive.r01")
-        assert base == "archive"
-        assert part == 1
-
-        base, part, total = extract_base_and_part("archive.r99")
-        assert base == "archive"
-        assert part == 99
-
-    def test_7z_split_format(self):
-        """Test .7z.001 format."""
-        base, part, total = extract_base_and_part("archive.7z.001")
-        assert base is not None  # Base name extracted
-        assert part == 1
-
-        base, part, total = extract_base_and_part("archive.7z.002")
-        assert base is not None
-        assert part == 2
-
-    def test_zip_split_format(self):
-        """Test .zip.001 and .z01 formats."""
-        base, part, total = extract_base_and_part("archive.zip.001")
-        assert base is not None  # Base name extracted
-        assert part == 1
-
-        base, part, total = extract_base_and_part("archive.z01")
-        assert base is not None
-        assert part == 1
-
-    def test_generic_split_format(self):
-        """Test generic .001, .002 format."""
-        base, part, total = extract_base_and_part("archive.001")
-        assert base == "archive"
-        assert part == 1
-
-        base, part, total = extract_base_and_part("large_file.003")
-        assert base == "large_file"
-        assert part == 3
-
-    def test_volume_format(self):
-        """Test volume1.zip, vol2.rar formats."""
-        base, part, total = extract_base_and_part("archive_vol1.zip")
-        assert base == "archive"
-        assert part == 1
-
-        base, part, total = extract_base_and_part("data-volume-2.rar")
-        assert base == "data-volume-2"
-        assert part is None
-
-    def test_xofy_format(self):
-        """Test 1of3.zip format."""
-        base, part, total = extract_base_and_part("archive_1of3.zip")
-        assert base == "archive"
-        assert part == 1
-        assert total == 3
-
-        # Regression: the generic .rar pattern must not shadow the XofY match
-        base, part, total = extract_base_and_part("data-2of5.rar")
-        assert base == "data"
-        assert part == 2
-        assert total == 5
     def test_no_match(self):
         """Test non-split archive filenames."""
         base, part, total = extract_base_and_part("archive.zip")

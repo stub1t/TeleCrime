@@ -147,92 +147,34 @@ class TestSevenZipExtractor:
         assert result.wrong_password is True
         assert mock_process.wait.await_count == 1
 
-    def test_parse_result_wrong_password(self):
-        """Test parsing wrong password error."""
+    @pytest.mark.parametrize(
+        "rc, stdout, stderr, success, error_code, wrong_password, needs_password",
+        [
+            (2, "", "Wrong password", False, "WRONG_PASSWORD", True, False),
+            (2, "Data Error in encrypted file", "", False, "WRONG_PASSWORD", True, False),
+            (2, "Data Error : some_file.txt", "", False, "CORRUPTED", False, False),
+            (2, "Enter password", "", False, "PASSWORD_REQUIRED", False, True),
+            (2, "Cannot open the file", "", False, "CANNOT_OPEN", False, False),
+            (2, "Unsupported archive type", "", False, "UNSUPPORTED_FORMAT", False, False),
+            (1, "", "some other failure", False, "EXIT_1", False, False),
+        ],
+    )
+    def test_parse_result_error_cases(
+        self, rc, stdout, stderr, success, error_code, wrong_password, needs_password
+    ):
+        """Table-driven _parse_result error classification."""
         extractor = SevenZipExtractor()
         result = extractor._parse_result(
-            return_code=2,
-            stdout="",
-            stderr="Wrong password",
+            return_code=rc,
+            stdout=stdout,
+            stderr=stderr,
             output_dir=Path("/tmp"),
             target_extensions=None,
         )
-
-        assert result.success is False
-        assert result.error_code == "WRONG_PASSWORD"
-        assert result.wrong_password is True
-
-    def test_parse_result_data_error_encrypted(self):
-        """Test parsing data error in encrypted file (wrong password)."""
-        extractor = SevenZipExtractor()
-        result = extractor._parse_result(
-            return_code=2,
-            stdout="Data Error in encrypted file",
-            stderr="",
-            output_dir=Path("/tmp"),
-            target_extensions=None,
-        )
-
-        assert result.success is False
-        assert result.wrong_password is True
-        assert result.error_code == "WRONG_PASSWORD"
-
-    def test_parse_result_data_error_corrupted(self):
-        """Test parsing data error without encryption context (corruption)."""
-        extractor = SevenZipExtractor()
-        result = extractor._parse_result(
-            return_code=2,
-            stdout="Data Error : some_file.txt",
-            stderr="",
-            output_dir=Path("/tmp"),
-            target_extensions=None,
-        )
-
-        assert result.success is False
-        assert result.wrong_password is False
-        assert result.error_code == "CORRUPTED"
-
-    def test_parse_result_password_required(self):
-        """Test parsing password required error."""
-        extractor = SevenZipExtractor()
-        result = extractor._parse_result(
-            return_code=2,
-            stdout="Enter password",
-            stderr="",
-            output_dir=Path("/tmp"),
-            target_extensions=None,
-        )
-
-        assert result.success is False
-        assert result.needs_password is True
-
-    def test_parse_result_cannot_open(self):
-        """Test parsing cannot open error."""
-        extractor = SevenZipExtractor()
-        result = extractor._parse_result(
-            return_code=2,
-            stdout="Cannot open the file",
-            stderr="",
-            output_dir=Path("/tmp"),
-            target_extensions=None,
-        )
-
-        assert result.success is False
-        assert result.error_code == "CANNOT_OPEN"
-
-    def test_parse_result_unsupported(self):
-        """Test parsing unsupported format error."""
-        extractor = SevenZipExtractor()
-        result = extractor._parse_result(
-            return_code=2,
-            stdout="Unsupported archive type",
-            stderr="",
-            output_dir=Path("/tmp"),
-            target_extensions=None,
-        )
-
-        assert result.success is False
-        assert result.error_code == "UNSUPPORTED_FORMAT"
+        assert result.success is success
+        assert result.error_code == error_code
+        assert result.wrong_password is wrong_password
+        assert result.needs_password is needs_password
 
     def test_parse_result_success(self, tmp_path):
         """Test parsing successful extraction."""

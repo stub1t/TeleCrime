@@ -188,69 +188,54 @@ class TestGetDefaultPaths:
 class TestApplyEnvVars:
     """Tests for _apply_env_vars function."""
 
-    def test_database_url_from_env(self):
-        """Test TELECRIME_DATABASE_URL environment variable."""
+    @pytest.mark.parametrize(
+        "env_var, value, attribute_path, expected",
+        [
+            ("TELECRIME_DATABASE_URL",
+             "postgresql://user:pass@db:5432/telecrime",
+             "database_url",
+             "postgresql://user:pass@db:5432/telecrime"),
+            ("TELECRIME_TELEGRAM_API_ID", "12345", "telegram.api_id", 12345),
+            ("TELECRIME_TELEGRAM_API_HASH",
+             "TEST_API_HASH_0123456789abcdef",
+             "telegram.api_hash",
+             "TEST_API_HASH_0123456789abcdef"),
+            ("TELECRIME_TELEGRAM_AUX_SESSION_NAME", "tc_aux", "telegram.aux_session_name", "tc_aux"),
+            ("TELECRIME_TELEGRAM_PHONE", "+15551234567", "telegram.phone", "+15551234567"),
+            ("TELECRIME_PARALLEL_CHUNKS", "4", "download.parallel_chunks", 4),
+            ("TELECRIME_DOWNLOAD_SESSIONS", "dl2, dl3 ,dl4",
+             "telegram.download_session_names", ["dl2", "dl3", "dl4"]),
+        ],
+    )
+    def test_env_overrides(self, env_var, value, attribute_path, expected):
+        """Each documented env var is applied by _apply_env_vars."""
         config = Config()
-
-        with patch.dict(
-            os.environ,
-            {"TELECRIME_DATABASE_URL": "postgresql://user:pass@db:5432/telecrime"},
-        ):
+        with patch.dict(os.environ, {env_var: value}):
             _apply_env_vars(config)
-
-        assert config.database_url == "postgresql://user:pass@db:5432/telecrime"
+        obj = config
+        for attr in attribute_path.split("."):
+            obj = getattr(obj, attr)
+        assert obj == expected
 
     def test_data_dir_from_env(self):
-        """Test TELECRIME_DATA_DIR environment variable."""
+        """TELECRIME_DATA_DIR also rewires the derived downloads/extracted dirs."""
         config = Config()
-
         with patch.dict(os.environ, {"TELECRIME_DATA_DIR": "/custom/data"}):
             _apply_env_vars(config)
-
         assert config.data_dir == Path("/custom/data")
         assert config.downloads_dir == Path("/custom/data/downloads")
         assert config.extracted_dir == Path("/custom/data/extracted")
 
-    def test_telegram_api_id_from_env(self):
-        """Test TELECRIME_TELEGRAM_API_ID environment variable."""
-        config = Config()
-
-        with patch.dict(os.environ, {"TELECRIME_TELEGRAM_API_ID": "12345"}):
-            _apply_env_vars(config)
-
-        assert config.telegram.api_id == 12345
-
-    def test_telegram_api_hash_from_env(self):
-        """Test TELECRIME_TELEGRAM_API_HASH environment variable."""
-        config = Config()
-
-        with patch.dict(os.environ, {"TELECRIME_TELEGRAM_API_HASH": "TEST_API_HASH_0123456789abcdef"}):
-            _apply_env_vars(config)
-
-        assert config.telegram.api_hash == "TEST_API_HASH_0123456789abcdef"
-
     def test_target_extensions_from_env(self):
-        """Test TELECRIME_TARGET_EXTENSIONS environment variable."""
+        """TELECRIME_TARGET_EXTENSIONS replaces the default target set."""
         config = Config()
-
+        original_extensions = config.extraction.target_extensions.copy()
         with patch.dict(os.environ, {"TELECRIME_TARGET_EXTENSIONS": ".mobi, .azw3, .fb2"}):
             _apply_env_vars(config)
-
         assert ".mobi" in config.extraction.target_extensions
         assert ".azw3" in config.extraction.target_extensions
         assert ".fb2" in config.extraction.target_extensions
-
-    def test_env_vars_override_defaults(self):
-        """Test environment variables override default values."""
-        config = Config()
-        original_extensions = config.extraction.target_extensions.copy()
-
-        with patch.dict(os.environ, {"TELECRIME_TARGET_EXTENSIONS": ".custom"}):
-            _apply_env_vars(config)
-
         assert config.extraction.target_extensions != original_extensions
-        assert ".custom" in config.extraction.target_extensions
-
 
 class TestLoadConfig:
     """Tests for load_config function."""

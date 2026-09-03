@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -183,3 +184,36 @@ async def test_parallel_download_writes_all_bytes(tmp_path):
         assert file_size == size
         assert offset < size
         assert stride == n * 512 * 1024
+
+
+@pytest.mark.asyncio
+async def test_iter_messages_raises_on_cancelled():
+    """A Telethon CancelledError (connection drop) must raise, not silently
+    end iteration — the silent path let ingest advance its checkpoint past
+    unfetched messages (round-5 fix)."""
+    from telecrime.adapters.telegram import TelegramAdapter
+
+    config = MagicMock()
+    config.telegram.api_id = 1
+    config.telegram.api_hash = "x"
+    config.telegram.session_name = "test"
+    adapter = TelegramAdapter(config)
+
+    client = AsyncMock()
+    adapter.client = client
+    from datetime import UTC, datetime
+
+    msg = MagicMock()
+    msg.id = 1
+    msg.date = datetime.now(UTC)
+    msg.fwd_from = None
+    msg.message = "x"
+
+    async def _boom():
+        yield msg
+        raise asyncio.CancelledError
+
+    client.iter_messages = lambda **kw: _boom()
+    with pytest.raises(RuntimeError):
+        async for _ in adapter.iter_messages(1, min_id=0):
+            pass

@@ -240,3 +240,35 @@ async def test_watchlist_empty_is_silent(notifier):
     n, send = notifier
     await n.watchlist_alerts([])
     send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_digest_flushes_by_time(monkeypatch):
+    """After the time cap, the next archive_parsed flushes the digest."""
+    import asyncio
+
+    monkeypatch.setenv("TELECRIME_NOTIFY_DIGEST_SECONDS", "30")
+    client = MagicMock()
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock()
+    n = TelegramNotifier(client=client, enabled=True)
+    # Fast-forward the time window past the cap.
+    n._digest_seconds_cap = 30
+    n._digest_since = asyncio.get_event_loop().time() - 60
+    await n.archive_parsed("a.zip", 10, 0, 1)
+    client.send_message.assert_awaited_once()
+    text = client.send_message.call_args.args[1]
+    assert "Progress digest" in text
+
+
+@pytest.mark.asyncio
+async def test_pipeline_start_and_activity_summary_render(notifier):
+    """pipeline_start / activity_summary / channels_discovered render headers."""
+    n, send = notifier
+    await n.pipeline_start([".txt"], queue_size=5, free_disk_gb=42.5)
+    await n.activity_summary("Last hour", 1234)
+    await n.channels_discovered(new_discovered=2, checked=5, joined=1)
+    assert send.await_count == 3
+    assert "Pipeline started" in send.call_args_list[0].args[1]
+    assert "Last hour summary" in send.call_args_list[1].args[1]
+    assert "Channels" in send.call_args_list[2].args[1]

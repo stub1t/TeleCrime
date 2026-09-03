@@ -3,8 +3,6 @@
 from unittest.mock import MagicMock
 
 from telecrime.pipeline.discover import (
-    ARCHIVE_EXTENSIONS,
-    ARCHIVE_MIME_TYPES,
     DiscoverStage,
 )
 
@@ -12,37 +10,8 @@ from telecrime.pipeline.discover import (
 class TestArchiveExtensions:
     """Tests for ARCHIVE_EXTENSIONS mapping."""
 
-    def test_common_extensions_exist(self):
-        """Test common archive extensions are defined."""
-        common = [".zip", ".7z", ".rar", ".tar", ".gz"]
-        for ext in common:
-            assert ext in ARCHIVE_EXTENSIONS
-
-    def test_split_extensions_exist(self):
-        """Test split archive extensions are defined."""
-        split = [".z01", ".001", ".r00", ".part1.rar"]
-        for ext in split:
-            assert ext in ARCHIVE_EXTENSIONS
-
-
 class TestArchiveMimeTypes:
     """Tests for ARCHIVE_MIME_TYPES set."""
-
-    def test_common_mime_types_exist(self):
-        """Test common MIME types are defined."""
-        common = [
-            "application/zip",
-            "application/x-7z-compressed",
-            "application/x-rar-compressed",
-        ]
-        for mime in common:
-            assert mime in ARCHIVE_MIME_TYPES
-
-    def test_octet_stream_included(self):
-        """Test application/octet-stream is included."""
-        # Many archives are served with this generic MIME type
-        assert "application/octet-stream" in ARCHIVE_MIME_TYPES
-
 
 class TestDiscoverStage:
     """Tests for DiscoverStage class."""

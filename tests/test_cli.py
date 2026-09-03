@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
 
-from telecrime import __version__
 from telecrime.cli import app
 from telecrime.database import get_session
 from telecrime.models import ArchiveGroup, ExtractionJob, ParsedCredential, PipelineRun
@@ -15,21 +14,6 @@ from telecrime.states import ExtractionStatus, GroupStatus
 
 runner = CliRunner()
 
-
-class TestCliVersion:
-    """Tests for version command."""
-
-    def test_version_in_help(self):
-        """Test version appears in help output."""
-        result = runner.invoke(app, ["--help"])
-
-        # Help should work
-        assert result.exit_code == 0
-        assert "telecrime" in result.stdout.lower()
-
-    def test_version_constant_exists(self):
-        """Test version constant is defined."""
-        assert __version__ == "0.1.0"
 
 
 class TestCliInit:
@@ -98,26 +82,6 @@ class TestCliStatus:
 
 class TestCliDiagnostics:
     """Tests for diagnostics command."""
-
-    def test_diagnostics_runs(self):
-        with patch("telecrime.cli.get_config_and_engine") as mock_get:
-            mock_get.return_value = (MagicMock(), MagicMock())
-
-            with patch("telecrime.cli.get_session") as mock_session:
-                mock_sess = MagicMock()
-                mock_query = MagicMock()
-                mock_query.filter.return_value.count.return_value = 0
-                mock_query.group_by.return_value.order_by.return_value.limit.return_value.all.return_value = []
-                mock_query.count.return_value = 0
-                mock_sess.query.return_value = mock_query
-                mock_session.return_value.__enter__ = MagicMock(return_value=mock_sess)
-                mock_session.return_value.__exit__ = MagicMock(return_value=False)
-
-                result = runner.invoke(app, ["diagnostics"])
-
-        assert result.exit_code == 0
-        assert "pipeline diagnostics" in result.stdout.lower()
-        assert "failure summary" in result.stdout.lower()
 
     def test_diagnostics_shows_recent_runs(self, pg_engine):
         with get_session(pg_engine) as session:

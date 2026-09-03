@@ -475,3 +475,34 @@ async def _read_streaming_body(response) -> str:
     async for chunk in response.body_iterator:
         chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
     return b"".join(chunks).decode()
+
+
+def test_parse_query_unbalanced_quote_falls_back():
+    """An unbalanced quote must not 500 — the whole input becomes one term
+    (round-3 fix)."""
+    from telecrime.web.app import _parse_query
+
+    terms, filters = _parse_query('foo"bar')
+    assert "foo\"bar" in terms
+    assert filters == {}
+
+
+def test_parse_query_extracts_filters():
+    from telecrime.web.app import _parse_query
+
+    terms, filters = _parse_query("admin domain:example.com stealer:redline")
+    assert "admin" in terms
+    assert filters.get("domain") == ["example.com"]
+    assert filters.get("stealer") == ["redline"]
+
+
+def test_errors_json_count_tolerates_malformed():
+    """errors_json can be null/plain text/partial JSON — count must not crash
+    (round-3 fix)."""
+    from telecrime.web.app import _errors_json_count
+
+    assert _errors_json_count(None) == 0
+    assert _errors_json_count("") == 0
+    assert _errors_json_count("not json") == 0
+    assert _errors_json_count('{"a": 1}') == 0
+    assert _errors_json_count('["one", "two"]') == 2

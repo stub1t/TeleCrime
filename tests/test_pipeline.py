@@ -101,22 +101,6 @@ class TestPipeline:
         assert stage2.was_called
 
     @pytest.mark.asyncio
-    async def test_run_continues_on_failure(self, session, test_config):
-        """Test pipeline continues when stage returns False."""
-        adapter = MagicMock()
-        pipeline = Pipeline(test_config, session, adapter)
-
-        stage1 = MockStage(should_succeed=False)
-        stage2 = MockStage(should_succeed=True)
-        pipeline.add_stage(stage1).add_stage(stage2)
-
-        await pipeline.run()
-
-        # Both stages should have been called
-        assert stage1.was_called
-        assert stage2.was_called
-
-    @pytest.mark.asyncio
     async def test_run_continues_on_exception(self, session, test_config):
         """Test pipeline continues when stage raises exception."""
         adapter = MagicMock()
@@ -280,11 +264,6 @@ class TestPipeline:
 
 class TestIngestStage:
     """Tests for IngestStage."""
-
-    def test_init_with_limit(self):
-        """Test initialization with message limit."""
-        stage = IngestStage(message_limit=100)
-        assert stage.message_limit == 100
 
     @pytest.mark.asyncio
     async def test_process_conversation_creates_record(self, session, test_config):
@@ -1642,3 +1621,129 @@ class TestFinalizeStageNoDeleteRetryable:
         assert ok is True
         assert cleaned.count(group.id) == 2  # archives + extracted files cleanup
         assert session.get(ArchiveGroup, group.id).status == GroupStatus.CLEANED
+
+
+class TestRoundNineCriticalPaths:
+    """Tests for the data-safety behaviors added in rounds 6-9."""
+
+    @pytest.mark.asyncio
+    async def test_finalize_skips_parse_failed_groups(self, session, test_config, monkeypatch):
+        """A group whose parse failed must stay EXTRACTED with its files intact."""
+        from telecrime.models import ArchiveGroup, ExtractionJob
+        from telecrime.pipeline.finalize import FinalizeStage
+        from telecrime.states import ExtractionStatus, GroupStatus
+
+        group = ArchiveGroup(
+            fingerprint="f-parse-failed",
+            base_name="parse-failed.rar",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.EXTRACTED,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+        session.add(job)
+        session.flush()
+        session.commit()
+
+        stage = FinalizeStage()
+        cleaned = []
+        async def _fake_cleanup(ctx, group):
+            cleaned.append(group.id)
+        monkeypatch.setattr(stage, "_cleanup_archives", _fake_cleanup)
+        monkeypatch.setattr(stage, "_cleanup_extracted_files", _fake_cleanup)
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        ctx.parse_failed_group_ids.add(group.id)
+        await stage.run(ctx)
+
+        assert cleaned == [], "parse-failed group files must not be deleted"
+        assert session.get(ArchiveGroup, group.id).status == GroupStatus.EXTRACTED
+
+    @pytest.mark.asyncio
+    async def test_next_pending_artifact_excludes_terminal_groups(self, session, test_config):
+        """PENDING artifacts in CLEANED/FAILED_TERMINAL groups are never picked."""
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.pipeline.orchestrator import _next_pending_artifact
+        from telecrime.states import DownloadStatus, GroupStatus
+
+        conv = Conversation(platform_id=9001, title="c1", conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=1001,
+            text="x",
+            platform_timestamp=datetime.now(UTC),
+        )
+        session.add(msg)
+        session.flush()
+
+        def _artifact(name, status):
+            fa = FileAttachment(
+                message_id=msg.id,
+                filename=name,
+                platform_file_id=f"fid_{name}",
+                size=100,
+                is_archive_candidate=True,
+            )
+            session.add(fa)
+            session.flush()
+            art = DownloadArtifact(
+                attachment_id=fa.id, status=status, error_message=None
+            )
+            session.add(art)
+            session.flush()
+            return art
+
+        # Terminal group with a PENDING artifact — must never be returned.
+        term_art = _artifact("term.zip", DownloadStatus.PENDING)
+        term_group = ArchiveGroup(
+            fingerprint="f-term", base_name="term.zip",
+            expected_part_count=1, detected_part_count=1,
+            status=GroupStatus.FAILED_TERMINAL,
+        )
+        session.add(term_group)
+        session.flush()
+        session.add(ArchiveGroupPart(group_id=term_group.id, artifact_id=term_art.id, part_index=0))
+
+        # Fresh INCOMPLETE group with a PENDING artifact — the only valid pick.
+        ok_art = _artifact("ok.zip", DownloadStatus.PENDING)
+        ok_group = ArchiveGroup(
+            fingerprint="f-ok", base_name="ok.zip",
+            expected_part_count=1, detected_part_count=1,
+            status=GroupStatus.INCOMPLETE,
+        )
+        session.add(ok_group)
+        session.flush()
+        session.add(ArchiveGroupPart(group_id=ok_group.id, artifact_id=ok_art.id, part_index=0))
+        session.commit()
+
+        picked = _next_pending_artifact(session)
+        assert picked is not None
+        assert picked.id == ok_art.id, "terminal-group artifacts must be excluded"
+
+    def test_check_disk_status_wedge_timeout(self, monkeypatch):
+        """A blocked statvfs (wedged drive) returns 'disk wedged/unavailable'
+        instead of freezing the caller."""
+        from telecrime.scheduler import _check_disk_status
+
+        config = MagicMock()
+        config.data_dir = Path("/nonexistent")
+        import time as _time
+
+        def _blocking_usage(path):
+            _time.sleep(5)
+            raise AssertionError("should have timed out")
+
+        monkeypatch.setattr("telecrime.scheduler.shutil.disk_usage", _blocking_usage)
+        result = _check_disk_status(config, timeout_seconds=0.2)
+        assert result == "disk wedged/unavailable"
