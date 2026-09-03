@@ -1007,7 +1007,9 @@ def _ensure_stats_indexes(engine) -> None:
         ("ix_download_artifacts_attachment", "ON download_artifacts(attachment_id)"),
         ("ix_download_artifacts_status", "ON download_artifacts(status)"),
         ("ix_parsed_credentials_created_at", "ON parsed_credentials(created_at)"),
-        ("ix_parsed_credentials_source_conversation_id", "ON parsed_credentials(source_conversation_id)"),
+        # NOTE: no source_conversation_id index here — migration x4y5z6a7b8c9
+        # deliberately dropped it (1.5GB, zero scans); recreating it only
+        # adds insert-maintenance cost.
         ("ix_extracted_outputs_created_at", "ON extracted_outputs(created_at)"),
         ("ix_extracted_outputs_source_conversation", "ON extracted_outputs(source_conversation_id)"),
         ("ix_telegram_channels_discovered", "ON telegram_channels(discovered_at)"),
@@ -2166,6 +2168,16 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
+        # The watchlist worker is lightweight (bounded incremental ILIKE
+        # counts) and must run even when the heavy stats workers are
+        # disabled — otherwise watchlist badges/alerts go stale for the whole
+        # multi-day parse window.
+        watchlist_thread = threading.Thread(
+            target=_watchlist_worker,
+            args=(worker_database_url, 1800),
+            daemon=True,
+        )
+        watchlist_thread.start()
         if not os.environ.get("TELECRIME_DISABLE_STATS_WORKER") == "1":
             stats_worker = threading.Thread(
                 target=_stats_worker,
@@ -2179,12 +2191,6 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 daemon=True,
             )
             home_worker.start()
-            watchlist_thread = threading.Thread(
-                target=_watchlist_worker,
-                args=(worker_database_url, 1800),
-                daemon=True,
-            )
-            watchlist_thread.start()
         yield
 
     app = FastAPI(title="Telecrime Dashboard", lifespan=_lifespan)

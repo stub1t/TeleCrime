@@ -133,7 +133,7 @@ async def test_process_archive_uses_domain_hash_dedup(tmp_path, pg_engine, monke
 
     stats = ProcessingStats()
     with session_factory() as session:
-        csv_rows = await process_archive(
+        success = await process_archive(
             archive,
             FakeExtractor(),
             output_dir,
@@ -144,10 +144,10 @@ async def test_process_archive_uses_domain_hash_dedup(tmp_path, pg_engine, monke
 
         stored = session.query(ParsedCredential).all()
 
+    assert success is True
     assert len(stored) == 1
     assert stored[0].credential_hash == ParsedCredential.compute_hash(
         "example.com", "alice", "secret"
     )
     assert stats.credentials_new == 1
     assert stats.credentials_duplicate == 1
-    assert len(csv_rows) == 1

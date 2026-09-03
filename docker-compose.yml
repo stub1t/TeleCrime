@@ -7,7 +7,9 @@ services:
       -c effective_cache_size=${TELECRIME_POSTGRES_EFFECTIVE_CACHE_SIZE:-4GB}
       -c work_mem=${TELECRIME_POSTGRES_WORK_MEM:-4MB}
       -c maintenance_work_mem=${TELECRIME_POSTGRES_MAINTENANCE_WORK_MEM:-64MB}
-      -c max_wal_size=${TELECRIME_POSTGRES_MAX_WAL_SIZE:-1GB}
+      -c max_wal_size=${TELECRIME_POSTGRES_MAX_WAL_SIZE:-8GB}
+      -c checkpoint_timeout=${TELECRIME_POSTGRES_CHECKPOINT_TIMEOUT:-30min}
+      -c wal_buffers=${TELECRIME_POSTGRES_WAL_BUFFERS:-64MB}
       -c statement_timeout=${TELECRIME_POSTGRES_STATEMENT_TIMEOUT:-5min}
       -c lock_timeout=${TELECRIME_POSTGRES_LOCK_TIMEOUT:-30s}
       -c idle_in_transaction_session_timeout=${TELECRIME_POSTGRES_IDLE_TRANSACTION_TIMEOUT:-10min}

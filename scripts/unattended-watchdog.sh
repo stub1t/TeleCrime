@@ -81,7 +81,7 @@ fi
 # --- 2. Fresh heartbeat? ---
 HEARTBEAT_AGE=9999
 if [ -f "$PROGRESS" ]; then
-  HEARTBEAT_AGE=$(python3 -c "
+  HEARTBEAT_AGE=$(timeout 15 python3 -c "
 import json, datetime, sys
 try:
     d = json.load(open('$PROGRESS'))
@@ -101,7 +101,7 @@ fi
 # Note: during a download (stage=acquire) creds/dups/archive_index stay
 # frozen while dl_pct advances; including dl_pct avoids false kills of a
 # healthy download. A stalled download (dl_pct frozen) is still caught.
-SIG=$(python3 -c "
+SIG=$(timeout 15 python3 -c "
 import json, sys
 try:
     d = json.load(open('$PROGRESS'))
@@ -146,7 +146,7 @@ printf '%s\n%s\n' "$SIG" "$NOW_TS" > "$SNAP"
 # any work (e.g. a Telegram session loop in password-candidate extraction)
 # and must be healed. (The old "no 7z subprocess" variant was discarded: it
 # false-positives on long 7z-free windows like record_outputs hashing.)
-STAGE=$(python3 -c "
+STAGE=$(timeout 15 python3 -c "
 import json, sys
 try:
     print(json.load(open('$PROGRESS')).get('current_stage') or '')
@@ -154,7 +154,7 @@ except Exception:
     print('')
 " 2>/dev/null || echo "")
 
-CUR_ARCHIVE=$(python3 -c "
+CUR_ARCHIVE=$(timeout 15 python3 -c "
 import json, sys
 try:
     print(json.load(open('$PROGRESS')).get('current_archive') or '')
@@ -365,15 +365,15 @@ if ! mountpoint -q /mnt/telecrime; then
   OPEN_MAPPER=$(ls /dev/mapper/ 2>/dev/null | grep -v 'control\|TeleCrime' | head -1)
   RECOVERED=0
   if [ -n "$OPEN_MAPPER" ]; then
-    if sudo -n mount "/dev/mapper/$OPEN_MAPPER" /mnt/telecrime 2>/dev/null; then
+    if timeout 30 sudo -n mount "/dev/mapper/$OPEN_MAPPER" /mnt/telecrime 2>/dev/null; then
       RECOVERED=1
     fi
   fi
   if [ "$RECOVERED" = "0" ]; then
     # Volume not open — try the crypttab path (needs the keyfile keyslot).
-    sudo -n systemctl start systemd-cryptsetup@telecrime-data.service 2>/dev/null
+    timeout 30 sudo -n systemctl start systemd-cryptsetup@telecrime-data.service 2>/dev/null
     sleep 3
-    if sudo -n mount /dev/mapper/telecrime-data /mnt/telecrime 2>/dev/null; then
+    if timeout 30 sudo -n mount /dev/mapper/telecrime-data /mnt/telecrime 2>/dev/null; then
       RECOVERED=1
     fi
   fi
@@ -390,7 +390,7 @@ else
   # Healthy-mount sanity: the DB volume must point at real PG data.
   # postgres_data is root-owned (0700) — plain -e fails with EACCES, so use
   # sudo; fall back to checking the directory entry is visible.
-  if ! sudo -n test -e /mnt/telecrime/postgres_data/PG_VERSION 2>/dev/null \
+  if ! timeout 15 sudo -n test -e /mnt/telecrime/postgres_data/PG_VERSION 2>/dev/null \
      && [ ! -e /mnt/telecrime/postgres_data ]; then
     log "CRITICAL: /mnt/telecrime mounted but postgres_data missing"
   fi

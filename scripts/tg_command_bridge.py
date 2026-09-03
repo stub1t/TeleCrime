@@ -229,10 +229,14 @@ async def main() -> None:
             # Paginate: iter_messages(limit=10) drops older unread messages
             # when >10 arrive between polls and last_seen_id then jumps past
             # them — operator commands were silently lost under load.
+            # limit=100 capped the TOTAL yielded messages, so >100 arrivals
+            # between polls still dropped the oldest (incl. commands). Raise
+            # the ceiling high enough to be effectively unbounded for a
+            # human-scale Saved Messages backlog while keeping a safety cap.
             new_msgs: list = []
-            async for page in client.iter_messages(me, limit=100, min_id=last_seen_id):
+            async for page in client.iter_messages(me, limit=1000, min_id=last_seen_id):
                 new_msgs.append(page)
-                if len(new_msgs) >= 200:
+                if len(new_msgs) >= 1000:
                     break
             new_msgs.reverse()
             for msg in new_msgs:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures as _futures
 import json
 import logging
 import os
@@ -578,6 +579,10 @@ def _format_pipeline_progress(progress: dict[str, Any], *, pid: int | None) -> s
     )
 
 
+_DISK_CHECK_EXECUTOR: _futures.ThreadPoolExecutor | None = None
+_DISK_CHECK_EXECUTOR_LOCK = threading.Lock()
+
+
 def _check_disk_status(config, timeout_seconds: float = 4.0) -> str:
     """Check free disk on the data dir.
 
@@ -588,7 +593,10 @@ def _check_disk_status(config, timeout_seconds: float = 4.0) -> str:
     wedge duration. Returns "" on success; a "disk critical" string when
     low; "disk wedged/unavailable" when the check could not complete.
     """
-    import concurrent.futures as _futures
+    global _DISK_CHECK_EXECUTOR
+    with _DISK_CHECK_EXECUTOR_LOCK:
+        if _DISK_CHECK_EXECUTOR is None:
+            _DISK_CHECK_EXECUTOR = _futures.ThreadPoolExecutor(max_workers=1)
 
     def _usage() -> str:
         usage = shutil.disk_usage(config.data_dir)
@@ -607,13 +615,11 @@ def _check_disk_status(config, timeout_seconds: float = 4.0) -> str:
         # NO `with` block: ThreadPoolExecutor.__exit__ calls shutdown(wait=True)
         # which joins the worker — on a wedged drive the statvfs thread is in
         # D-state forever, so the timeout would never fire and the caller would
-        # block for the entire wedge anyway. Fire-and-forget the shutdown.
-        _executor = _futures.ThreadPoolExecutor(max_workers=1)
-        try:
-            result = _executor.submit(_usage).result(timeout=timeout_seconds)
-            return result
-        finally:
-            _executor.shutdown(wait=False, cancel_futures=True)
+        # block for the entire wedge anyway. Reuse ONE module-level executor so
+        # wedged statvfs threads don't accumulate (each 10-min health check
+        # would otherwise leak a thread until APScheduler's pool exhausts).
+        result = _DISK_CHECK_EXECUTOR.submit(_usage).result(timeout=timeout_seconds)
+        return result
     except _futures.TimeoutError:
         logger.warning(
             "Disk space check timed out (%ss) — data dir likely wedged",
@@ -1818,7 +1824,12 @@ class TelecrimeWorker:
                     _send_telegram_notification(
                         self.config,
                         lambda n, msg=health.disk_status: n.send(
-                            f"Disk space critical: {msg}. Pipeline may stall.",
+                            (
+                                f"⚠️ Data drive status: {msg}. "
+                                "Pipeline may stall."
+                                if msg.startswith("disk wedged")
+                                else f"Disk space critical: {msg}. Pipeline may stall."
+                            ),
                             force=True,
                         ),
                     )
