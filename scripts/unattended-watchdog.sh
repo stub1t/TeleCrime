@@ -315,16 +315,9 @@ fi
 DRIVE_WEDGED=0
 WEDGE_SNAP=/tmp/telecrime-wedge-pids.txt
 CURRENT_WEDGED=""
-if [ -d /proc ]; then
-  # A stuck write on the data drive blocks postgres entirely; recreating the
-  # db container then just re-enters crash recovery on the same wedged volume.
-  # Transient D-state is NORMAL under heavy write load (postgres checkpoint,
-  # COPY bursts) — only a drive-writer thread stuck in D-state on TWO
-  # consecutive checks (≥5-10 min apart) indicates a real wedge.
-  # (DRIVE_WEDGED is already computed above the heal logic; this block only
-  # re-logs for the container-heal section.)
-  :
-fi
+# NOTE: DRIVE_WEDGED was computed ABOVE the pipeline-heal logic and must NOT
+# be reset here — the container-heal guards below rely on it. (The previous
+# unconditional reset made them dead code.)
 if [ "$DRIVE_WEDGED" = "1" ]; then
   log "CRITICAL: data drive write appears hung — pausing container heals"
 fi

@@ -85,19 +85,6 @@ def is_system_info_file(filename: str) -> bool:
     name = Path(filename).name
     return bool(_system_info_regex.search(name))
 
-
-def find_credential_files(file_list: list[str]) -> list[str]:
-    """Find all credential files in a list of paths.
-
-    Args:
-        file_list: List of file paths (can be nested like "folder/subfolder/Passwords.txt")
-
-    Returns:
-        List of paths matching credential file patterns
-    """
-    return [f for f in file_list if is_credential_file(f)]
-
-
 def detect_stealer_type(
     file_list: list[str],
     content_sample: str | None = None,

@@ -68,13 +68,17 @@ _BRACKET_LINE_RE = re.compile(
     r'^\["?(?P<app>[^"=\]]+)"?\s*=\s*"?(?P<profile>[^"\]]+)"?\]'
 )
 _SEPARATOR_RE = re.compile(r"^(?:---+|===+|_{3,})\s*$")
+# Marketplace boilerplate must be preceded by a separator (pipe/┃) or the
+# field start — a plain password containing "buy" or "t.me" is legit and must
+# NOT be truncated. Verified victims: "I want to buy stuff" → "I want".
 _PROMO_MARKERS_RE = re.compile(
-    r"\s*(?:┃|\|)?\s*(?:https?://)?t\.me/[^\s]+.*$"
-    r"|\s*(?:you\s+can\s+buy|to\s+buy|dm\s+@)[^\r\n]*$",
+    r"(?:^|\s*(?:┃|\|)\s*)(?:https?://)?t\.me/[^\s]+.*$"
+    r"|\s*(?:┃|\|)\s*(?:you\s+can\s+buy|to\s+buy|dm\s+@)[^\r\n]*$",
     re.IGNORECASE,
 )
 # Fast fail-fast trigger scan (C-level, no allocation) replacing the
-# unconditional .lower() copy on every field.
+# unconditional .lower() copy on every field. Intentionally broad — it only
+# gates whether the (strict) marker regex runs; it must not filter itself.
 _PROMO_TRIGGER_RE = re.compile(r"t\.me|buy|dm\s+@", re.IGNORECASE)
 _BRACKET_PROMO_RE = re.compile(r"\s*\[.*?(?:to\s+buy|buy|dm)\b.*$", re.IGNORECASE)
 
@@ -90,6 +94,10 @@ _GARBAGE_PASSWORDS = frozenset({
 
 def _is_garbage_credential(username: str, password: str) -> bool:
     """Return True if username or password is an obvious sentinel/placeholder value."""
+    # Both-empty rows carry no credential at all (url+password-only rows are
+    # kept — they are real captures from labeled blocks without a Login line).
+    if not username and not password:
+        return True
     # All garbage sentinel values are ≤15 chars — skip the allocation for long values.
     # HTML/block-char artifacts can appear at any length so they are always checked.
     if len(username) <= 15 and username.lower() in _GARBAGE_USERNAMES:
@@ -125,8 +133,12 @@ def _make_credential(
     application: str | None = None,
     profile: str | None = None,
 ) -> Credential:
+    # Combo (colon/pipe/semicolon) paths go through this constructor — the
+    # labeled-block path already normalizes in _credential_from_fields. A
+    # normalized None can't happen here (the combo regexes enforce http(s)).
+    _url = _normalize_url(url.strip())
     return Credential(
-        url=url.strip(),
+        url=_url or url.strip(),
         username=_clean_credential_field(username, username=True),
         password=_clean_credential_field(password),
         application=_clean_credential_field(application) or None,
@@ -151,9 +163,14 @@ def truncate_field(value: str | None, limit: int) -> str | None:
 
 
 def _detect_encoding(hint: str) -> list[str]:
-    """Return encoding list to try, with hint first and deduped."""
-    # utf-16-le handles UTF-16 LE files without BOM (common in some stealers)
-    chain = [hint, "utf-8", "utf-16", "utf-16-le", "latin-1", "cp1252"]
+    """Return encoding list to try, with hint first and deduped.
+
+    ORDER IS CRITICAL: any broken-UTF-8 single-byte file decodes as utf-16
+    (even-length byte pairs), so utf-16 must come LAST — otherwise latin-1
+    files silently decode as utf-16 mojibake and yield zero credentials.
+    UTF-16 files with a BOM are handled before this chain runs.
+    """
+    chain = [hint, "utf-8", "latin-1", "cp1252", "utf-16-le", "utf-16"]
     seen: set[str] = set()
     result = []
     for enc in chain:
@@ -181,6 +198,12 @@ def _normalize_url(url: str | None) -> str | None:
     # Reject Windows paths (HOST: C:\...) and other non-HTTP values
     if not url.startswith(("http://", "https://")):
         return None
+    # Credentials embedded in the URL ("https://user:pass@example.com") must
+    # not leak into the domain column or the dedup hashes.
+    scheme, rest = url.split("://", 1)
+    if "@" in rest:
+        rest = rest.rsplit("@", 1)[1]
+        url = f"{scheme}://{rest}"
     return url
 
 
@@ -363,6 +386,18 @@ def _open_credential_file(file_path: Path, encoding: str) -> TextIO | None:
     if _is_binary_file(file_path):
         logger.debug("Skipping binary file: %s", file_path)
         return None
+
+    # Explicit BOM handling: a UTF-16 BOM picks the encoding without the
+    # fallback chain (which must never guess utf-16 for non-BOM files).
+    try:
+        with open(file_path, "rb") as raw:
+            head = raw.read(4)
+    except OSError:
+        head = b""
+    if head.startswith(b"\xff\xfe"):
+        return _open_file(file_path, "utf-16")
+    if head.startswith(b"\xfe\xff"):
+        return _open_file(file_path, "utf-16-be")
 
     enc_chain = _detect_encoding(encoding)
     for enc in enc_chain:

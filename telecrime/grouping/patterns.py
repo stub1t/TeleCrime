@@ -214,6 +214,39 @@ def group_by_pattern(attachments: list[FileAttachment]) -> list[GroupingResult]:
 
     # Add standalone files as single-file groups
     for attachment in standalone:
+        # Split-series end volume: a bare "file.zip" is the FINAL volume of a
+        # "file.z01/z02/..." series (and "file.7z" ends a ".001/.002"
+        # series). Left standalone, 7z CANNOT_OPEN it and the group is
+        # deleted. Attach it to the matching series when one exists — the
+        # series itself must have been found in the explicit-parts branch.
+        _linked = False
+        _series_key: str | None = None
+        _filename = attachment.filename or ""
+        _suffix = _filename.lower()
+        if _suffix.endswith(".zip"):
+            _series_key = _filename[:-4]
+        elif _suffix.endswith(".7z"):
+            _series_key = _filename[:-3]
+        if _series_key:
+            for existing in results:
+                if (
+                    existing.attachments
+                    and (existing.attachments[0].filename or "").lower().startswith(
+                        _series_key.lower()
+                    )
+                    and any(
+                        (a.filename or "").lower().endswith((".z01", ".z02", ".001", ".002"))
+                        for a in existing.attachments
+                    )
+                ):
+                    existing.attachments.append(attachment)
+                    existing.expected_parts = (existing.expected_parts or 0) + 1
+                    existing.part_numbers[attachment.id] = len(existing.attachments) - 1
+                    _linked = True
+                    break
+        if _linked:
+            continue
+
         base_name = attachment.filename or f"file_{attachment.id}"
         results.append(GroupingResult(
             base_name=base_name,

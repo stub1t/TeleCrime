@@ -202,6 +202,17 @@ class SevenZipExtractor(ArchiveExtractor):
                     error_message="Unsupported archive format",
                 )
 
+            if return_code < 0:
+                # Killed by a signal (OOM killer, container kill) — NOT an
+                # archive problem. Callers must treat this as transient and
+                # retryable, never terminal (a terminal classification lets
+                # finalize delete the archive).
+                return ExtractionResult(
+                    success=False,
+                    error_code="KILLED",
+                    error_message=f"extractor killed by signal {-return_code}",
+                )
+
             return ExtractionResult(
                 success=False,
                 error_code=f"EXIT_{return_code}",

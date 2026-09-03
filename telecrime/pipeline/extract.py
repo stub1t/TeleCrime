@@ -192,6 +192,34 @@ class ExtractStage(PipelineStage):
         # Main archive is the first one (or only one)
         main_archive = archive_paths[0]
 
+        # Split-part chain check: 7z/unrar auto-discover sibling volumes by
+        # NAME. A collision rename (stem_1.rar, from concurrent prefetch) breaks
+        # the chain silently — extraction then fails or reads partial data, and
+        # a terminal classification deletes ALL parts. Fail retryable instead
+        # so a repost or later recovery can fix the naming.
+        if len(archive_paths) > 1:
+            import re as _re
+
+            _bases = {p.name for p in archive_paths}
+            _chain_ok = True
+            for _p in archive_paths[1:]:
+                _name = _p.name
+                _clean = _re.sub(r"_\d+(?=\.[^.]+$)", "", _name)
+                if _clean not in _bases and _name not in _bases:
+                    _chain_ok = False
+                    break
+            if not _chain_ok:
+                logger.warning(
+                    "Split group %s has non-contiguous part names %s — "
+                    "collision rename likely; deferring (retryable)",
+                    group.base_name,
+                    [p.name for p in archive_paths],
+                )
+                job.status = ExtractionStatus.FAILED
+                job.last_error_code = "VOLUME_MISSING"
+                job.last_error_message = "Split parts renamed by collision"
+                return False
+
         # Dispatch direct .txt files — skip 7z and the disk space check entirely
         first_part = group.parts[0] if group.parts else None
         _attach = first_part.artifact.attachment if (first_part and first_part.artifact) else None
@@ -216,8 +244,11 @@ class ExtractStage(PipelineStage):
         # Get password candidates
         passwords = await self._get_password_candidates(ctx, group)
 
-        # Output directory
+        # Output directory — clean leftovers from previous failed attempts
+        # (7z -y overwrites, but stale files from an aborted run would be
+        # re-recorded as duplicate ExtractedOutput rows).
         output_dir = ctx.config.extracted_dir / f"group_{group.id}"
+        shutil.rmtree(output_dir, ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Mark as in-progress and commit immediately so the transaction snapshot
@@ -229,7 +260,7 @@ class ExtractStage(PipelineStage):
         ctx.session.commit()
 
         target_exts = ctx.config.extraction.target_extensions
-        _nested_exts = {"zip", "rar", "7z"}
+        _nested_exts = {"zip", "rar", "7z", "tar"}
 
         # RAR5 archives: 7z support is incomplete — it can list headers but fails
         # extraction with PASSWORD_REQUIRED (even for unencrypted archives).
@@ -391,8 +422,14 @@ class ExtractStage(PipelineStage):
 
         else:
             # Extraction failed — but partial output may contain nested archives.
-            # Try to recover txt from any zip/rar files extracted before the error.
-            if output_dir.exists():
+            # ONLY trust this when the outer container was fully read: a clean
+            # non-password error (corrupt volume, unsupported member) means
+            # everything extractable landed on disk. A TIMEOUT means the outer
+            # archive was NOT fully processed — accepting the partial data and
+            # letting finalize delete the archive loses the unextracted
+            # remainder permanently.
+            _recoverable_errors = ("CORRUPTED", "UNSUPPORTED_FORMAT", "CANNOT_OPEN")
+            if output_dir.exists() and result.error_code in _recoverable_errors:
                 nested_txts = await self._try_nested_extraction(
                     output_dir, target_exts, extractor, passwords, ctx,
                 )
@@ -405,6 +442,18 @@ class ExtractStage(PipelineStage):
                     group.status = GroupStatus.EXTRACTED
                     job.status = ExtractionStatus.COMPLETED
                     return True
+
+            # Corruption and unsupported formats won't improve on retry.
+            # KILLED (signal/OOM death) and TIMEOUT are transient — never
+            # terminal, so the archive survives for a retry.
+            _killed = getattr(result, "error_code", "") == "KILLED"
+            terminal = result.error_code in _recoverable_errors and not _killed
+            job.status = ExtractionStatus.FAILED_TERMINAL if terminal else ExtractionStatus.FAILED
+            job.last_error_code = result.error_code
+            job.last_error_message = result.error_message
+            group.status = GroupStatus.FAILED
+            logger.error("Extraction failed for %s: %s", main_archive.name, result.error_message)
+            return False
 
             # Corruption and unsupported formats won't improve on retry
             terminal = result.error_code in ("CORRUPTED", "UNSUPPORTED_FORMAT", "CANNOT_OPEN")
@@ -462,7 +511,7 @@ class ExtractStage(PipelineStage):
         raw txt files (e.g. PegasusCloud distributes each victim as a separate
         zip inside the outer RAR).  Returns all extracted target-extension paths.
         """
-        _nested_exts = {".zip", ".rar", ".7z"}
+        _nested_exts = {".zip", ".rar", ".7z", ".tar"}
         _max_nested = 500
 
         nested_archives = [
@@ -545,14 +594,21 @@ class ExtractStage(PipelineStage):
             # extraction.  For ZipCrypto-encrypted ZIPs, a wrong password causes
             # 7z to write corrupt data for every file before reporting failure —
             # test_password catches wrong passwords in seconds with no disk writes.
+            # Without a known member (first_file), test_password falls back to
+            # testing the WHOLE archive — on 55K-file archives that is slower
+            # than the full extraction it is meant to avoid, so skip the
+            # pre-screen entirely in that case.
             for pwd_candidate in passwords:
                 job.password_attempts += 1
                 logger.debug("Trying password candidate %d", pwd_candidate.id)
 
                 # Quick pre-screen: skip obvious wrong passwords without extracting.
-                if not await extractor.test_password(
-                    main_archive, pwd_candidate.value,
-                    first_file=first_file, timeout_seconds=30,
+                if (
+                    first_file
+                    and not await extractor.test_password(
+                        main_archive, pwd_candidate.value,
+                        first_file=first_file, timeout_seconds=30,
+                    )
                 ):
                     pwd_candidate.times_failed += 1
                     logger.debug("Password candidate %d failed pre-screen", pwd_candidate.id)
@@ -622,6 +678,23 @@ class ExtractStage(PipelineStage):
         )
 
         # Combine, deduplicate, and rank
+        # MAX_FAILED_ATTEMPTS must survive re-extraction: context-derived
+        # candidates are freshly created (times_failed=0) on EVERY run, so
+        # without this filter the same exhausted values are retried forever
+        # ("all 37 password candidates failed" repeating across runs).
+        # Query the conversation's exhausted values and drop them from the
+        # new set before ranking.
+        exhausted = {
+            row[0]
+            for row in ctx.session.execute(
+                select(PasswordCandidate.value).where(
+                    PasswordCandidate.conversation_id == message.conversation_id,
+                    PasswordCandidate.times_failed >= MAX_FAILED_ATTEMPTS,
+                )
+            )
+        }
+        if exhausted:
+            new_candidates = [c for c in new_candidates if c.value not in exhausted]
         all_candidates = deduplicate_candidates(list(existing) + new_candidates)
         ranked = rank_passwords(all_candidates)
 

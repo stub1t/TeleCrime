@@ -9,7 +9,6 @@ from telecrime.stealer.parser import (
 )
 from telecrime.stealer.patterns import (
     detect_stealer_type,
-    find_credential_files,
     is_credential_file,
     is_system_info_file,
 )
@@ -131,7 +130,9 @@ class TestPatterns:
         assert not is_system_info_file("passwords.txt")
 
     def test_find_credential_files(self):
-        """Test finding credential files in a list."""
+        """Filename gate: credential files qualify, system info/readme don't."""
+        from telecrime.stealer.patterns import is_credential_file
+
         files = [
             "victim1/Passwords.txt",
             "victim1/Cookies.txt",
@@ -139,7 +140,7 @@ class TestPatterns:
             "victim2/All Passwords.txt",
             "readme.txt",
         ]
-        matches = find_credential_files(files)
+        matches = [f for f in files if is_credential_file(f)]
         assert len(matches) == 2
         assert "victim1/Passwords.txt" in matches
         assert "victim2/All Passwords.txt" in matches
@@ -520,3 +521,61 @@ class TestExpandedStealerDetection:
         assert info.hostname == "WORKSTATION-42"
         assert info.ip_address == "8.8.8.8"
         assert info.os == "Windows 11"
+
+
+class TestRoundTenValidation:
+    """Tests for the round-10 validation fixes."""
+
+    def test_cp1252_file_decodes_via_fallback(self, tmp_path):
+        """A cp1252-encoded credential file must decode (latin-1 fallback),
+        NOT be misdetected as utf-16 (round-10 fix: chain ordering)."""
+        from telecrime.stealer.parser import iter_credentials_file
+
+        f = tmp_path / "Passwords.txt"
+        # "https://example.com;user;pass\xe9" in cp1252 (é = \xe9)
+        f.write_bytes(b"https://example.com;alice;p\xe9ss\n")
+        creds = list(iter_credentials_file(f))
+        assert len(creds) == 1
+        assert creds[0].password == "p\xe9ss"
+
+    def test_utf16_bom_file_decodes(self, tmp_path):
+        """A UTF-16 file WITH BOM must decode via the explicit BOM path."""
+        from telecrime.stealer.parser import iter_credentials_file
+
+        f = tmp_path / "Passwords.txt"
+        f.write_bytes(
+            "https://example.com;alice;p@ss1\n".encode("utf-16")
+        )
+        creds = list(iter_credentials_file(f))
+        assert len(creds) == 1
+        assert creds[0].url == "https://example.com"
+
+    def test_promo_strip_requires_separator(self):
+        """Legit passwords containing 'buy'/'t.me' must NOT be truncated."""
+        from telecrime.stealer.parser import _clean_credential_field
+
+        assert _clean_credential_field("I want to buy stuff") == "I want to buy stuff"
+        assert _clean_credential_field("to buy stuff") == "to buy stuff"
+        assert _clean_credential_field("my t.me/abc password") == "my t.me/abc password"
+        # Marketplace boilerplate AFTER a pipe separator is still stripped.
+        assert _clean_credential_field(
+            "secret123 | https://t.me/SampleCloud You can buy dm @SampleCloud"
+        ) == "secret123"
+
+    def test_url_userinfo_stripped(self):
+        """user:pass@ in a URL must not leak into the domain/hashes."""
+        from telecrime.stealer.parser import parse_credential_lines
+
+        creds = list(parse_credential_lines(
+            iter(["https://alice:secret@example.com;u;p"]), "f.txt"
+        ))
+        assert creds
+        assert creds[0].url == "https://example.com"
+        assert creds[0].domain == "example.com"
+
+    def test_both_empty_credential_is_garbage(self):
+        from telecrime.stealer.parser import _is_garbage_credential
+
+        assert _is_garbage_credential("", "") is True
+        # url+password-only rows stay valid
+        assert _is_garbage_credential("", "pass123") is False

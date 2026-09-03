@@ -51,6 +51,12 @@ class UnrarExtractor(ArchiveExtractor):
             cmd.append("-p-")
 
         cmd.append(str(archive_path))
+        # File masks BEFORE the output dir: without them unrar extracts every
+        # member (jpg/db/exe included) and only post-filters — for 650-900 MB
+        # RAR5 dumps that is massively wasted I/O, disk and wall time.
+        if target_extensions:
+            for ext in target_extensions:
+                cmd.append(f"*.{ext.lstrip('.')}")
         # unrar needs trailing slash on output dir
         cmd.append(str(output_dir) + "/")
 
@@ -153,6 +159,18 @@ class UnrarExtractor(ArchiveExtractor):
             # Partial success: some files extracted with errors (e.g. corrupt headers
             # in multi-volume archives missing later volumes). Treat as success if
             # we got any files.
+            # EXCEPTION: "Unexpected end of archive" means the volume chain is
+            # broken (missing/renamed parts) — treating it as success lets
+            # finalize delete ALL volumes while the group is only partially
+            # parsed. That must be retryable so a late-arriving part (plan's
+            # late-part linking) can rescue the group.
+            if "Unexpected end of archive" in combined or "volume" in combined.lower():
+                return ExtractionResult(
+                    success=False,
+                    error_code="VOLUME_MISSING",
+                    error_message="Archive incomplete — missing or renamed volume",
+                )
+
             extracted = self._find_extracted_files(output_dir, target_extensions)
             if extracted:
                 logger.warning(
@@ -161,6 +179,13 @@ class UnrarExtractor(ArchiveExtractor):
                     len(extracted),
                 )
                 return ExtractionResult(success=True, extracted_files=extracted)
+
+            if return_code < 0:
+                return ExtractionResult(
+                    success=False,
+                    error_code="KILLED",
+                    error_message=f"extractor killed by signal {-return_code}",
+                )
 
             return ExtractionResult(
                 success=False,
