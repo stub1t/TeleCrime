@@ -5,6 +5,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from telecrime.extractor.interface import ExtractionResult
+from telecrime.extractor.seven_zip import SevenZipExtractor
+
 
 class _AsyncLineReader:
     """Async iterable over bytes lines, mimicking subprocess stdout."""
@@ -25,8 +28,6 @@ class _AsyncLineReader:
         self._buf = self._buf[n:] if n >= 0 else b""
         return out
 
-from telecrime.extractor.interface import ExtractionResult
-from telecrime.extractor.seven_zip import SevenZipExtractor
 
 
 class TestExtractionResult:

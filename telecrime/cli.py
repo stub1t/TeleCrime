@@ -1146,7 +1146,7 @@ def search(
                     )
                     ordered = {cred_id: idx for idx, cred_id in enumerate(ids)}
                     results = soft_dedupe_credentials(
-                        sorted(rows, key=lambda cred: ordered[cred.id])
+                        sorted(rows, key=lambda cred: ordered[int(cred.id)])
                     )[:limit]
                 else:
                     total = 0

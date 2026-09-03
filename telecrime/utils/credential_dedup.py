@@ -22,12 +22,12 @@ def soft_dedupe_credentials(
     seen: set[str | int] = set()
     unique: list[T] = []
     for cred in credentials:
-        key = (
+        key: str | int | None = (
             getattr(cred, "soft_credential_hash", None)
             or getattr(cred, "credential_hash", None)
-            or cred.id
+            or getattr(cred, "id", None)
         )
-        if key in seen:
+        if key is None or key in seen:
             continue
         seen.add(key)
         unique.append(cred)

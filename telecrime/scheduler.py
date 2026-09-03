@@ -768,7 +768,7 @@ def _run_channel_join_job(config, engine, max_joins: int = 1) -> str:
         # Also defer while the pipeline subprocess is live: it holds the main
         # session (a second client on the same session file invalidates both).
         try:
-            if read_progress().get("running"):
+            if (read_progress() or {}).get("running"):
                 return (
                     f"discovered {new_count} new, "
                     f"skipped Telegram step: pipeline running (session in use)"
@@ -1520,7 +1520,7 @@ def _send_telegram_notification(config, callback) -> str:
         # wedge the pipeline's extract stage indefinitely. Defer the
         # notification until the pipeline is idle.
         try:
-            if read_progress().get("running"):
+            if (read_progress() or {}).get("running"):
                 return "skipped: pipeline running (session in use)"
         except Exception:
             pass

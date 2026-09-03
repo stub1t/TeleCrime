@@ -294,6 +294,7 @@ class SevenZipExtractor(ArchiveExtractor):
 
             path: str | None = None
             is_folder = False
+            assert process.stdout is not None
             line_bytes = await process.stdout.readline()
             while line_bytes:
                 line = line_bytes.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")

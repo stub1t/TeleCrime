@@ -13,8 +13,10 @@ from collections import Counter
 from collections.abc import AsyncGenerator, Iterator
 from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
+from typing import cast
 
 from sqlalchemy import delete, inspect, select, text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import selectinload
 
 from telecrime.database import get_dialect_insert
@@ -486,10 +488,13 @@ class ParseStage(PipelineStage):
                     # job's already-inserted rows so the whole job re-parses
                     # cleanly (ON CONFLICT dedups the re-inserts).
                     try:
-                        removed = ctx.session.execute(
-                            delete(ParsedCredential).where(
-                                ParsedCredential.extraction_job_id == job.id
-                            )
+                        removed = cast(
+                            CursorResult,
+                            ctx.session.execute(
+                                delete(ParsedCredential).where(
+                                    ParsedCredential.extraction_job_id == job.id
+                                )
+                            ),
                         ).rowcount
                         ctx.session.commit()
                         logger.info(

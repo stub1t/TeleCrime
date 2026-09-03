@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+import sqlalchemy
 from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import Session, joinedload
 
@@ -538,7 +539,7 @@ def _next_pending_artifact(session: "Session", exclude_ids: set[int] | None = No
     _id_excl = (
         ~DownloadArtifact.id.in_(exclude_ids)
         if exclude_ids
-        else True
+        else sqlalchemy.true()
     )
     pending_count = (
         select(

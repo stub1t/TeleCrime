@@ -361,7 +361,7 @@ class PlanStage(PipelineStage):
                 .all()
             )
             for _candidate in _by_name:
-                _cand_base = _derived_base(_candidate.base_name)
+                _cand_base = _derived_base(_candidate.base_name or "")
                 if _cand_base is None or _cand_base not in _new_bases:
                     continue
                 _cand_conv_ids = {
