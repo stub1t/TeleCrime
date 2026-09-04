@@ -400,7 +400,11 @@ class TestExtractionTimeoutHelper:
         from telecrime.pipeline.extract import _extraction_timeout
 
         archive = tmp_path / "small.zip"
-        archive.write_bytes(b"x" * (100 * 1024 * 1024))  # 100 MB
+        # Sparse file — the timeout helper only needs stat().st_size, and a
+        # real 100MB write multiplied the /tmp (RAM tmpfs) footprint of the
+        # suite and repeatedly filled it to 100%.
+        with open(archive, "wb") as f:
+            f.truncate(100 * 1024 * 1024)
         ctx = MagicMock()
         ctx.config.extraction.max_extraction_seconds = 600
 
@@ -410,7 +414,8 @@ class TestExtractionTimeoutHelper:
         from telecrime.pipeline.extract import _extraction_timeout
 
         archive = tmp_path / "big.zip"
-        archive.write_bytes(b"x" * (2 * 1024 * 1024 * 1024))  # 2 GB
+        with open(archive, "wb") as f:
+            f.truncate(2 * 1024 * 1024 * 1024)  # 2 GB sparse
         ctx = MagicMock()
         ctx.config.extraction.max_extraction_seconds = 600
 
