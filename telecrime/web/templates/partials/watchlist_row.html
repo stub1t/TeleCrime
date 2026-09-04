@@ -11,7 +11,7 @@
   <td>{{ item.label }}</td>
   <td class="code">{{ item.query }}</td>
   <td><span class="match-type-pill">{{ item.match_type }}</span></td>
-  <td class="code">{{ "{:,}".format(item.last_known_count) }}</td>
+  <td class="code">{{ "{:,}".format(item.last_known_count | default(0, true)) }}</td>
   <td>
     {% if item.new_count > 0 %}
       <span class="wl-new-badge">+{{ "{:,}".format(item.new_count) }}</span>

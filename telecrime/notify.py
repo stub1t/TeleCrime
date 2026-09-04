@@ -132,7 +132,9 @@ def _header(icon: str, title: str) -> str:
 class TelegramNotifier:
     """Send progress notifications to Telegram Saved Messages."""
 
-    # Stages we explicitly announce as "completed" (others are noise).
+    # Stages we SUPPRESS from stage_complete announcements (all real pipeline
+    # stage names; "channel_join" was never a pipeline stage — kept for
+    # symmetry with the scheduler job name, harmless).
     _NOISY_STAGE_COMPLETIONS = frozenset({
         "ingest", "channel_discover", "discover", "plan",
         "channel_join", "enrich",

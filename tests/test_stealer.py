@@ -579,3 +579,39 @@ class TestRoundTenValidation:
         assert _is_garbage_credential("", "") is True
         # url+password-only rows stay valid
         assert _is_garbage_credential("", "pass123") is False
+
+
+class TestCredentialGateExpanded:
+    """Round-13: the filename gate previously rejected ~1.1 TB of real
+    stealer-cloud dump files. These names must now be caught; non-credential
+    files must still be excluded."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "@TXTLOG_ALIEN - 712.txt",
+            "@InfernoUrl [URL LOG PASS PRIVATE 133].txt",
+            "@segacloud BIG URL LOGIN PASS (2).txt",
+            "HotmailValid @MASTER_CLOUDS.txt",
+            "Uk_Gov_Service_by@Master_clouds.txt",
+            "BIG URL LOGIN PASS.txt",
+            "accounts dumps.txt",
+            "valid combos.txt",
+        ],
+    )
+    def test_stealer_cloud_dumps_caught(self, name):
+        from telecrime.stealer.patterns import is_credential_file
+
+        assert is_credential_file(name) is True, name
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "README.txt", "notes.txt", "SystemInfo.txt", "catalog.txt",
+            "analog.txt", "dialog.txt", "user_info.txt",
+        ],
+    )
+    def test_non_credential_files_still_excluded(self, name):
+        from telecrime.stealer.patterns import is_credential_file
+
+        assert is_credential_file(name) is False, name

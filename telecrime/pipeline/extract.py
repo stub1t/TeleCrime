@@ -686,22 +686,35 @@ class ExtractStage(PipelineStage):
         # candidates are freshly created (times_failed=0) on EVERY run, so
         # without this filter the same exhausted values are retried forever
         # ("all 37 password candidates failed" repeating across runs).
-        # Query the conversation's exhausted values and drop them from the
-        # new set before ranking.
-        exhausted = {
-            row[0]
-            for row in ctx.session.execute(
-                select(PasswordCandidate.value).where(
-                    PasswordCandidate.conversation_id == message.conversation_id,
-                    PasswordCandidate.times_failed >= MAX_FAILED_ATTEMPTS,
-                    # A value that EVER succeeded for this conversation is
-                    # worth keeping — success overrides accumulated failures.
-                    PasswordCandidate.times_succeeded == 0,
-                )
+        # Two problems fixed here:
+        #  1. fresh rows never carry their failure history — merge it from
+        #     the conversation's existing rows by value;
+        #  2. the old "ever succeeded" exemption kept rotated-out passwords
+        #     alive forever — 146 archives were permanently stuck retrying
+        #     values that failed 3+ times AFTER their last success.
+        # A value with times_failed >= MAX is not working NOW; a channel that
+        # rotates a password back will still work (the archive is retried
+        # with every other candidate; only a manual retry re-adds it).
+        _history: dict[str, tuple[int, int]] = {}
+        for _row in ctx.session.execute(
+            select(PasswordCandidate.value, PasswordCandidate.times_failed,
+                   PasswordCandidate.times_succeeded).where(
+                PasswordCandidate.conversation_id == message.conversation_id,
             )
-        }
+        ):
+            _v, _f, _s = _row
+            _h = _history.get(_v)
+            if _h is None or _f > _h[0]:
+                _history[_v] = (_f, _s)
+        exhausted = {v for v, (f, _s) in _history.items() if f >= MAX_FAILED_ATTEMPTS}
         if exhausted:
             new_candidates = [c for c in new_candidates if c.value not in exhausted]
+        # Carry accumulated failure/success history onto fresh candidates so
+        # their ranking reflects reality (rank_passwords boosts success).
+        for c in new_candidates:
+            h = _history.get(c.value)
+            if h is not None and c.times_failed == 0 and c.times_succeeded == 0:
+                c.times_failed, c.times_succeeded = h
         all_candidates = deduplicate_candidates(list(existing) + new_candidates)
         ranked = rank_passwords(all_candidates)
 

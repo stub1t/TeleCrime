@@ -978,6 +978,19 @@ async def run_sequential_pipeline(
                         .where(ArchiveGroup.id.in_(retry_ids))
                         .values(status=GroupStatus.READY)
                     )
+                    # Reset the groups' FAILED jobs to PENDING so the retry
+                    # bound accumulates on the SAME job. Without this,
+                    # _extract_group creates a fresh job every run
+                    # (attempts_count=0) and max(attempts) never reaches the
+                    # terminal cap — the group retried once per run forever.
+                    session.execute(
+                        update(ExtractionJob)
+                        .where(
+                            ExtractionJob.group_id.in_(retry_ids),
+                            ExtractionJob.status == ExtractionStatus.FAILED,
+                        )
+                        .values(status=ExtractionStatus.PENDING)
+                    )
                     logger.info(
                         "Startup recovery: reset %d EXTRACTING/FAILED groups → READY "
                         "for re-processing",

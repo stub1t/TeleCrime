@@ -30,6 +30,20 @@ CREDENTIAL_FILE_PATTERNS = [
     # Autofill
     r"autofills?\.txt$",
     r"important\s*autofills?\.txt$",
+
+    # Marketplace/stealer-cloud dump names (verified live: 3,881 direct-txt
+    # credential files, ~1.1 TB, were rejected before these were added):
+    # "@TXTLOG_ALIEN - 712.txt", "@InfernoUrl [URL LOG PASS PRIVATE 133].txt",
+    # "@segacloud BIG URL LOGIN PASS (2).txt", "HotmailValid @MASTER_CLOUDS.txt",
+    # "Uk_Gov_Service_by@Master_clouds.txt". Word-boundary tokens so
+    # "catalog.txt"/"analog.txt"/"dialog.txt" stay excluded.
+    r"\b(?:pass|login|logins|log|combo|dump|account|accounts|url|mail|creds?)\b.*\.txt$",
+    r"@[\w. -]+\s*-\s*\d+.*\.txt$",
+    r"(?:hotmail|gmail|yahoo|outlook|mail)[\w .-]*\.txt$",
+    r"valid.*\.txt$",
+    r"private.*(?:log|pass|url|dump).*\.txt$",
+    r"\bby@[\w. -]+\.txt$",
+    r"by@[\w. -]+\.txt$",
 ]
 
 # System information file patterns

@@ -100,7 +100,16 @@ class IngestStage(PipelineStage):
                     # Commit after each conversation so we don't hold a long
                     # transaction open across multiple Telegram API calls.
                     ctx.session.commit()
-                except (Exception, asyncio.CancelledError) as e:
+                except asyncio.CancelledError:
+                    # MUST propagate: a reingest timeout (wait_for) cancels
+                    # this task — swallowing it leaves a zombie task racing
+                    # the shared session with the download loop.
+                    try:
+                        ctx.session.rollback()
+                    except Exception:
+                        pass
+                    raise
+                except Exception as e:
                     logger.error(
                         "Error processing conversation %s: %s", conv_info.title, e
                     )
