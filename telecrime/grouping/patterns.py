@@ -228,12 +228,13 @@ def group_by_pattern(attachments: list[FileAttachment]) -> list[GroupingResult]:
         elif _suffix.endswith(".7z"):
             _series_key = _filename[:-3]
         if _series_key:
+            _series_norm = normalize_group_key(_series_key)
             for existing in results:
+                _first = existing.attachments[0].filename if existing.attachments else ""
                 if (
                     existing.attachments
-                    and (existing.attachments[0].filename or "").lower().startswith(
-                        _series_key.lower()
-                    )
+                    and _first
+                    and normalize_group_key(_first) == _series_norm
                     and any(
                         (a.filename or "").lower().endswith((".z01", ".z02", ".001", ".002"))
                         for a in existing.attachments
@@ -241,7 +242,10 @@ def group_by_pattern(attachments: list[FileAttachment]) -> list[GroupingResult]:
                 ):
                     existing.attachments.append(attachment)
                     existing.expected_parts = (existing.expected_parts or 0) + 1
-                    existing.part_numbers[attachment.id] = len(existing.attachments) - 1
+                    # Next free index — never collide with the series' highest.
+                    existing.part_numbers[attachment.id] = (
+                        max(existing.part_numbers.values(), default=-1) + 1
+                    )
                     _linked = True
                     break
         if _linked:

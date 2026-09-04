@@ -288,13 +288,7 @@ class TelegramAdapter(BaseAdapter):
                     f"Waiting for Telegram reconnect during {operation}",
                     kind="telegram_reconnect",
                 )
-                async with self._connect_lock:
-                    if self.client is not None:
-                        try:
-                            await self.client.disconnect()
-                        except Exception:
-                            pass
-                    await self.connect(timeout=timeout)
+                await self._reconnect_blocking(operation, timeout)
                 continue
             except Exception as exc:
                 if not self._is_retryable_connection_error(exc) or attempt >= retries:
@@ -306,19 +300,52 @@ class TelegramAdapter(BaseAdapter):
                     attempt + 1,
                     retries,
                 )
-                self._set_runtime_note(
-                    f"Waiting for Telegram reconnect during {operation}",
-                    kind="telegram_reconnect",
-                )
-                async with self._connect_lock:
-                    if self.client is not None:
-                        try:
-                            await self.client.disconnect()
-                        except Exception:
-                            pass
-                    await self.connect(timeout=timeout)
+                await self._reconnect_blocking(operation, timeout)
 
         raise RuntimeError(f"{operation} failed after reconnect retries")
+
+    async def _reconnect_blocking(self, operation: str, timeout: int) -> None:
+        """Disconnect + reconnect under the connect lock, BOUNDED.
+
+        The retry paths previously called connect(timeout=timeout) directly —
+        with a download timeout of 1800s the lock was held for up to 30 min,
+        freezing every concurrent op on this adapter, and the failure paths
+        never cleared the reconnect runtime note.
+        """
+        budget = max(60, min(self._ENSURE_CONNECTED_BUDGET_SECONDS, timeout))
+        try:
+            await asyncio.wait_for(
+                self._connect_lock.acquire(), timeout=budget
+            )
+        except TimeoutError:
+            logger.warning(
+                "Telegram reconnect lock busy for %ds during %s — aborting reconnect",
+                budget, operation,
+            )
+            raise ConnectionError(f"Telegram reconnect lock busy during {operation}")
+        try:
+            try:
+                if self.client is not None:
+                    await self.client.disconnect()
+            except Exception:
+                pass
+            await asyncio.wait_for(
+                self.connect(timeout=min(timeout, budget)),
+                timeout=budget,
+            )
+        except (TimeoutError, Exception):
+            # Failed reconnect: clear the note so the health job does not
+            # chase a stale "reconnect pending" signal forever.
+            try:
+                self._clear_runtime_note()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                self._connect_lock.release()
+            except RuntimeError:
+                pass
 
     async def iter_conversations(self) -> AsyncIterator[ConversationInfo]:
         """Iterate over all accessible conversations."""
@@ -645,6 +672,16 @@ class TelegramAdapter(BaseAdapter):
         deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
 
         async def _monitor(task) -> None:
+            # Stall accounting: a download is only "stalled" during windows in
+            # which the event loop was FREE — the synchronous parse-stage DB
+            # work blocks this loop for minutes, and during a block the
+            # download task itself cannot run either (same loop). Measuring
+            # wall-clock alone falsely cancelled healthy downloads after every
+            # long parse batch. A wait that returns promptly (loop free) with
+            # no progress accumulates; a wait that returns late (loop was
+            # blocked) does not.
+            _stall = 0.0
+            _prev_wake = time.monotonic()
             try:
                 while not task.done():
                     wait_secs = 30.0
@@ -657,17 +694,26 @@ class TelegramAdapter(BaseAdapter):
                             )
                         wait_secs = min(wait_secs, remaining)
 
+                    _wait_start = time.monotonic()
                     await asyncio.wait({task}, timeout=wait_secs)
 
                     if task.done():
                         break
 
-                    stalled = time.monotonic() - last_progress_time[0]
-                    if stalled > stall_seconds:
+                    _now = time.monotonic()
+                    _waited = _now - _wait_start
+                    if last_progress_time[0] >= _prev_wake:
+                        _stall = 0.0
+                    elif _waited >= wait_secs * 0.75:
+                        # Loop was free through the window and no bytes
+                        # arrived — genuine stall time.
+                        _stall += _now - _prev_wake
+                    if _stall > stall_seconds:
                         task.cancel()
                         raise TimeoutError(
-                            f"Download stalled for {stalled:.0f}s with no progress"
+                            f"Download stalled for {_stall:.0f}s with no progress"
                         )
+                    _prev_wake = _now
 
                 # Propagate any exception from the task
                 task.result()

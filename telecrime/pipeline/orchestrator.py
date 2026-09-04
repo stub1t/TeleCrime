@@ -24,6 +24,7 @@ from telecrime.models import (
     DownloadArtifact,
     ExtractionJob,
     FileAttachment,
+    Message,
     PipelineRun,
 )
 from telecrime.pipeline.lock import pipeline_run_lock
@@ -1302,6 +1303,28 @@ async def run_sequential_pipeline(
 
                 try:
                     if needs_download:
+                        # The prefetch queue object may be DETACHED: _iter_jobs
+                        # (parse paging) calls session.expunge_all(), which
+                        # detaches every object in the identity map — including
+                        # this artifact. _download_artifact lazy-loads
+                        # attachment.message and would raise
+                        # DetachedInstanceError. Re-fetch fresh with the full
+                        # relationship chain.
+                        _fresh = session.execute(
+                            select(DownloadArtifact)
+                            .where(DownloadArtifact.id == artifact.id)
+                            .options(
+                                joinedload(DownloadArtifact.attachment)
+                                .joinedload(FileAttachment.message)
+                                .joinedload(Message.conversation)
+                            )
+                        ).scalar_one_or_none()
+                        if _fresh is None:
+                            logger.warning(
+                                "Artifact %d disappeared — skipping", artifact.id
+                            )
+                            raise KeyError("artifact missing")
+                        artifact = _fresh
                         if display:
                             display.stage_start("acquire")
                             total_size_mb = (

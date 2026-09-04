@@ -312,12 +312,8 @@ fi
 # slow-starting/crash-recovering container (or a wedged data drive) must not
 # be force-recreated on every 5-10 min cycle, which interrupts recovery and
 # severs the running pipeline's DB connections.
-DRIVE_WEDGED=0
-WEDGE_SNAP=/tmp/telecrime-wedge-pids.txt
-CURRENT_WEDGED=""
 # NOTE: DRIVE_WEDGED was computed ABOVE the pipeline-heal logic and must NOT
-# be reset here — the container-heal guards below rely on it. (The previous
-# unconditional reset made them dead code.)
+# be reset here — the container-heal guards below rely on it.
 if [ "$DRIVE_WEDGED" = "1" ]; then
   log "CRITICAL: data drive write appears hung — pausing container heals"
 fi

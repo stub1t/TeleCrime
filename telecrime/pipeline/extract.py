@@ -201,17 +201,22 @@ class ExtractStage(PipelineStage):
             import re as _re
 
             _bases = {p.name for p in archive_paths}
-            _chain_ok = True
-            for _p in archive_paths[1:]:
+            _collision = False
+            for _p in archive_paths:
                 _name = _p.name
+                # Only split-pattern names (partN/.rNN/.NNN) can suffer a
+                # collision rename — a genuine "file_2.rar" underscore series
+                # must never be flagged.
+                if not _re.search(r"\.(?:part\d+|r\d{2}|\d{3})", _name, _re.IGNORECASE):
+                    continue
                 _clean = _re.sub(r"_\d+(?=\.[^.]+$)", "", _name)
-                if _clean not in _bases and _name not in _bases:
-                    _chain_ok = False
+                if _clean != _name and _clean not in _bases:
+                    _collision = True
                     break
-            if not _chain_ok:
+            if _collision:
                 logger.warning(
-                    "Split group %s has non-contiguous part names %s — "
-                    "collision rename likely; deferring (retryable)",
+                    "Split group %s has collision-renamed parts %s — "
+                    "deferring (retryable)",
                     group.base_name,
                     [p.name for p in archive_paths],
                 )
@@ -455,15 +460,6 @@ class ExtractStage(PipelineStage):
             logger.error("Extraction failed for %s: %s", main_archive.name, result.error_message)
             return False
 
-            # Corruption and unsupported formats won't improve on retry
-            terminal = result.error_code in ("CORRUPTED", "UNSUPPORTED_FORMAT", "CANNOT_OPEN")
-            job.status = ExtractionStatus.FAILED_TERMINAL if terminal else ExtractionStatus.FAILED
-            job.last_error_code = result.error_code
-            job.last_error_message = result.error_message
-            group.status = GroupStatus.FAILED
-            logger.error("Extraction failed for %s: %s", main_archive.name, result.error_message)
-            return False
-
     async def _handle_direct_txt(
         self,
         ctx: PipelineContext,
@@ -690,6 +686,9 @@ class ExtractStage(PipelineStage):
                 select(PasswordCandidate.value).where(
                     PasswordCandidate.conversation_id == message.conversation_id,
                     PasswordCandidate.times_failed >= MAX_FAILED_ATTEMPTS,
+                    # A value that EVER succeeded for this conversation is
+                    # worth keeping — success overrides accumulated failures.
+                    PasswordCandidate.times_succeeded == 0,
                 )
             )
         }

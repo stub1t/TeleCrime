@@ -164,7 +164,19 @@ class UnrarExtractor(ArchiveExtractor):
             # finalize delete ALL volumes while the group is only partially
             # parsed. That must be retryable so a late-arriving part (plan's
             # late-part linking) can rescue the group.
-            if "Unexpected end of archive" in combined or "volume" in combined.lower():
+            if return_code < 0:
+                # Killed by a signal (OOM killer) — ALWAYS transient, even if
+                # some files landed: accepting partial data and letting
+                # finalize delete the archive loses the unextracted remainder.
+                return ExtractionResult(
+                    success=False,
+                    error_code="KILLED",
+                    error_message=f"extractor killed by signal {-return_code}",
+                )
+
+            # Narrow the volume check to unrar's actual messages (a bare
+            # "volume" substring could appear in normal multi-volume output).
+            if "Unexpected end of archive" in combined or "Cannot find volume" in combined:
                 return ExtractionResult(
                     success=False,
                     error_code="VOLUME_MISSING",
@@ -179,13 +191,6 @@ class UnrarExtractor(ArchiveExtractor):
                     len(extracted),
                 )
                 return ExtractionResult(success=True, extracted_files=extracted)
-
-            if return_code < 0:
-                return ExtractionResult(
-                    success=False,
-                    error_code="KILLED",
-                    error_message=f"extractor killed by signal {-return_code}",
-                )
 
             return ExtractionResult(
                 success=False,

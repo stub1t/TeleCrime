@@ -357,6 +357,15 @@ class AcquireStage(PipelineStage):
         a long download does not hold a PostgreSQL snapshot open (which blocks
         autovacuum on every table the initial SELECT touched).
         """
+        if artifact.status == DownloadStatus.FAILED_TERMINAL:
+            # A prefetch task already exhausted the retries for this artifact
+            # (e.g. permanent Telegram error). The main-loop pop path calls
+            # this unconditionally — don't burn another full retry cycle.
+            logger.warning(
+                "Artifact %d already FAILED_TERMINAL — skipping re-download",
+                artifact.id,
+            )
+            return False
         attachment = artifact.attachment
 
         # Disk space guard: pause downloads if below configured threshold

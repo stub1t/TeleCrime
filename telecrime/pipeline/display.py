@@ -57,7 +57,6 @@ class PipelineDisplay:
         self._failed_stages: set[str] = set()
 
         # Download tracking
-        self._dl_filename: str | None = None
         self._dl_pct: float = 0.0
         self._dl_speed: float = 0.0
         self._dl_eta: str = ""
@@ -322,7 +321,6 @@ class PipelineDisplay:
 
     def download_start(self, filename: str, size_mb: float) -> None:
         """Start tracking a download."""
-        self._dl_filename = filename
         self._dl_pct = 0.0
         self._dl_speed = 0.0
         self._dl_eta = ""

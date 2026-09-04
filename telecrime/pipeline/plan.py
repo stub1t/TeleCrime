@@ -357,6 +357,10 @@ class PlanStage(PipelineStage):
                         joinedload(ArchiveGroup.parts).joinedload(ArchiveGroupPart.artifact)
                     )
                 )
+                # .unique() is REQUIRED: the joinedload of parts→artifact fans
+                # out rows, and scalars().all() without unique() raises
+                # "The unique() method must be invoked on this Result".
+                .unique()
                 .scalars()
                 .all()
             )
