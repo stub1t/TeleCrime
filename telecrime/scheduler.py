@@ -22,6 +22,7 @@ from typing import Any, cast
 
 from sqlalchemy.engine import CursorResult
 
+from telecrime.passwords.extractor import MAX_FAILED_ATTEMPTS
 from telecrime.pipeline.progress import mark_progress_stopped, read_progress
 
 logger = logging.getLogger(__name__)
@@ -779,6 +780,13 @@ def _run_channel_join_job(config, engine, max_joins: int = 1) -> str:
         joined = skipped = failed = 0
         try:
             try:
+                # TOCTOU guard: the earlier skip check ran before this point;
+                # a pipeline started in between would fight for the session.
+                if (read_progress() or {}).get("running"):
+                    return (
+                        f"discovered {new_count} new, "
+                        f"skipped Telegram step: pipeline started during join"
+                    )
                 await adapter.connect()
             except Exception as exc:
                 if _is_telegram_transient(exc):
@@ -938,7 +946,24 @@ def _run_vacuum_job(engine) -> str:
             )
         """), {"cleaned_status": GroupStatus.CLEANED.name})
         pruned = cast(CursorResult[Any], result).rowcount
+        # Prune exhausted password candidates: rows with times_failed >= 3
+        # and zero successes are never used again (query-filtered) but grow
+        # unboundedly across runs. This bounds the table permanently.
+        pruned_pw = cast(
+            CursorResult[Any],
+            session.execute(
+                _sa.text(
+                    "DELETE FROM password_candidates "
+                    "WHERE times_failed >= :max_failed AND times_succeeded = 0"
+                ),
+                {"max_failed": MAX_FAILED_ATTEMPTS},
+            ),
+        ).rowcount
         session.commit()
+        if pruned_pw:
+            logger.info(
+                "Pruned %d exhausted password candidates", pruned_pw
+            )
 
     # VACUUM cannot run inside a transaction block on PostgreSQL, and the DB's
     # statement_timeout (5 min) would cancel a full-table VACUUM ANALYZE on

@@ -15,8 +15,10 @@ WORKDIR /app
 # Copy dependency files first for better layer caching
 COPY pyproject.toml uv.lock ./
 
-# Install project dependencies (no dev extras)
-RUN uv sync --no-dev --frozen
+# Install project dependencies (no dev extras). UV cache would otherwise be
+# baked into the image (~100-300 MB of wheels); the cache is useless at
+# runtime.
+RUN uv sync --no-dev --frozen --no-cache
 
 # Copy the rest of the project
 COPY telecrime/ ./telecrime/

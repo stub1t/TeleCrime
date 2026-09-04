@@ -161,6 +161,9 @@ class TelegramNotifier:
         self._digest_domains: Counter[str] = Counter()
         self._digest_last_archive: str | None = None
         self._digest_since: float | None = None
+        # Archive names already reported this run — a re-parse of the same
+        # job (after a wedge) must not double-count it in the digest.
+        self._reported_archives: set[str] = set()
 
     async def _get_me(self):
         if self._me is None:
@@ -201,6 +204,9 @@ class TelegramNotifier:
         digest is due (every N archives or M minutes).
         """
         del unique_domains
+        if archive_name in self._reported_archives:
+            return
+        self._reported_archives.add(archive_name)
         self._digest_archives += 1
         self._digest_new += new_credentials or 0
         self._digest_dups += duplicates or 0
@@ -255,6 +261,8 @@ class TelegramNotifier:
         self._digest_last_archive = None
         self._digest_since = None
         await self.send("\n".join(lines))
+        # Keep _reported_archives: a digest flush mid-run must not re-report
+        # archives already counted once this run.
 
     # ------------------------------------------------------------------ stages
 

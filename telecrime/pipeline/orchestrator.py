@@ -1014,6 +1014,22 @@ async def run_sequential_pipeline(
                     len(_pwd_retry),
                 )
 
+            # Startup recovery: orphaned IN_PROGRESS jobs (a crash mid-
+            # extraction leaves them behind; the group is reset to READY but
+            # the job stays IN_PROGRESS and accumulates forever — 150+ live).
+            _inprog = session.execute(
+                update(ExtractionJob)
+                .where(ExtractionJob.status == ExtractionStatus.IN_PROGRESS)
+                .values(status=ExtractionStatus.PENDING)
+                .returning(ExtractionJob.id)
+            ).all()
+            if _inprog:
+                session.commit()
+                logger.info(
+                    "Startup recovery: reset %d orphaned IN_PROGRESS jobs → PENDING",
+                    len(_inprog),
+                )
+
             total_pending = (
                 session.execute(
                     select(func.count(DownloadArtifact.id)).where(
@@ -1081,12 +1097,21 @@ async def run_sequential_pipeline(
                 Errors are caught here so a Telegram hiccup can't abort the pipeline.
                 """
                 label = "priority" if priority_only else "full"
-                try:
-                    logger.info("Periodic %s re-ingest starting", label)
+
+                async def _reingest_work() -> None:
                     await IngestStage(priority_only=priority_only).run(ctx)
                     session.commit()
                     await DiscoverStage().run(ctx)
                     await PlanStage().run(ctx)
+
+                try:
+                    logger.info("Periodic %s re-ingest starting", label)
+                    # Bound the whole re-ingest: it runs synchronously in the
+                    # download loop, and a drive wedge mid-reingest would
+                    # otherwise stall every download for its duration.
+                    await asyncio.wait_for(
+                        _reingest_work(), timeout=2400
+                    )
                     session.commit()
                     new_total = (
                         session.execute(
@@ -1100,6 +1125,7 @@ async def run_sequential_pipeline(
                     logger.info("Periodic %s re-ingest done; %d downloads pending", label, new_total)
                 except (Exception, asyncio.CancelledError) as _e:
                     logger.warning("Periodic %s re-ingest failed, continuing: %s", label, _e)
+                    ctx.errors.append(f"Re-ingest ({label}): {type(_e).__name__}: {_e}")
                     try:
                         session.rollback()
                     except Exception:

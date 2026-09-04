@@ -704,9 +704,12 @@ class TelegramAdapter(BaseAdapter):
                     _waited = _now - _wait_start
                     if last_progress_time[0] >= _prev_wake:
                         _stall = 0.0
-                    elif _waited >= wait_secs * 0.75:
-                        # Loop was free through the window and no bytes
-                        # arrived — genuine stall time.
+                    elif wait_secs * 0.75 <= _waited <= wait_secs * 1.5:
+                        # The wait returned ON TIME (loop was free through the
+                        # window) and no bytes arrived — genuine stall time.
+                        # A wait that returns LATE (loop blocked by the
+                        # synchronous parse COPY; the download itself could not
+                        # run either) must NOT accumulate.
                         _stall += _now - _prev_wake
                     if _stall > stall_seconds:
                         task.cancel()

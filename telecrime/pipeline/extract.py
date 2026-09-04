@@ -220,9 +220,17 @@ class ExtractStage(PipelineStage):
                     group.base_name,
                     [p.name for p in archive_paths],
                 )
+                # The group must NOT stay READY: the main loop would re-pick it
+                # EVERY iteration of EVERY run, creating a fresh job each time
+                # (attempts never counted → the retry bound never trips).
+                # Mark FAILED like other retryable extraction errors so the
+                # startup-recovery bound (3 attempts → FAILED_TERMINAL)
+                # applies, and count this attempt.
                 job.status = ExtractionStatus.FAILED
+                job.attempts_count = (job.attempts_count or 0) + 1
                 job.last_error_code = "VOLUME_MISSING"
                 job.last_error_message = "Split parts renamed by collision"
+                group.status = GroupStatus.FAILED
                 return False
 
         # Dispatch direct .txt files — skip 7z and the disk space check entirely

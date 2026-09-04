@@ -460,6 +460,12 @@ class ParseStage(PipelineStage):
                     total_duplicates += dups_found
                     ctx.credentials_parsed += creds_found
                     ctx.duplicates_skipped += dups_found
+                    # Success: the group's files are fully parsed — finalize
+                    # may clean it. (Never clearing this set meant a
+                    # once-failed group was re-parsed before every download
+                    # and NEVER finalized, even after success.)
+                    if job.group_id is not None:
+                        ctx.parse_failed_group_ids.discard(job.group_id)
                 except Exception as e:
                     try:
                         ctx.session.rollback()
@@ -547,6 +553,8 @@ class ParseStage(PipelineStage):
                 total_duplicates += dups_found
                 ctx.credentials_parsed += creds_found
                 ctx.duplicates_skipped += dups_found
+                if job.group_id is not None:
+                    ctx.parse_failed_group_ids.discard(job.group_id)
         finally:
             _reset_pg_bulk_settings(ctx.session)
 

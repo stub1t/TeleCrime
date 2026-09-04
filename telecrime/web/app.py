@@ -1284,8 +1284,15 @@ def _check_watchlist(engine, *, incremental_only: bool = False) -> None:
                         item.last_known_count = int(item.last_known_count or 0) + delta
                     else:
                         count = _watchlist_count(conn, item.query, item.match_type)
-                        item.new_count = max(0, count - item.last_known_count)
-                        item.last_known_count = count
+                        if item.last_known_count is None:
+                            # Sentinel from a timed-out initial count: seed the
+                            # baseline WITHOUT alerting on every historical
+                            # match.
+                            item.last_known_count = count
+                            item.new_count = 0
+                        else:
+                            item.new_count = max(0, count - item.last_known_count)
+                            item.last_known_count = count
                     item.last_checked_at = now
                 except Exception as e:
                     msg = str(e)
@@ -4537,17 +4544,24 @@ def create_app(database_url: str | None = None) -> FastAPI:
         if match_type not in ("any", "domain", "user", "url"):
             match_type = "any"
 
-        def _initial_count() -> int:
+        def _initial_count() -> int | None:
             with engine.connect() as conn:
                 conn.execute(text("SET LOCAL statement_timeout = '30s'"))
                 try:
                     return _watchlist_count(conn, query, match_type)
                 except Exception:
                     # Query too expensive for the 30s budget — accept the item
-                    # with an unknown count; the background worker fills it in.
-                    return 0
+                    # with an UNKNOWN count. None is stored as a sentinel so
+                    # the background worker seeds the baseline WITHOUT firing
+                    # every historical match as a new alert.
+                    return None
 
-        count = await asyncio.to_thread(_initial_count)
+        try:
+            count = await asyncio.wait_for(
+                asyncio.to_thread(_initial_count), timeout=35
+            )
+        except TimeoutError:
+            count = None
 
         with get_session(engine) as session:
             session.add(WatchlistItem(

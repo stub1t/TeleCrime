@@ -132,6 +132,17 @@ class AcquireStage(PipelineStage):
                 artifact.local_path = str(existing_path)
                 artifact.temp_path = None
                 artifact.status = DownloadStatus.COMPLETED
+                # Size alone cannot distinguish a DIFFERENT same-name+same-size
+                # file — verify content. Recovery is startup-only, so the
+                # one-time hash read is cheap vs re-downloading multi-GB.
+                try:
+                    artifact.content_hash = self._compute_hash_sync(existing_path)
+                    artifact.verified_size = existing_path.stat().st_size
+                except Exception as hash_err:
+                    logger.warning(
+                        "Could not hash recovered artifact %d (%s): %s",
+                        artifact.id, filename or "unknown", hash_err,
+                    )
                 logger.info(
                     "Recovered artifact %d (%s) → COMPLETED (file on disk)",
                     artifact.id, filename or "unknown",
@@ -196,6 +207,16 @@ class AcquireStage(PipelineStage):
         cleaned = 0
         for group in stale_groups:
             if not group.parts:
+                continue
+            # A group with a DOWNLOADING part is NOT stale: group.updated_at
+            # only moves on status changes, so a first part stuck mid-download
+            # across a long drive-wedge freeze leaves the timestamp older than
+            # the cutoff even though work is active. A part still PENDING
+            # after 30 days was never downloaded — that IS stale.
+            if any(
+                part.artifact.status == DownloadStatus.DOWNLOADING
+                for part in group.parts
+            ):
                 continue
             any_completed = any(
                 part.artifact.status == DownloadStatus.COMPLETED for part in group.parts
