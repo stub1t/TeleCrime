@@ -35,14 +35,17 @@ CREDENTIAL_FILE_PATTERNS = [
     # credential files, ~1.1 TB, were rejected before these were added):
     # "@TXTLOG_ALIEN - 712.txt", "@InfernoUrl [URL LOG PASS PRIVATE 133].txt",
     # "@segacloud BIG URL LOGIN PASS (2).txt", "HotmailValid @MASTER_CLOUDS.txt",
-    # "Uk_Gov_Service_by@Master_clouds.txt". Word-boundary tokens so
-    # "catalog.txt"/"analog.txt"/"dialog.txt" stay excluded.
-    r"\b(?:pass|login|logins|log|combo|dump|account|accounts|url|mail|creds?)\b.*\.txt$",
+    # "Uk_Gov_Service_by@Master_clouds.txt". STRONG tokens match alone;
+    # WEAK tokens (log/url/mail/account/valid) only in combination — a bare
+    # "log.txt"/"mail.txt"/"url.txt"/"valid.txt" is not a credential dump.
+    r"\b(?:pass|login|logins|combo|dump|dumps|creds?|ulp|txtlog)\b.*\.txt$",
+    r"\b(?:log|url|mail|account|accounts|valid)\b.*\b(?:pass|login|logins|combo|dump|creds?|ulp|txtlog)\b.*\.txt$",
+    r"\b(?:pass|login|logins|combo|dump|dumps|creds?|ulp|txtlog)\b.*\.txt$",
+    r"(?:txtlog|url\s*log(?:in)?\s*pass|log\s*in\s*pass|login\s*pass|mail.*\bpass).*\.txt$",
     r"@[\w. -]+\s*-\s*\d+.*\.txt$",
-    r"(?:hotmail|gmail|yahoo|outlook|mail)[\w .-]*\.txt$",
-    r"valid.*\.txt$",
+    r"(?:hotmail|gmail|yahoo|outlook)[\w .@-]*\.txt$",
+    r"\bmail\b.*\b(?:pass|login|combo|dump|valid)\b.*\.txt$",
     r"private.*(?:log|pass|url|dump).*\.txt$",
-    r"\bby@[\w. -]+\.txt$",
     r"by@[\w. -]+\.txt$",
 ]
 

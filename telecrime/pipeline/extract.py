@@ -155,9 +155,14 @@ class ExtractStage(PipelineStage):
         extractor: SevenZipExtractor | UnrarExtractor,
     ) -> bool:
         """Extract a single archive group."""
-        # Create or get extraction job
+        # Create or get extraction job. NOTE: startup recovery resets FAILED
+        # jobs to PENDING, so a group with accumulated FAILED jobs from
+        # earlier runs can have SEVERAL PENDING rows — take the oldest and
+        # let attempts accumulate on it (a scalar_one_or_none would raise
+        # MultipleResultsFound on such groups, permanently wedging them).
         job = ctx.session.execute(
-            select(ExtractionJob).where(
+            select(ExtractionJob)
+            .where(
                 ExtractionJob.group_id == group.id,
                 ExtractionJob.status.in_(
                     [
@@ -166,7 +171,9 @@ class ExtractStage(PipelineStage):
                     ]
                 ),
             )
-        ).scalar_one_or_none()
+            .order_by(ExtractionJob.id)
+            .limit(1)
+        ).scalars().first()
 
         if job is None:
             job = ExtractionJob(
@@ -686,31 +693,23 @@ class ExtractStage(PipelineStage):
         # candidates are freshly created (times_failed=0) on EVERY run, so
         # without this filter the same exhausted values are retried forever
         # ("all 37 password candidates failed" repeating across runs).
-        # Two problems fixed here:
-        #  1. fresh rows never carry their failure history — merge it from
-        #     the conversation's existing rows by value;
-        #  2. the old "ever succeeded" exemption kept rotated-out passwords
-        #     alive forever — 146 archives were permanently stuck retrying
-        #     values that failed 3+ times AFTER their last success.
-        # A value with times_failed >= MAX is not working NOW; a channel that
-        # rotates a password back will still work (the archive is retried
-        # with every other candidate; only a manual retry re-adds it).
-        _history: dict[str, tuple[int, int]] = {}
-        for _row in ctx.session.execute(
-            select(PasswordCandidate.value, PasswordCandidate.times_failed,
-                   PasswordCandidate.times_succeeded).where(
+        # CRITICAL detail: the `existing` query above AUTOFLUSHED the fresh
+        # (0,0) candidate rows into the DB — they come back in `existing`
+        # and would survive any filter applied to new_candidates only. The
+        # exhausted values must be filtered from BOTH pools by VALUE.
+        _failed_rows = ctx.session.execute(
+            select(PasswordCandidate.value).where(
                 PasswordCandidate.conversation_id == message.conversation_id,
+                PasswordCandidate.times_failed >= MAX_FAILED_ATTEMPTS,
             )
-        ):
-            _v, _f, _s = _row
-            _h = _history.get(_v)
-            if _h is None or _f > _h[0]:
-                _history[_v] = (_f, _s)
-        exhausted = {v for v, (f, _s) in _history.items() if f >= MAX_FAILED_ATTEMPTS}
+        ).scalars().all()
+        exhausted = set(_failed_rows)
         if exhausted:
+            existing = [c for c in existing if c.value not in exhausted]
             new_candidates = [c for c in new_candidates if c.value not in exhausted]
         # Carry accumulated failure/success history onto fresh candidates so
         # their ranking reflects reality (rank_passwords boosts success).
+        _history = {c.value: (c.times_failed, c.times_succeeded) for c in existing}
         for c in new_candidates:
             h = _history.get(c.value)
             if h is not None and c.times_failed == 0 and c.times_succeeded == 0:

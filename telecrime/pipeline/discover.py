@@ -128,6 +128,30 @@ class DiscoverStage(PipelineStage):
         """Run the discover stage."""
         logger.info("Starting archive discovery")
 
+        # Tombstone sweep: files stamped archive_type='' BEFORE the round-13
+        # credential-gate expansion are permanently stranded (discover only
+        # scans archive_type IS NULL). Reset any tombstoned file that NOW
+        # passes the gate so it is re-classified and picked up.
+        from telecrime.stealer.patterns import is_credential_file
+
+        _tombstoned = ctx.session.execute(
+            select(FileAttachment).where(
+                FileAttachment.is_archive_candidate == False,
+                FileAttachment.archive_type == "",
+            )
+        ).scalars().all()
+        _reset = 0
+        for _att in _tombstoned:
+            if _att.filename and is_credential_file(_att.filename):
+                _att.archive_type = None
+                _reset += 1
+        if _reset:
+            ctx.session.commit()
+            logger.info(
+                "Credential gate sweep: reset %d tombstoned .txt files for re-discovery",
+                _reset,
+            )
+
         # Find all unprocessed attachments
         attachments = ctx.session.execute(
             select(FileAttachment).where(
