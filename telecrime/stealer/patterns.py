@@ -46,10 +46,14 @@ r"(?:^|[_ ])(?:pass|login|logins|combo|dump|dumps|creds?|ulp|txtlog)\w*\.txt$",
     r"(?:txtlog|url\s*log(?:in)?\s*pass|log\s*in\s*pass|login\s*pass|mail\s*pass).*\.txt$",
     r"\b(?:email|mail|valid)(?:pass|creds?|dump|login|list|account|id|pwd)\w*\.txt$",
     r"passwords?\s*(?:backup|list|dump).*\.txt$",
-    r"@[\w. ()\[\]-]{2,}\.txt$",
-    r"@[\w. -]+\s*-\s*\d+.*\.txt$",
-    r"(?:hotmail|gmail|yahoo|outlook)[\w .@-]*\.txt$",
-    r"\b(?:mansory|raven|segacloud|anubis|wangling|plunder|azul|inferno)[\w .-]*\.txt$",
+    # ^ anchor REQUIRED: without it, "notes@example.com.txt" matches via
+    # re.search. Channel dump names start with @.
+    r"^@[\w. ()\[\]-]{2,}\.txt$",
+    r"^@[\w. #-]+\s*-\s*\d+.*\.txt$",
+    r"(?:hotmail|gmail|yahoo|outlook)[\w .@()-]*\.txt$",
+    r"\b(?:mansory|raven|segacloud|anubis|wangling|plunder|azul|inferno)[\w .()-]*\.txt$",
+    r"\b(?:mix)\b.*\d.*\.txt$",
+    r"[a-z0-9]+_com\.txt$",
     r"private.*(?:log|pass|url|dump).*\.txt$",
     r"by@[\w. -]+\.txt$",
 ]

@@ -140,7 +140,7 @@ class DiscoverStage(PipelineStage):
                 FileAttachment.archive_type == "",
                 # The gate only ever matches .txt names — skip the 8K+ rows
                 # of tombstoned images/videos/exes on every discover run.
-                FileAttachment.filename.like("%.txt"),
+                FileAttachment.filename.ilike("%.txt"),
             )
         ).scalars().all()
         _reset = 0

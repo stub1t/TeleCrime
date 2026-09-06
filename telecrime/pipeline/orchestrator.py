@@ -997,31 +997,29 @@ async def run_sequential_pipeline(
                         retry_ids.append(_g.id)
                         continue
                     # FAILED: retry up to MAX_ATTEMPTS total extraction attempts.
-                    # Count attempts ONLY on the job that will actually be
-                    # picked next (_extract_group takes the OLDEST PENDING
-                    # job). max() over ALL jobs is wrong: a group with an old
-                    # failed job at attempts=3 plus retryable PENDING jobs
-                    # (from the round-13 reset) would be terminalized even
-                    # though a fresh attempt never ran — finalize then
-                    # deletes the downloaded archive (620 GB of wedged groups
-                    # were lost exactly this way).
-                    _retained_attempts = (
-                        session.execute(
-                            select(ExtractionJob.attempts_count)
-                            .where(
-                                ExtractionJob.group_id == _g.id,
-                                ExtractionJob.status.in_(
-                                    [
-                                        ExtractionStatus.PENDING,
-                                        ExtractionStatus.PASSWORD_NEEDED,
-                                    ]
-                                ),
-                            )
-                            .order_by(ExtractionJob.id)
-                            .limit(1)
-                        ).scalar()
-                        or 0
-                    )
+                    # Count attempts on the job _extract_group will actually
+                    # pick AFTER the reset below: the oldest PENDING/
+                    # PASSWORD_NEEDED job if one exists, ELSE the oldest FAILED
+                    # job (which the reset turns into PENDING). Round-15's
+                    # PENDING-only query ran BEFORE the reset and saw None for
+                    # all-FAILED groups — the cap never tripped and failed
+                    # groups were re-extracted once per run forever.
+                    _retained = session.execute(
+                        select(ExtractionJob.id, ExtractionJob.attempts_count)
+                        .where(
+                            ExtractionJob.group_id == _g.id,
+                            ExtractionJob.status.in_(
+                                [
+                                    ExtractionStatus.PENDING,
+                                    ExtractionStatus.PASSWORD_NEEDED,
+                                    ExtractionStatus.FAILED,
+                                ]
+                            ),
+                        )
+                        .order_by(ExtractionJob.id)
+                        .limit(1)
+                    ).first()
+                    _retained_attempts = _retained[1] if _retained else 0
                     if _retained_attempts >= job_max_attempts:
                         terminal_ids.append(_g.id)
                     else:

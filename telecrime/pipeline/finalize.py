@@ -70,6 +70,7 @@ class FinalizeStage(PipelineStage):
             .options(
                 selectinload(ArchiveGroup.parts)
                 .selectinload(ArchiveGroupPart.artifact),
+                selectinload(ArchiveGroup.extraction_jobs),
             )
         ).scalars().all()
 
@@ -195,8 +196,13 @@ class FinalizeStage(PipelineStage):
         # wedged group whose old failed job hit the attempts cap while a
         # fresh retry is queued). Deleting the archive here would destroy a
         # recoverable download; only clean groups whose jobs are all settled.
+        # A PENDING job already AT the attempts cap is genuinely terminal —
+        # skipping cleanup for it would flap the group forever.
+        _job_max_attempts = 3
         _pending = any(
-            job.status == ExtractionStatus.PENDING for job in group.extraction_jobs
+            job.status == ExtractionStatus.PENDING
+            and (job.attempts_count or 0) < _job_max_attempts
+            for job in group.extraction_jobs
         )
         if _pending:
             logger.warning(
