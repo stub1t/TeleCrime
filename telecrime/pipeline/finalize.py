@@ -22,7 +22,7 @@ from telecrime.models import (
     ParsedCredential,
 )
 from telecrime.pipeline.orchestrator import PipelineContext, PipelineStage
-from telecrime.states import DownloadStatus, GroupStatus
+from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +190,23 @@ class FinalizeStage(PipelineStage):
 
     async def _finalize_failed_group(self, ctx: PipelineContext, group: ArchiveGroup) -> None:
         """Cleanup one failed group to reclaim disk space."""
+        # A group marked FAILED_TERMINAL with a PENDING job still holding the
+        # archive is NOT terminal — the PENDING attempt never ran (e.g. a
+        # wedged group whose old failed job hit the attempts cap while a
+        # fresh retry is queued). Deleting the archive here would destroy a
+        # recoverable download; only clean groups whose jobs are all settled.
+        _pending = any(
+            job.status == ExtractionStatus.PENDING for job in group.extraction_jobs
+        )
+        if _pending:
+            logger.warning(
+                "Skipping cleanup of failed group %s — a PENDING extraction "
+                "job still needs the archive",
+                group.base_name,
+            )
+            group.status = GroupStatus.FAILED
+            ctx.session.flush()
+            return
         if not ctx.dry_run:
             await self._cleanup_archives(ctx, group)
             await self._cleanup_extracted_files(ctx, group)

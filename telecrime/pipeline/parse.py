@@ -654,7 +654,11 @@ class ParseStage(PipelineStage):
         # Threshold of 2 means "we've seen this content in 3 separate archives";
         # finalize() always inserts the first row (creates new fsi entry with
         # duplicate_count=0); each subsequent archive bumps duplicate_count.
-        _preskip_dup_threshold = 2
+        # Threshold 1 (was 2): a file whose content was seen in 2 archives is
+        # overwhelmingly a pure repost — skipping the 3rd copy saves minutes
+        # of parse on multi-GB dumps while the queue rots (deleted-message
+        # files convert recoverable archives into permanent losses).
+        _preskip_dup_threshold = 1
         all_output_hashes = [o.output_hash for o in credential_outputs if o.output_hash]
         from telecrime.models import FirstSeenIndex
         preskip_hashes: set[str] = set()

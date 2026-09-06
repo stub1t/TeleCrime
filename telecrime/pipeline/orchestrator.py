@@ -943,6 +943,43 @@ async def run_sequential_pipeline(
             # during extraction) or transiently FAILED (retryable extraction
             # error) back to READY so they are re-processed this run.  Groups
             # whose extraction already failed the configured max number of
+            # Collapse duplicate PENDING jobs per group: _extract_group only ever uses
+            # the oldest PENDING job, so accumulated duplicates (from failed
+            # runs pre-round-14 reset) are dead rows that grew unboundedly
+            # (2,733 live). Keep the highest-attempts one so the terminal cap
+            # still trips; terminalize the rest.
+            _pending_rows = session.execute(
+                select(
+                    ExtractionJob.id,
+                    ExtractionJob.group_id,
+                    ExtractionJob.attempts_count,
+                )
+                .where(ExtractionJob.status == ExtractionStatus.PENDING)
+                .order_by(
+                    ExtractionJob.group_id,
+                    ExtractionJob.attempts_count.desc(),
+                    ExtractionJob.id,
+                )
+            ).all()
+            _best_per_group: dict[int, int] = {}
+            for _pid, _gid, _att in _pending_rows:
+                _best_per_group.setdefault(_gid, _pid)
+            _collapse_ids = [
+                r[0] for r in _pending_rows if _best_per_group.get(r[1]) != r[0]
+            ]
+            if _collapse_ids:
+                session.execute(
+                    update(ExtractionJob)
+                    .where(ExtractionJob.id.in_(_collapse_ids))
+                    .values(status=ExtractionStatus.FAILED_TERMINAL)
+                )
+                logger.info(
+                    "Startup recovery: collapsed %d duplicate PENDING jobs "
+                    "(kept highest-attempts per group)",
+                    len(_collapse_ids),
+                )
+                session.commit()
+
             # times stay FAILED_TERMINAL (no endless retry loop).
             stuck = session.execute(
                 select(ArchiveGroup).where(
@@ -960,15 +997,32 @@ async def run_sequential_pipeline(
                         retry_ids.append(_g.id)
                         continue
                     # FAILED: retry up to MAX_ATTEMPTS total extraction attempts.
-                    attempts = (
+                    # Count attempts ONLY on the job that will actually be
+                    # picked next (_extract_group takes the OLDEST PENDING
+                    # job). max() over ALL jobs is wrong: a group with an old
+                    # failed job at attempts=3 plus retryable PENDING jobs
+                    # (from the round-13 reset) would be terminalized even
+                    # though a fresh attempt never ran — finalize then
+                    # deletes the downloaded archive (620 GB of wedged groups
+                    # were lost exactly this way).
+                    _retained_attempts = (
                         session.execute(
-                            select(func.max(ExtractionJob.attempts_count)).where(
-                                ExtractionJob.group_id == _g.id
+                            select(ExtractionJob.attempts_count)
+                            .where(
+                                ExtractionJob.group_id == _g.id,
+                                ExtractionJob.status.in_(
+                                    [
+                                        ExtractionStatus.PENDING,
+                                        ExtractionStatus.PASSWORD_NEEDED,
+                                    ]
+                                ),
                             )
+                            .order_by(ExtractionJob.id)
+                            .limit(1)
                         ).scalar()
                         or 0
                     )
-                    if attempts >= job_max_attempts:
+                    if _retained_attempts >= job_max_attempts:
                         terminal_ids.append(_g.id)
                     else:
                         retry_ids.append(_g.id)

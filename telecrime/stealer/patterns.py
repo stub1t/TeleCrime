@@ -38,13 +38,18 @@ CREDENTIAL_FILE_PATTERNS = [
     # "Uk_Gov_Service_by@Master_clouds.txt". STRONG tokens match alone;
     # WEAK tokens (log/url/mail/account/valid) only in combination — a bare
     # "log.txt"/"mail.txt"/"url.txt"/"valid.txt" is not a credential dump.
-    r"\b(?:pass|login|logins|combo|dump|dumps|creds?|ulp|txtlog)\b.*\.txt$",
-    r"\b(?:log|url|mail|account|accounts|valid)\b.*\b(?:pass|login|logins|combo|dump|creds?|ulp|txtlog)\b.*\.txt$",
-    r"\b(?:pass|login|logins|combo|dump|dumps|creds?|ulp|txtlog)\b.*\.txt$",
-    r"(?:txtlog|url\s*log(?:in)?\s*pass|log\s*in\s*pass|login\s*pass|mail.*\bpass).*\.txt$",
+r"(?:^|[_ ])(?:pass|login|logins|combo|dump|dumps|creds?|ulp|txtlog)\w*\.txt$",
+    r"(?:^|[_ ])(?:pass|login|logins|combo|dump|dumps|creds?|ulp|txtlog)"
+    r"\w*.*(?:^|[_ ])(?:log|url|mail|account|accounts|valid)\b.*\.txt$",
+    r"\b(?:log|url|mail|account|accounts|valid)\b.*(?:^|[_ ])(?:pass|login|logins|combo|dump|dumps|creds?|ulp|"
+    r"txtlog)\w*\.txt$",
+    r"(?:txtlog|url\s*log(?:in)?\s*pass|log\s*in\s*pass|login\s*pass|mail\s*pass).*\.txt$",
+    r"\b(?:email|mail|valid)(?:pass|creds?|dump|login|list|account|id|pwd)\w*\.txt$",
+    r"passwords?\s*(?:backup|list|dump).*\.txt$",
+    r"@[\w. ()\[\]-]{2,}\.txt$",
     r"@[\w. -]+\s*-\s*\d+.*\.txt$",
     r"(?:hotmail|gmail|yahoo|outlook)[\w .@-]*\.txt$",
-    r"\bmail\b.*\b(?:pass|login|combo|dump|valid)\b.*\.txt$",
+    r"\b(?:mansory|raven|segacloud|anubis|wangling|plunder|azul|inferno)[\w .-]*\.txt$",
     r"private.*(?:log|pass|url|dump).*\.txt$",
     r"by@[\w. -]+\.txt$",
 ]
