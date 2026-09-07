@@ -272,3 +272,60 @@ async def test_pipeline_start_and_activity_summary_render(notifier):
     assert "Pipeline started" in send.call_args_list[0].args[1]
     assert "Last hour summary" in send.call_args_list[1].args[1]
     assert "Channels" in send.call_args_list[2].args[1]
+
+
+@pytest.mark.asyncio
+async def test_digest_includes_live_status_section():
+    """The digest carries a 'Pipeline' section with live status."""
+    client = MagicMock()
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock()
+    n = TelegramNotifier(client=client, enabled=True)
+
+    async def _status():
+        return {
+            "stage": "parse",
+            "archive_index": 203,
+            "archive_total": 3887,
+            "current_archive": "big.txt",
+            "pending": 450,
+            "free_disk_gb": 342,
+            "errors": 0,
+        }
+
+    n.status_provider = _status
+    await n.archive_parsed("a.zip", 1000, 500, 3)
+    await n.flush()
+    text = client.send_message.call_args.args[1]
+    assert "Progress digest" in text
+    assert "Pipeline" in text
+    assert "parse" in text
+    assert "203 / 3,887" in text
+    assert "450" in text  # queue
+    assert "342 GB" in text
+
+
+@pytest.mark.asyncio
+async def test_digest_flush_sends_watchlist_alerts():
+    """Watchlist hits ride on the digest flush via the provider."""
+    client = MagicMock()
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock()
+    n = TelegramNotifier(client=client, enabled=True)
+
+    async def _wl():
+        return [{
+            "label": "paypal",
+            "query": "paypal",
+            "new_matches": 3,
+            "hits": [{"domain": "paypal.com", "username": "a@b.com",
+                      "password": "secret", "source_archive": "x.zip"}],
+        }]
+
+    n.watchlist_provider = _wl
+    await n.archive_parsed("a.zip", 100, 0, 1)
+    await n.flush()
+    assert client.send_message.await_count == 2
+    second = client.send_message.call_args_list[1].args[1]
+    assert "Watchlist hits" in second
+    assert "paypal" in second

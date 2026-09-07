@@ -485,6 +485,59 @@ def run(
 
                 # Create notifier for progress updates to Saved Messages
                 notifier = TelegramNotifier(adapter.client, enabled=True)
+
+                # Live status + watchlist providers ride on the pipeline's
+                # Telegram session: the scheduler's own notify jobs defer
+                # while the pipeline runs, so digests carry both a "what is
+                # the pipeline doing" section and any new watchlist hits.
+                from telecrime.pipeline.progress import read_progress as _read_progress
+
+                async def _status_provider():
+                    try:
+                        _prog = _read_progress() or {}
+                    except Exception:
+                        _prog = {}
+                    _pending = None
+                    try:
+                        from sqlalchemy import func
+
+                        from telecrime.models import DownloadArtifact
+                        from telecrime.states import DownloadStatus
+
+                        with get_session(engine) as _s:
+                            _pending = (
+                                _s.query(func.count(DownloadArtifact.id))
+                                .filter(DownloadArtifact.status == DownloadStatus.PENDING)
+                                .scalar()
+                                or 0
+                            )
+                    except Exception:
+                        pass
+                    _free_gb = None
+                    try:
+                        import shutil
+
+                        _free_gb = shutil.disk_usage(config.data_dir).free / (1024 ** 3)
+                    except Exception:
+                        pass
+                    return {
+                        "stage": _prog.get("current_stage"),
+                        "archive_index": _prog.get("archive_index"),
+                        "archive_total": _prog.get("archive_total"),
+                        "current_archive": _prog.get("current_archive"),
+                        "pending": _pending,
+                        "free_disk_gb": _free_gb,
+                        "errors": _prog.get("errors"),
+                    }
+
+                from telecrime.scheduler import _collect_watchlist_alerts
+
+                async def _watchlist_provider():
+                    return await asyncio.to_thread(_collect_watchlist_alerts, engine)
+
+                notifier.status_provider = _status_provider
+                notifier.watchlist_provider = _watchlist_provider
+
                 with get_session(engine) as session:
                     # Disable idle-in-transaction timeout for the pipeline session.
                     # The pipeline commits before each long network/I/O operation,
