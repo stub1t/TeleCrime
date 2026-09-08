@@ -5,10 +5,11 @@ from sqlalchemy import inspect, text
 _PG_SEARCH_COLUMNS = ["domain", "username"]
 
 # Trigram GIN indexes backing the ILIKE search path, keyed by column.
+# NOTE: ix_pc_url_trgm was DELIBERATELY dropped by migration v2w3x4y5z6a7
+# (largest credential GIN index) and must never be recreated here.
 _PG_TRGM_INDEXES = {
     "ix_pc_domain_trgm": "domain",
     "ix_pc_username_trgm": "username",
-    "ix_pc_url_trgm": "url",
 }
 
 # Schema introspection cache: (engine_url, table, column) -> bool.
@@ -57,9 +58,9 @@ def ensure_fts(engine, rebuild: bool = False) -> bool:
 
     The GIN indexes are normally created by Alembic migration i9j0k1l2m3n4;
     indexes deliberately dropped by later migrations (email_domain,
-    source_archive) are not recreated here. rebuild=True drops and recreates
-    the remaining indexes inside a single transaction — if any step fails the
-    transaction rolls back and the old indexes stay intact.
+    source_archive, url) are not recreated here. rebuild=True drops and
+    recreates the remaining indexes inside a single transaction — if any step
+    fails the transaction rolls back and the old indexes stay intact.
     """
     try:
         with engine.begin() as conn:

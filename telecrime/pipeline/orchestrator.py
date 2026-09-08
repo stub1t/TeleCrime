@@ -871,6 +871,12 @@ def _run_startup_recovery(session: Session, config: Config) -> None:
             # PENDING-only query ran BEFORE the reset and saw None for
             # all-FAILED groups — the cap never tripped and failed
             # groups were re-extracted once per run forever.
+            # FAILED_TERMINAL jobs are included so their attempts_count
+            # (incremented before the terminal error) still counts toward
+            # the cap — otherwise a group whose job went terminal with the
+            # group left FAILED (extract.py terminal-error paths) shows
+            # attempts=0 and retries once per run forever, creating a fresh
+            # job every time.
             _retained = session.execute(
                 select(ExtractionJob.id, ExtractionJob.attempts_count)
                 .where(
@@ -880,6 +886,7 @@ def _run_startup_recovery(session: Session, config: Config) -> None:
                             ExtractionStatus.PENDING,
                             ExtractionStatus.PASSWORD_NEEDED,
                             ExtractionStatus.FAILED,
+                            ExtractionStatus.FAILED_TERMINAL,
                         ]
                     ),
                 )

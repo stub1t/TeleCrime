@@ -1460,6 +1460,11 @@ def _collect_watchlist_alerts(engine) -> list[dict]:
                                 "new_matches": new_matches,
                                 "total_matches": current,
                                 "hits": hits,
+                                # Window anchor: advance to the COLLECTION time,
+                                # not send time — hits created between collection
+                                # and delivery must surface next interval, not
+                                # be skipped by an over-eager advance.
+                                "collected_at": now,
                             }
                         )
                 else:
@@ -1491,6 +1496,7 @@ def _collect_watchlist_alerts(engine) -> list[dict]:
                                 "new_matches": new_matches,
                                 "total_matches": total,
                                 "hits": hits,
+                                "collected_at": now,
                             }
                         )
         except Exception as exc:
@@ -1504,21 +1510,22 @@ def _advance_watchlist_alerts(engine, alerts: list[dict]) -> None:
 
     Previously _collect_watchlist_alerts bumped last_alerted_at before the
     send; a transient Telegram failure then permanently dropped those hits
-    (the window had already moved past them).
+    (the window had already moved past them). The window advances to the
+    collection timestamp (not send time) so credentials created during the
+    send surface on the next interval.
     """
     if not alerts:
         return
     from telecrime.database import get_session
     from telecrime.models.watchlist import WatchlistItem
 
-    now = datetime.now(UTC)
     try:
         with get_session(engine) as session:
             for alert in alerts:
                 item = session.get(WatchlistItem, alert["id"])
                 if item is None:
                     continue
-                item.last_alerted_at = now
+                item.last_alerted_at = alert.get("collected_at") or datetime.now(UTC)
                 item.last_alerted_count = int(alert.get("total_matches") or 0)
             session.commit()
     except Exception as exc:
@@ -1602,13 +1609,20 @@ def _run_watchlist_notify_job(config, engine) -> str:
     if not alerts:
         return "no new watchlist hits"
 
-    result = _send_telegram_notification(
-        config, lambda notifier: notifier.watchlist_alerts(alerts)
-    )
-    if result != "ok":
-        # Transient failure — do NOT advance the alert window, or the hits
-        # would be silently dropped (they'd never re-alert next interval).
-        return result
+    # Capture the notifier's send result: send() swallows failures internally
+    # (returns False) rather than raising, so "ok" alone is not proof of
+    # delivery — the alert window must only advance on a confirmed send.
+    _sent = False
+
+    async def _send(notifier) -> None:
+        nonlocal _sent
+        _sent = await notifier.watchlist_alerts(alerts)
+
+    result = _send_telegram_notification(config, _send)
+    if result != "ok" or not _sent:
+        # Failure — do NOT advance the alert window, or the hits would be
+        # silently dropped (they'd never re-alert next interval).
+        return result if result != "ok" else "send failed (will retry next interval)"
     _advance_watchlist_alerts(engine, alerts)
     new_total = sum(int(alert["new_matches"]) for alert in alerts)
     return f"alerted on {new_total:,} new watchlist matches across {len(alerts)} items"

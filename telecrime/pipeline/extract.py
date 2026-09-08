@@ -478,7 +478,13 @@ class ExtractStage(PipelineStage):
             job.status = ExtractionStatus.FAILED_TERMINAL if terminal else ExtractionStatus.FAILED
             job.last_error_code = result.error_code
             job.last_error_message = result.error_message
-            group.status = GroupStatus.FAILED
+            # Terminal errors must terminalize the GROUP too: leaving it FAILED
+            # with a FAILED_TERMINAL job made startup recovery see attempts=0
+            # (its job-status filter excluded terminal jobs) and retry the
+            # group once per run forever, creating a fresh job each time.
+            group.status = (
+                GroupStatus.FAILED_TERMINAL if terminal else GroupStatus.FAILED
+            )
             logger.error("Extraction failed for %s: %s", main_archive.name, result.error_message)
             return False
 
@@ -506,7 +512,10 @@ class ExtractStage(PipelineStage):
             logger.error("Failed to link/copy txt file %s: %s", txt_path.name, e)
             job.status = ExtractionStatus.FAILED_TERMINAL
             job.last_error_message = str(e)
-            group.status = GroupStatus.FAILED
+            # Match the group's status to the job's, or startup recovery
+            # retries the group forever with fresh jobs (terminal job's
+            # attempts never counted).
+            group.status = GroupStatus.FAILED_TERMINAL
             return False
 
         await self._record_outputs(ctx, job, group, [dest])
