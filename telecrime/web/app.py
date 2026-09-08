@@ -1184,37 +1184,55 @@ def _pg_fast_count_estimates(session, *table_names: str) -> dict[str, int]:
     }
 
 
+def _stats_tiles(session, big_count) -> dict[str, object]:
+    """Build the nine home-page stats tiles.
+
+    The three small tables are real COUNT(*)s; the multi-million-row tables
+    (messages, file_attachments, download_artifacts, extraction_jobs,
+    extracted_outputs, parsed_credentials) come from ``big_count(table_name)``
+    because real counts are seq scans that compete with bulk INSERT I/O.
+    """
+    return {
+        "conversations": session.query(Conversation).count(),
+        "messages": big_count("messages"),
+        "attachments": big_count("file_attachments"),
+        "archives": big_count("download_artifacts"),
+        "archive_groups": session.query(ArchiveGroup).count(),
+        "extractions": big_count("extraction_jobs"),
+        "extracted_outputs": big_count("extracted_outputs"),
+        "credentials": big_count("parsed_credentials"),
+        "channels": session.query(TelegramChannel).count(),
+    }
+
+
+def _daily_credentials(session, excluded_conversations=None) -> list[dict[str, object]]:
+    """Per-day parsed-credential counts for the last 14 days (home chart)."""
+    since_14d = datetime.now(UTC) - timedelta(days=14)
+    query = session.query(
+        func.date(ParsedCredential.created_at).label("day"),
+        func.count(ParsedCredential.id).label("count"),
+    ).filter(ParsedCredential.created_at >= since_14d)
+    if excluded_conversations:
+        query = query.filter(
+            ParsedCredential.source_conversation_id.notin_(excluded_conversations)
+        )
+    rows = (
+        query.group_by(func.date(ParsedCredential.created_at))
+        .order_by(func.date(ParsedCredential.created_at).asc())
+        .all()
+    )
+    return [{"day": str(row.day), "count": row.count} for row in rows]
+
+
 def _compute_home_cache_payload(engine) -> dict[str, object]:
     with get_session(engine) as session:
         if engine.dialect.name == "postgresql":
             session.execute(text("SET LOCAL statement_timeout = '90s'"))
-        stats = {
-            "conversations": session.query(Conversation).count(),
-            "messages": _approx_count(session, "messages"),
-            "attachments": _approx_count(session, "file_attachments"),
-            "archives": _approx_count(session, "download_artifacts"),
-            "archive_groups": session.query(ArchiveGroup).count(),
-            "extractions": _approx_count(session, "extraction_jobs"),
-            "extracted_outputs": _approx_count(session, "extracted_outputs"),
-            "credentials": _approx_count(session, "parsed_credentials"),
-            "channels": session.query(TelegramChannel).count(),
-        }
-        since_14d = datetime.now(UTC) - timedelta(days=14)
-        daily_credentials_14d = (
-            session.query(
-                func.date(ParsedCredential.created_at).label("day"),
-                func.count(ParsedCredential.id).label("count"),
-            )
-            .filter(ParsedCredential.created_at >= since_14d)
-            .group_by(func.date(ParsedCredential.created_at))
-            .order_by(func.date(ParsedCredential.created_at).asc())
-            .all()
-        )
+        stats = _stats_tiles(session, lambda table_name: _approx_count(session, table_name))
+        daily_credentials_14d = _daily_credentials(session)
     return {
         "stats": stats,
-        "daily_credentials_14d": [
-            {"day": str(row.day), "count": row.count} for row in daily_credentials_14d
-        ],
+        "daily_credentials_14d": daily_credentials_14d,
     }
 
 
@@ -1397,17 +1415,15 @@ def _home_stats_fallback(session, credential_count: object) -> dict[str, object]
         "download_artifacts",
         "extraction_jobs",
     )
-    return {
-        "conversations": session.query(Conversation).count(),
-        "messages": estimates.get("messages") or 0,
-        "attachments": estimates.get("file_attachments") or 0,
-        "archives": estimates.get("download_artifacts") or 0,
-        "archive_groups": session.query(ArchiveGroup).count(),
-        "extractions": estimates.get("extraction_jobs") or 0,
-        "extracted_outputs": 0,
-        "credentials": credential_count or 0,
-        "channels": session.query(TelegramChannel).count(),
-    }
+
+    def _fallback_tile_count(table_name: str):
+        if table_name == "parsed_credentials":
+            return credential_count or 0
+        if table_name == "extracted_outputs":
+            return 0
+        return estimates.get(table_name) or 0
+
+    return _stats_tiles(session, _fallback_tile_count)
 
 
 def _hours_between(ts1, ts2):
@@ -2165,6 +2181,45 @@ def _compute_stats_payload(engine, days: int, limit: int) -> dict[str, object]:
     return payload
 
 
+def _build_jobs_rows(statuses, job_defs=None, *, prefer_status_interval=True) -> list[dict]:
+    """Build scheduler job rows for the scheduler page / partial.
+
+    ``interval_hours`` prefers the worker's runtime value (written to the
+    status file after CLI overrides) over the web process's stale JOB_DEFS
+    code default, unless ``prefer_status_interval`` is disabled.
+    """
+    if job_defs is None:
+        from telecrime.scheduler import JOB_DEFS
+
+        job_defs = JOB_DEFS
+    rows = []
+    for name, defn in job_defs.items():
+        st = statuses.get(name)
+        interval_hours = (
+            st.interval_hours
+            if prefer_status_interval and st
+            else defn["interval_hours"]
+        )
+        rows.append(
+            {
+                "name": name,
+                "description": defn["description"],
+                "interval_hours": interval_hours,
+                "requires_telegram": defn["requires_telegram"],
+                "enabled": st is not None
+                and not (
+                    st.last_error and "credentials not configured" in (st.last_error or "")
+                ),
+                "running": st.running if st else False,
+                "last_run": st.last_run if st else None,
+                "last_result": st.last_result if st else None,
+                "last_error": st.last_error if st else None,
+                "next_run": st.next_run if st else None,
+            }
+        )
+    return rows
+
+
 def create_app(database_url: str | None = None) -> FastAPI:
     """Create FastAPI app bound to the Telecrime database."""
     engine = get_engine(database_url)
@@ -2307,20 +2362,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
             daily_credentials_14d: list[dict[str, object]] = []
             if excluded_conversations:
-                since_14d = datetime.now(UTC) - timedelta(days=14)
-                trend_query = session.query(
-                    func.date(ParsedCredential.created_at).label("day"),
-                    func.count(ParsedCredential.id).label("count"),
-                ).filter(ParsedCredential.created_at >= since_14d)
-                trend_query = trend_query.filter(
-                    ParsedCredential.source_conversation_id.notin_(excluded_conversations)
-                )
-                daily_credentials_14d = [
-                    {"day": str(row.day), "count": row.count}
-                    for row in trend_query.group_by(func.date(ParsedCredential.created_at))
-                    .order_by(func.date(ParsedCredential.created_at).asc())
-                    .all()
-                ]
+                daily_credentials_14d = _daily_credentials(session, excluded_conversations)
             elif cached_home and isinstance(cached_home.get("daily_credentials_14d"), list):
                 daily_credentials_14d = cast(
                     list[dict[str, object]], cached_home["daily_credentials_14d"]
@@ -4685,31 +4727,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @app.get("/scheduler", response_class=HTMLResponse)
     def scheduler_page(request: Request, flash: str = "", flash_type: str = ""):
-        from telecrime.scheduler import JOB_DEFS, read_status
+        from telecrime.scheduler import read_status
 
         statuses = read_status()
-        jobs = []
-        for name, defn in JOB_DEFS.items():
-            st = statuses.get(name)
-            jobs.append(
-                {
-                    "name": name,
-                    "description": defn["description"],
-                    # Prefer the worker's runtime value (written to status file after CLI overrides)
-                    # over the web process's stale JOB_DEFS code default.
-                    "interval_hours": st.interval_hours if st else defn["interval_hours"],
-                    "requires_telegram": defn["requires_telegram"],
-                    "enabled": st is not None
-                    and not (
-                        st.last_error and "credentials not configured" in (st.last_error or "")
-                    ),
-                    "running": st.running if st else False,
-                    "last_run": st.last_run if st else None,
-                    "last_result": st.last_result if st else None,
-                    "last_error": st.last_error if st else None,
-                    "next_run": st.next_run if st else None,
-                }
-            )
+        jobs = _build_jobs_rows(statuses)
         return templates.TemplateResponse(
             "scheduler.html",
             {"request": request, "jobs": jobs, "flash": flash, "flash_type": flash_type},
@@ -4729,8 +4750,6 @@ def create_app(database_url: str | None = None) -> FastAPI:
             return RedirectResponse(
                 f"/scheduler?flash=Unknown+job+{job_name}&flash_type=error", status_code=303
             )
-
-        defn = JOB_DEFS[job_name]
 
         def _run_bg():
             from telecrime.config import load_config
@@ -4754,30 +4773,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
         t.start()
 
         if request.headers.get("HX-Request"):
-            from telecrime.scheduler import JOB_DEFS as _JOB_DEFS
             from telecrime.scheduler import read_status
 
             statuses = read_status()
-            jobs = []
-            for name, defn in _JOB_DEFS.items():
-                st = statuses.get(name)
-                jobs.append(
-                    {
-                        "name": name,
-                        "description": defn["description"],
-                        "interval_hours": defn["interval_hours"],
-                        "requires_telegram": defn["requires_telegram"],
-                        "enabled": st is not None
-                        and not (
-                            st.last_error and "credentials not configured" in (st.last_error or "")
-                        ),
-                        "running": st.running if st else False,
-                        "last_run": st.last_run if st else None,
-                        "last_result": st.last_result if st else None,
-                        "last_error": st.last_error if st else None,
-                        "next_run": st.next_run if st else None,
-                    }
-                )
+            jobs = _build_jobs_rows(statuses, prefer_status_interval=False)
             return templates.TemplateResponse(
                 "partials/scheduler_jobs.html",
                 {
@@ -4800,29 +4799,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @app.get("/scheduler/jobs-fragment", response_class=HTMLResponse)
     def scheduler_jobs_fragment(request: Request, flash: str = "", flash_type: str = ""):
-        from telecrime.scheduler import JOB_DEFS, read_status
+        from telecrime.scheduler import read_status
 
         statuses = read_status()
-        jobs = []
-        for name, defn in JOB_DEFS.items():
-            st = statuses.get(name)
-            jobs.append(
-                {
-                    "name": name,
-                    "description": defn["description"],
-                    "interval_hours": st.interval_hours if st else defn["interval_hours"],
-                    "requires_telegram": defn["requires_telegram"],
-                    "enabled": st is not None
-                    and not (
-                        st.last_error and "credentials not configured" in (st.last_error or "")
-                    ),
-                    "running": st.running if st else False,
-                    "last_run": st.last_run if st else None,
-                    "last_result": st.last_result if st else None,
-                    "last_error": st.last_error if st else None,
-                    "next_run": st.next_run if st else None,
-                }
-            )
+        jobs = _build_jobs_rows(statuses)
         return templates.TemplateResponse(
             "partials/scheduler_jobs.html",
             {"request": request, "jobs": jobs, "flash": flash, "flash_type": flash_type},
