@@ -484,7 +484,7 @@ def run(
                     )
 
                 # Create notifier for progress updates to Saved Messages
-                notifier = TelegramNotifier(adapter.client, enabled=True)
+                notifier = TelegramNotifier(adapter.client, enabled=True, adapter=adapter)
 
                 # Live status + watchlist providers ride on the pipeline's
                 # Telegram session: the scheduler's own notify jobs defer

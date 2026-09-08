@@ -38,6 +38,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from telethon import TelegramClient
 
+    from telecrime.adapters.telegram import TelegramAdapter
+
 logger = logging.getLogger(__name__)
 
 # Bound every Telegram network call so a wedged connection (Telethon
@@ -140,9 +142,15 @@ class TelegramNotifier:
         "channel_join", "enrich",
     })
 
-    def __init__(self, client: "TelegramClient", enabled: bool = True):
+    def __init__(
+        self,
+        client: "TelegramClient",
+        enabled: bool = True,
+        adapter: "TelegramAdapter | None" = None,
+    ):
         self.client = client
         self.enabled = enabled
+        self.adapter = adapter
         self._me = None
         # Live-status provider (set by the pipeline entry point): called on
         # each digest flush to include a "what is the pipeline doing right
@@ -177,9 +185,9 @@ class TelegramNotifier:
         # job (after a wedge) must not double-count it in the digest.
         self._reported_archives: set[str] = set()
 
-    async def _get_me(self):
+    async def _get_me(self, client: "TelegramClient"):
         if self._me is None:
-            self._me = await self.client.get_me()
+            self._me = await client.get_me()
         return self._me
 
     async def send(self, message: str, force: bool = False):
@@ -190,9 +198,33 @@ class TelegramNotifier:
             return
 
         try:
-            me = await asyncio.wait_for(self._get_me(), timeout=_SEND_TIMEOUT_SECONDS)
+            client = self.client
+            if self.adapter is not None:
+                # The adapter replaces its client instance on reconnect, so a
+                # reference captured at construction would send on a dead
+                # client forever (observed: every digest failing with "Cannot
+                # send requests while disconnected" for the rest of a
+                # multi-day run). Re-resolve each send and run the adapter's
+                # bounded reconnect when the client is down.
+                client = self.adapter.client
+                if client is None or not client.is_connected():
+                    await asyncio.wait_for(
+                        self.adapter._ensure_connected(
+                            timeout=30, reason="sending notification"
+                        ),
+                        timeout=2 * _SEND_TIMEOUT_SECONDS,
+                    )
+                    client = self.adapter.client
+                    self._me = None
+            if client is None or not client.is_connected():
+                logger.warning(
+                    "Notification not sent: Telegram client disconnected (%s)",
+                    _trunc(message, 80),
+                )
+                return
+            me = await asyncio.wait_for(self._get_me(client), timeout=_SEND_TIMEOUT_SECONDS)
             await asyncio.wait_for(
-                self.client.send_message(me.id, message, parse_mode="html"),
+                client.send_message(me.id, message, parse_mode="html"),
                 timeout=_SEND_TIMEOUT_SECONDS,
             )
             logger.debug("Notification sent: %s", _trunc(message, 80))

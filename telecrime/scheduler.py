@@ -1552,7 +1552,7 @@ def _send_telegram_notification(config, callback) -> str:
         adapter = TelegramAdapter(config.with_aux_telegram_session())
         try:
             await adapter.connect()
-            notifier = TelegramNotifier(adapter.client, enabled=True)
+            notifier = TelegramNotifier(adapter.client, enabled=True, adapter=adapter)
             await callback(notifier)
             return "ok"
         except asyncio.CancelledError:

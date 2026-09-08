@@ -65,6 +65,74 @@ async def test_send_uses_html_parse_mode(notifier):
 
 
 @pytest.mark.asyncio
+async def test_send_reconnects_via_adapter_when_disconnected():
+    """A wedged client must not kill notifications: send() reconnects via the
+    adapter (which replaces its client on reconnect) instead of sending on
+    the dead instance captured at construction."""
+    stale_client = MagicMock()
+    stale_client.is_connected.return_value = False
+    stale_client.send_message = AsyncMock()
+
+    fresh_client = MagicMock()
+    fresh_client.is_connected.return_value = True
+    fresh_client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    fresh_client.send_message = AsyncMock()
+
+    adapter = MagicMock()
+    adapter.client = stale_client
+
+    async def _reconnect(*args, **kwargs):
+        adapter.client = fresh_client
+
+    adapter._ensure_connected = AsyncMock(side_effect=_reconnect)
+
+    n = TelegramNotifier(client=stale_client, enabled=True, adapter=adapter)
+    await n.send("hello <b>world</b>")
+
+    adapter._ensure_connected.assert_awaited_once()
+    fresh_client.send_message.assert_awaited_once()
+    stale_client.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_uses_adapter_client_when_connected():
+    """With a live adapter client, no reconnect is attempted — the adapter's
+    current client is used directly."""
+    live_client = MagicMock()
+    live_client.is_connected.return_value = True
+    live_client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    live_client.send_message = AsyncMock()
+
+    adapter = MagicMock()
+    adapter.client = live_client
+    adapter._ensure_connected = AsyncMock()
+
+    n = TelegramNotifier(client=live_client, enabled=True, adapter=adapter)
+    await n.send("hi")
+
+    adapter._ensure_connected.assert_not_awaited()
+    live_client.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_skips_quietly_when_reconnect_fails():
+    """If reconnect fails, the notification is dropped with a warning, not an
+    exception — a down Telegram link must not crash the pipeline."""
+    dead_client = MagicMock()
+    dead_client.is_connected.return_value = False
+
+    adapter = MagicMock()
+    adapter.client = dead_client
+    adapter._ensure_connected = AsyncMock(
+        side_effect=ConnectionError("Telegram reconnect lock busy")
+    )
+
+    n = TelegramNotifier(client=dead_client, enabled=True, adapter=adapter)
+    await n.send("boom")  # must not raise
+    adapter._ensure_connected.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_stage_start_is_silent(notifier):
     n, send = notifier
     await n.stage_start("parse")
