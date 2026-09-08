@@ -102,7 +102,15 @@ class TelegramAdapter(BaseAdapter):
             timeout=timeout,
             connection_retries=5,
             retry_delay=1,
-            auto_reconnect=True,
+            # auto_reconnect=False: Telethon's internal reconnect loop races
+            # the adapter's own reconnect paths, and a leaked old client
+            # reconnecting on the same session file invalidates the fresh
+            # connection ("Server replied with a wrong session ID") and wedges
+            # permanently with "AttributeError: 'NoneType' object has no
+            # attribute 'connect'" in mtprotosender._reconnect. The adapter's
+            # bounded _ensure_connected/_reconnect_blocking are the single
+            # reconnect authority; a drop fails fast instead of spinning.
+            auto_reconnect=False,
             flood_sleep_threshold=60,
             request_retries=3,
         )
@@ -117,6 +125,17 @@ class TelegramAdapter(BaseAdapter):
                 # No phone configured — connect and rely on existing session file.
                 await asyncio.wait_for(self.client.connect(), timeout=timeout)
                 if not await self.client.is_user_authorized():
+                    # Clean up the half-open client: without this, a leaked
+                    # live client (with its internal connection state) keeps
+                    # the session file busy and poisons later connects.
+                    try:
+                        await asyncio.wait_for(
+                            self.client.disconnect(),
+                            timeout=self._DISCONNECT_TIMEOUT_SECONDS,
+                        )
+                    except Exception:
+                        pass
+                    self.client = None
                     raise ConnectionError(
                         "Telegram session is not authorized. "
                         "Set TELECRIME_TELEGRAM_PHONE and run interactively to log in."
@@ -145,9 +164,16 @@ class TelegramAdapter(BaseAdapter):
         logger.info("Connected to Telegram")
 
     async def disconnect(self) -> None:
-        """Disconnect from Telegram."""
+        """Disconnect from Telegram (bounded — a wedged client must not hang
+        pipeline shutdown)."""
         if self.client:
-            await self.client.disconnect()
+            try:
+                await asyncio.wait_for(
+                    self.client.disconnect(),
+                    timeout=self._DISCONNECT_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                pass
             logger.info("Disconnected from Telegram")
 
     def _set_runtime_note(self, note: str, *, kind: str) -> None:
@@ -195,6 +221,10 @@ class TelegramAdapter(BaseAdapter):
             "connection reset",
             "connection aborted",
             "not connected",
+            # Telethon's _call retried request_retries times and gave up on a
+            # dropped connection; the adapter's reconnect must then take over
+            # (with auto_reconnect=False this is the normal drop signal).
+            "request was unsuccessful",
         )
         return any(p in msg for p in patterns)
 
@@ -202,6 +232,12 @@ class TelegramAdapter(BaseAdapter):
     # call (including disconnect of the prior client + new connect). Hard cap
     # so a stuck Telethon reconnect can't wedge the caller for hours.
     _ENSURE_CONNECTED_BUDGET_SECONDS: int = 300
+
+    # Bound on awaiting an old client's teardown before creating the new one.
+    # Telethon's disconnect() returns a shielded task; with auto_reconnect=False
+    # the teardown completes in milliseconds, and a slow teardown must not hold
+    # the reconnect lock indefinitely.
+    _DISCONNECT_TIMEOUT_SECONDS: int = 15
 
     async def _ensure_connected(self, timeout: int = 30, reason: str = "telegram operation") -> None:
         if self.client is not None and self.client.is_connected():
@@ -226,7 +262,10 @@ class TelegramAdapter(BaseAdapter):
             try:
                 if self.client is not None:
                     try:
-                        await asyncio.wait_for(self.client.disconnect(), timeout=5)
+                        await asyncio.wait_for(
+                            self.client.disconnect(),
+                            timeout=self._DISCONNECT_TIMEOUT_SECONDS,
+                        )
                     except Exception:
                         pass
                 await asyncio.wait_for(
@@ -272,10 +311,14 @@ class TelegramAdapter(BaseAdapter):
                 self._clear_runtime_note()
                 return result
             except asyncio.CancelledError as exc:
-                # Telethon cancels in-flight futures when the connection drops.
-                # Treat this as a retryable connection error rather than letting
-                # it propagate as a BaseException (which bypasses all except Exception
-                # guards in the pipeline and kills the subprocess).
+                # Distinguish Telethon cancelling our in-flight request because
+                # the connection dropped (retryable) from an EXTERNAL cancel of
+                # this task (e.g. the download stall/timeout monitor calling
+                # task.cancel()). Re-connecting and retrying after an external
+                # cancel leaks the task — it survives its own cancellation and
+                # keeps hammering reconnect — so propagate it.
+                if asyncio.current_task() is not None and asyncio.current_task().cancelling():
+                    raise
                 if attempt >= retries:
                     raise ConnectionError(
                         f"{operation} cancelled by Telethon (connection dropped)"
@@ -326,14 +369,17 @@ class TelegramAdapter(BaseAdapter):
         try:
             try:
                 if self.client is not None:
-                    await self.client.disconnect()
+                    await asyncio.wait_for(
+                        self.client.disconnect(),
+                        timeout=self._DISCONNECT_TIMEOUT_SECONDS,
+                    )
             except Exception:
                 pass
             await asyncio.wait_for(
                 self.connect(timeout=min(timeout, budget)),
                 timeout=budget,
             )
-        except (TimeoutError, Exception):
+        except Exception:
             # Failed reconnect: clear the note so the health job does not
             # chase a stale "reconnect pending" signal forever.
             try:
@@ -731,14 +777,18 @@ class TelegramAdapter(BaseAdapter):
                         await asyncio.wait({task}, timeout=5.0)
                     except Exception:
                         pass
-                # If the task was cancelled (stall or hard timeout), disconnect
-                # so Telethon's auto_reconnect loop doesn't keep firing during
-                # subsequent pipeline stages that don't use Telegram.
+                # If the task was cancelled (stall or hard timeout), drop the
+                # connection so the next Telegram operation starts clean.
                 # _ensure_connected will reconnect transparently on the next
-                # Telegram operation.
+                # Telegram operation. Bounded: with auto_reconnect=False the
+                # old client is quiescent, and a slow teardown must not stall
+                # the acquire stage.
                 if task.cancelled() and self.client:
                     try:
-                        await self.client.disconnect()
+                        await asyncio.wait_for(
+                            self.client.disconnect(),
+                            timeout=5,
+                        )
                     except Exception:
                         pass
 

@@ -217,3 +217,100 @@ async def test_iter_messages_raises_on_cancelled():
     with pytest.raises(RuntimeError):
         async for _ in adapter.iter_messages(1, min_id=0):
             pass
+
+
+@pytest.mark.asyncio
+async def test_run_with_reconnect_propagates_external_cancel(monkeypatch):
+    """An EXTERNAL task.cancel() must not be swallowed into a reconnect+retry
+    loop — that leak left _run_with_reconnect tasks alive after the download
+    monitor cancelled them, hammering reconnect on a wedged session for hours."""
+    adapter = _make_adapter()
+
+    async def _ensure_ok(timeout=30, reason="t"):
+        return None
+    monkeypatch.setattr(adapter, "_ensure_connected", _ensure_ok)
+    monkeypatch.setattr(adapter, "_reconnect_blocking", AsyncMock())
+
+    async def _never_called():
+        await asyncio.sleep(3600)
+        raise AssertionError("factory must not be retried after external cancel")
+
+    task = asyncio.create_task(
+        adapter._run_with_reconnect("dl", _never_called, timeout=5, retries=2)
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    adapter._reconnect_blocking.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_with_reconnect_retries_telethon_drop_cancel(monkeypatch):
+    """A CancelledError raised by Telethon's own machinery (connection drop,
+    not an external cancel) must still go through the reconnect+retry path."""
+    adapter = _make_adapter()
+
+    async def _ensure_ok(timeout=30, reason="t"):
+        return None
+    monkeypatch.setattr(adapter, "_ensure_connected", _ensure_ok)
+    monkeypatch.setattr(adapter, "_reconnect_blocking", AsyncMock())
+
+    calls = {"n": 0}
+
+    async def _drops():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise asyncio.CancelledError  # simulates Telethon drop-cancel
+        return "ok"
+
+    result = await adapter._run_with_reconnect("dl", _drops, timeout=5, retries=2)
+    assert result == "ok"
+    assert calls["n"] == 2
+    adapter._reconnect_blocking.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_request_unsuccessful_is_retryable():
+    """Telethon's 'Request was unsuccessful N time(s)' (given up after its own
+    retries on a dropped connection) must trigger the adapter reconnect path."""
+    from telecrime.adapters.telegram import TelegramAdapter
+
+    assert TelegramAdapter._is_retryable_connection_error(
+        ValueError("Request was unsuccessful 3 time(s)")
+    )
+
+
+@pytest.mark.asyncio
+async def test_client_created_with_auto_reconnect_disabled(monkeypatch, tmp_path):
+    """Regression: auto_reconnect=True let Telethon's internal reconnect loop
+    race the adapter's own reconnect, wedge the client permanently, and leak
+    zombie clients reconnecting on the same session file ('wrong session ID')."""
+    import sqlite3
+
+    from telecrime.config import Config, TelegramConfig
+
+    cfg = Config(
+        database_url="postgresql://x:y@db/z",
+        telegram=TelegramConfig(api_id=1, api_hash="x", session_name="sess"),
+    )
+    session_path = tmp_path / "sess.session"
+    sqlite3.connect(str(session_path)).close()
+
+    created = {}
+
+    def _fake_client(*args, **kwargs):
+        created.update(kwargs)
+        client = MagicMock()
+        client.connect = AsyncMock()
+        client.is_user_authorized = AsyncMock(return_value=True)
+        client.disconnect = AsyncMock()
+        return client
+
+    monkeypatch.setattr(
+        "telecrime.adapters.telegram.TelegramClient", _fake_client
+    )
+    adapter = TelegramAdapter(cfg)
+    await adapter.connect(timeout=5)
+    assert created.get("auto_reconnect") is False
