@@ -214,9 +214,17 @@ class TelegramNotifier:
                 # client forever (observed: every digest failing with "Cannot
                 # send requests while disconnected" for the rest of a
                 # multi-day run). Re-resolve each send and run the adapter's
-                # bounded reconnect when the client is down.
+                # bounded reconnect when the client is down — but ONLY when
+                # the adapter has no operation in flight: forcing a reconnect
+                # mid-download kills the download, and the new client then
+                # collides with the retrying download on the same session
+                # file ("database is locked" / "wrong session ID"). When
+                # busy, drop the message instead (the next digest retries).
                 client = self.adapter.client
-                if client is None or not client.is_connected():
+                if (
+                    client is None
+                    or not client.is_connected()
+                ) and getattr(self.adapter, "_active_ops", 0) == 0:
                     await asyncio.wait_for(
                         self.adapter._ensure_connected(
                             timeout=30, reason="sending notification"

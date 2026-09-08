@@ -82,6 +82,11 @@ class TelegramAdapter(BaseAdapter):
         self.client: TelegramClient | None = None
         self._connect_lock = asyncio.Lock()
         self._reconnect_since: str | None = None
+        # Number of Telegram operations currently in flight on this adapter.
+        # External observers (e.g. the notifier) consult it before forcing a
+        # reconnect: disconnecting mid-operation kills the op and a second
+        # client on the same session file collides.
+        self._active_ops = 0
 
         if not config.telegram.api_id or not config.telegram.api_hash:
             raise ValueError("Telegram API credentials not configured")
@@ -295,7 +300,28 @@ class TelegramAdapter(BaseAdapter):
         timeout: int = 30,
         retries: int = 2,
     ):
-        await self._ensure_connected(timeout=timeout, reason=operation)
+        # In-flight counter: the notifier (and any other observer) must not
+        # force a reconnect while a long operation (e.g. a multi-minute
+        # download) is bound to the current client — disconnecting mid-op
+        # kills it, and a second client on the same session file collides
+        # ("database is locked" / "wrong session ID").
+        self._active_ops += 1
+        try:
+            await self._ensure_connected(timeout=timeout, reason=operation)
+            return await self._run_with_reconnect_inner(
+                operation, factory, timeout=timeout, retries=retries
+            )
+        finally:
+            self._active_ops -= 1
+
+    async def _run_with_reconnect_inner(
+        self,
+        operation: str,
+        factory: Callable[[], object],
+        *,
+        timeout: int = 30,
+        retries: int = 2,
+    ):
         for attempt in range(retries + 1):
             try:
                 # Budget: the operation's own timeout when it's larger than the

@@ -79,6 +79,7 @@ async def test_send_reconnects_via_adapter_when_disconnected():
     fresh_client.send_message = AsyncMock()
 
     adapter = MagicMock()
+    adapter._active_ops = 0
     adapter.client = stale_client
 
     async def _reconnect(*args, **kwargs):
@@ -122,6 +123,7 @@ async def test_send_skips_quietly_when_reconnect_fails():
     dead_client.is_connected.return_value = False
 
     adapter = MagicMock()
+    adapter._active_ops = 0
     adapter.client = dead_client
     adapter._ensure_connected = AsyncMock(
         side_effect=ConnectionError("Telegram reconnect lock busy")
@@ -130,6 +132,28 @@ async def test_send_skips_quietly_when_reconnect_fails():
     n = TelegramNotifier(client=dead_client, enabled=True, adapter=adapter)
     await n.send("boom")  # must not raise
     adapter._ensure_connected.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_reconnect_while_adapter_busy():
+    """While a download/extract op is in flight on the adapter, send() must
+    NOT force a reconnect — disconnecting mid-op kills the download, and the
+    new client collides with the retrying download on the same session file
+    ('database is locked' / 'wrong session ID'). The message is dropped."""
+    busy_client = MagicMock()
+    busy_client.is_connected.return_value = False
+    busy_client.send_message = AsyncMock()
+
+    adapter = MagicMock()
+    adapter._active_ops = 2  # two downloads in flight
+    adapter.client = busy_client
+    adapter._ensure_connected = AsyncMock()
+
+    n = TelegramNotifier(client=busy_client, enabled=True, adapter=adapter)
+    await n.send("drop me")
+
+    adapter._ensure_connected.assert_not_awaited()
+    busy_client.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
