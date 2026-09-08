@@ -229,7 +229,11 @@ def _shutdown_state(config) -> str | None:
 
     pid = _read_pipeline_pid()
     lock_held = _pipeline_lock_is_held(config.data_dir)
-    if progress_running or (pid is not None and _pid_is_alive(pid)) or lock_held:
+    # _pid_is_pipeline_process: a stale pid file pointing at a recycled PID
+    # must not make the worker wait for "draining" that never completes.
+    if progress_running or (
+        pid is not None and _pid_is_alive(pid) and _pid_is_pipeline_process(pid)
+    ) or lock_held:
         return "draining"
     return "drained"
 
@@ -334,6 +338,28 @@ def _pid_is_alive(pid: int) -> bool:
         return False
 
 
+def _pid_is_pipeline_process(pid: int) -> bool:
+    """True when `pid` is actually a `telecrime run` subprocess.
+
+    The pipeline pid file can go stale (crashed run, recycled PID). Killing
+    with killpg() on a recycled pid would terminate an UNRELATED process
+    group, so the watchdog and shutdown paths must verify the process is
+    really ours before signalling it.
+    """
+    if pid <= 0:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return False
+    parts = [p.decode(errors="replace") for p in raw.split(b"\x00") if p]
+    if not parts:
+        return False
+    # e.g. ['/usr/local/bin/python', '-m', 'telecrime', 'run']
+    return any("telecrime" in p for p in parts) and "run" in parts
+
+
 def _pipeline_lock_is_held(data_dir: Path) -> bool:
     from telecrime.pipeline.lock import PipelineAlreadyRunningError, pipeline_run_lock
 
@@ -372,6 +398,11 @@ def _terminate_pipeline_process(pid: int, grace_seconds: int = 15) -> str:
     """Terminate a supervised pipeline subprocess."""
     if pid <= 0:
         return "no pipeline pid"
+
+    if not _pid_is_pipeline_process(pid):
+        # Stale/recycled pid file — never signal an unrelated process group.
+        _clear_pipeline_pid()
+        return f"pipeline pid {pid} no longer a telecrime process (stale pid file)"
 
     try:
         os.killpg(pid, signal.SIGTERM)
@@ -653,6 +684,11 @@ def _check_pipeline_health(config) -> PipelineHealth:
     # across Docker container namespaces (e.g. pipeline triggered from web container).
     if pid is not None and not _pid_is_alive(pid) and not lock_held:
         reasons.append(f"pipeline subprocess pid {pid} disappeared")
+    elif pid is not None and _pid_is_alive(pid) and not _pid_is_pipeline_process(pid):
+        # Stale pid file pointing at a recycled/unrelated process — the real
+        # pipeline is gone; the watchdog must flag it for restart, not believe
+        # the imposter keeps the run alive.
+        reasons.append(f"pipeline pid {pid} is not a telecrime process (stale pid file)")
     if bool(progress.get("running")) and updated_age is not None and updated_age > stale_threshold:
         reasons.append(f"progress heartbeat stale for {int(updated_age)}s")
     if (
