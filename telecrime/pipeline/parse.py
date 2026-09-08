@@ -563,8 +563,11 @@ class ParseStage(PipelineStage):
     async def run_group(self, ctx: PipelineContext, group_id: int) -> tuple[int, int]:
         """Parse completed extraction jobs for a single EXTRACTED group."""
         jobs = self._iter_jobs(ctx, group_id=group_id)
-        if not jobs:
+        # `not jobs` would be dead on a generator — peek the first page.
+        first = next(jobs, None)
+        if first is None:
             return 0, 0
+        jobs = itertools.chain([first], jobs)
 
         if ctx.has_soft_hash_column is None:
             db_columns = {

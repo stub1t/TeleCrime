@@ -135,6 +135,10 @@ def deduplicate_candidates(
 ) -> list[PasswordCandidate]:
     """Remove duplicate password values, keeping highest-ranked.
 
+    Dedup is on the EXACT (whitespace-stripped) value, NOT case-folded:
+    archive passwords are case-sensitive, and dropping a case-variant of a
+    candidate would silently remove the one password that actually works.
+
     Args:
         candidates: List of candidates (should already be ranked)
 
@@ -145,7 +149,7 @@ def deduplicate_candidates(
     unique: list[PasswordCandidate] = []
 
     for candidate in candidates:
-        normalized = candidate.value.strip().lower()
+        normalized = candidate.value.strip()
         if normalized not in seen_values:
             seen_values.add(normalized)
             unique.append(candidate)

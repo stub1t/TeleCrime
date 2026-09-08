@@ -410,8 +410,10 @@ class TestDeduplicateCandidates:
         assert len(unique) == 1
         assert unique[0] is first
 
-    def test_case_insensitive(self):
-        """Test deduplication is case-insensitive."""
+    def test_case_variants_kept(self):
+        """Test deduplication keeps case variants — archive passwords are
+        case-sensitive, so dropping a differently-cased candidate could
+        discard the password that actually works."""
         candidates = [
             self._make_candidate("Password"),
             self._make_candidate("password"),
@@ -420,7 +422,8 @@ class TestDeduplicateCandidates:
 
         unique = deduplicate_candidates(candidates)
 
-        assert len(unique) == 1
+        assert len(unique) == 3
+        assert [c.value for c in unique] == ["Password", "password", "PASSWORD"]
 
     def test_empty_input(self):
         """Test empty input."""
