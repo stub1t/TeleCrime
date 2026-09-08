@@ -1462,7 +1462,6 @@ def _collect_watchlist_alerts(engine) -> list[dict]:
                                 "hits": hits,
                             }
                         )
-                        item.last_alerted_count = current
                 else:
                     # Incremental path: only count credentials created since last alert.
                     # Disable statement_timeout — ILIKE + large date ranges can exceed 5m.
@@ -1494,13 +1493,36 @@ def _collect_watchlist_alerts(engine) -> list[dict]:
                                 "hits": hits,
                             }
                         )
-                        item.last_alerted_count = total
-                item.last_alerted_at = now
-                session.commit()
         except Exception as exc:
             logger.warning("Watchlist alert check failed for item %d: %s", item_id, exc)
 
     return alerts
+
+
+def _advance_watchlist_alerts(engine, alerts: list[dict]) -> None:
+    """Advance the alerted window ONLY after a notification was confirmed sent.
+
+    Previously _collect_watchlist_alerts bumped last_alerted_at before the
+    send; a transient Telegram failure then permanently dropped those hits
+    (the window had already moved past them).
+    """
+    if not alerts:
+        return
+    from telecrime.database import get_session
+    from telecrime.models.watchlist import WatchlistItem
+
+    now = datetime.now(UTC)
+    try:
+        with get_session(engine) as session:
+            for alert in alerts:
+                item = session.get(WatchlistItem, alert["id"])
+                if item is None:
+                    continue
+                item.last_alerted_at = now
+                item.last_alerted_count = int(alert.get("total_matches") or 0)
+            session.commit()
+    except Exception as exc:
+        logger.warning("Failed to advance watchlist alert window: %s", exc)
 
 
 _TELEGRAM_TRANSIENT_MSG_FRAGMENTS = (
@@ -1580,7 +1602,14 @@ def _run_watchlist_notify_job(config, engine) -> str:
     if not alerts:
         return "no new watchlist hits"
 
-    _send_telegram_notification(config, lambda notifier: notifier.watchlist_alerts(alerts))
+    result = _send_telegram_notification(
+        config, lambda notifier: notifier.watchlist_alerts(alerts)
+    )
+    if result != "ok":
+        # Transient failure — do NOT advance the alert window, or the hits
+        # would be silently dropped (they'd never re-alert next interval).
+        return result
+    _advance_watchlist_alerts(engine, alerts)
     new_total = sum(int(alert["new_matches"]) for alert in alerts)
     return f"alerted on {new_total:,} new watchlist matches across {len(alerts)} items"
 
@@ -1664,16 +1693,6 @@ class TelecrimeWorker:
             reason or "",
         )
         return request
-
-    def clear_shutdown(self) -> None:
-        clear_shutdown_request()
-        self._shutdown_requested.clear()
-        if self._scheduler is not None:
-            try:
-                self._scheduler.resume()
-            except Exception:
-                logger.exception("Failed to resume scheduler after clearing shutdown request")
-        _apply_shutdown_status(self.config)
 
     def can_exit(self) -> bool:
         if self._any_job_running():

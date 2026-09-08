@@ -198,6 +198,9 @@ def _apply_pg_bulk_settings(session) -> None:
     # GIN pending-list flushes sort entries in memory; a larger budget means
     # faster sorts and shorter stall windows during bulk inserts.
     session.execute(text("SET maintenance_work_mem = '1GB'"))
+    # The compose default work_mem is 4MB; the staging-table sort/anti-join
+    # paths spill to disk per chunk without a raise.
+    session.execute(text("SET work_mem = '64MB'"))
 
 
 def _reset_pg_bulk_settings(session) -> None:
@@ -206,6 +209,7 @@ def _reset_pg_bulk_settings(session) -> None:
         session.execute(text("SET statement_timeout = DEFAULT"))
         session.execute(text("SET gin_pending_list_limit = DEFAULT"))
         session.execute(text("SET maintenance_work_mem = DEFAULT"))
+        session.execute(text("SET work_mem = DEFAULT"))
     except Exception:
         pass
 
@@ -242,6 +246,34 @@ def _has_hash64_index(engine) -> bool:
     except Exception:
         _HAS_HASH64 = False
     return _HAS_HASH64
+
+
+def _ensure_hash64_index(engine) -> None:
+    """Create ix_pc_hash64 (compact dedup index) if missing, without blocking.
+
+    The index is referenced by the two-stage dedup INSERT but was never
+    created by any migration; without it every COPY chunk falls back to a
+    left(credential_hash, 32) anti-join that seq-scans the whole table and
+    times out. CONCURRENTLY needs autocommit, so a fresh connection is used.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    if _has_hash64_index(engine):
+        return
+    global _HAS_HASH64
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(
+                text(
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_pc_hash64 "
+                    "ON parsed_credentials "
+                    "((CAST((CAST((chr(120) || substring(credential_hash, 1, 16)) AS bit(64))) AS bigint)))"
+                )
+            )
+        _HAS_HASH64 = None  # re-resolve against the live schema
+    except Exception as exc:
+        logger.warning("Could not create ix_pc_hash64 index: %s", exc)
+        _HAS_HASH64 = False
 
 
 class ParseStage(PipelineStage):
@@ -449,6 +481,7 @@ class ParseStage(PipelineStage):
             ctx.has_soft_hash_column = "soft_credential_hash" in db_columns
 
         _apply_pg_bulk_settings(ctx.session)
+        _ensure_hash64_index(ctx.session.get_bind())
 
         try:
             for job in jobs:
@@ -541,6 +574,7 @@ class ParseStage(PipelineStage):
             ctx.has_soft_hash_column = "soft_credential_hash" in db_columns
 
         _apply_pg_bulk_settings(ctx.session)
+        _ensure_hash64_index(ctx.session.get_bind())
 
         total_credentials = 0
         total_duplicates = 0
@@ -1089,153 +1123,171 @@ class ParseStage(PipelineStage):
 
         for i in range(0, len(rows), _INSERT_CHUNK_SIZE):
             chunk = rows[i : i + _INSERT_CHUNK_SIZE]
-            chunk_ok = False
-            last_error: Exception | None = None
-            for attempt in range(2):
-                savepoint = ctx.session.begin_nested()
-                try:
-                    raw_conn = ctx.session.connection().connection
-                    cursor = raw_conn.cursor()
-                    try:
-                        # The DB server default is statement_timeout=5min and the
-                        # session-level SET (in _apply_pg_bulk_settings) is lost
-                        # when the pooled connection is recycled between commits.
-                        # Re-apply on the RAW connection that actually runs the
-                        # COPY/INSERT. A generous 10-min bound (not 0) still
-                        # allows legitimately slow disk-bound batches while
-                        # auto-cancelling the pathological 11+ minute anti-join
-                        # INSERTs (cold index reads on a 200M+ row table); the
-                        # chunk savepoint + retry + abort-on-persistent-error
-                        # path keeps that safe — no rows are lost.
-                        cursor.execute("SET statement_timeout = 600000")
-                        cursor.execute("SET lock_timeout = 0")
-                        cursor.execute("SET synchronous_commit = off")
-                        # Session-level SETs from _apply_pg_bulk_settings are
-                        # lost when the pooled connection is recycled between
-                        # commits — re-apply on the raw connection too. A
-                        # default 32MB gin_pending_list_limit means 4x more
-                        # GIN flush stalls on the 23GB username trigram index.
-                        cursor.execute("SET gin_pending_list_limit = 134217728")
-                        cursor.execute("SET maintenance_work_mem = '1GB'")
-                        # Reuse the staging temp table across chunks within the
-                        # same transaction for fewer DDL ticks.
-                        cursor.execute(
-                            "CREATE TEMP TABLE IF NOT EXISTS _pc_staging "
-                            "(LIKE parsed_credentials INCLUDING DEFAULTS) "
-                            "ON COMMIT DROP"
-                        )
-                        cursor.execute("TRUNCATE _pc_staging")
-                        # No unique index on the staging table: the Python-side
-                        # _seen_hashes set already drops duplicate credential
-                        # hashes before COPY, and PostgreSQL treats NULLs as
-                        # distinct, so the index never rejects anything. The
-                        # INSERT-SELECT below only needs the staging rows.
-
-                        buf = io.StringIO()
-                        write = buf.write
-                        esc = self._copy_escape
-                        # In-chunk dedup: repeated credential_hash rows (the
-                        # same victim's log line appearing twice in one file)
-                        # violate _pc_staging_hash during COPY — PostgreSQL
-                        # treats a COPY constraint violation as a hard error
-                        # that discards the WHOLE chunk. Deduplicating here
-                        # keeps the batch intact; dropped rows still count as
-                        # duplicates in the caller (dup_count = rows - new).
-                        _seen_hashes: set[str] = set()
-                        for row in chunk:
-                            _h = row.get("credential_hash")
-                            if isinstance(_h, str):
-                                if _h in _seen_hashes:
-                                    continue
-                                _seen_hashes.add(_h)
-                            write("\t".join(esc(row.get(f)) for f in fields))
-                            write("\n")
-                        buf.seek(0)
-                        cursor.copy_expert(
-                            f"COPY _pc_staging ({col_list}) FROM STDIN",
-                            buf,
-                        )
-
-                        # Two-stage dedup:
-                        #  1. Anti-join against a compact hash index to reject
-                        #     the bulk of duplicates in one pass. The 64-bit
-                        #     expression index is more cache-friendly than
-                        #     probing the full credential hash index for every
-                        #     row.
-                        #  2. ON CONFLICT (credential_hash) stays as the exact
-                        #     correctness backstop for hash collisions (risk
-                        #     collision risk remains negligible for the
-                        #     prefilter's purpose).
-                        # NULL credential_hashes pass straight through.
-                        # The SELECT list must be qualified with the staging
-                        # alias: both tables have url/domain/... and unqualified
-                        # references raise "AmbiguousColumn" and can make
-                        # every insert chunk fail.
-                        # NOT EXISTS (instead of LEFT JOIN ... OR p.id IS NULL)
-                        # lets the planner use an anti-join with the ix_pc_hash64
-                        # expression index; the LEFT JOIN variant degrades to a
-                        # Seq Scan of the whole parsed_credentials table per
-                        # chunk and can exceed the database statement timeout.
-                        _sel = ", ".join(f"s.{f}" for f in fields)
-                        if _has_hash64_index(ctx.session.get_bind()):
-                            cursor.execute(
-                                f"INSERT INTO parsed_credentials ({col_list}) "
-                                f"SELECT {_sel} FROM _pc_staging s "
-                                "WHERE s.credential_hash IS NULL "
-                                "   OR NOT EXISTS (SELECT 1 FROM parsed_credentials p "
-                                f"      WHERE {_hash64_expr('p')} = {_hash64_expr('s')}) "
-                                "ON CONFLICT (credential_hash) DO NOTHING "
-                                "RETURNING credential_hash, domain"
-                            )
-                        else:
-                            cursor.execute(
-                                f"INSERT INTO parsed_credentials ({col_list}) "
-                                f"SELECT {_sel} FROM _pc_staging s "
-                                "WHERE s.credential_hash IS NULL "
-                                "   OR NOT EXISTS (SELECT 1 FROM parsed_credentials p "
-                                "      WHERE left(p.credential_hash, 32) = left(s.credential_hash, 32)) "
-                                "ON CONFLICT (credential_hash) DO NOTHING "
-                                "RETURNING credential_hash, domain"
-                            )
-                        rows_returned = cursor.fetchall()
-                    finally:
-                        cursor.close()
-                    savepoint.commit()
-                    for credential_hash, domain in rows_returned:
-                        inserted.append({
-                            "credential_hash": credential_hash,
-                            "domain": domain,
-                        })
-                    chunk_ok = True
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    try:
-                        savepoint.rollback()
-                    except Exception:
-                        pass
-                    if attempt == 0:
-                        logger.info(
-                            "Credential COPY chunk failed on first attempt (%s: %s) — retrying",
-                            type(exc).__name__, exc,
-                        )
-                    else:
-                        logger.warning(
-                            "Credential COPY chunk failed after retry (%s): %s — continuing",
-                            type(exc).__name__, exc,
-                        )
-            if not chunk_ok:
+            try:
+                inserted.extend(self._copy_insert_chunk(ctx, chunk, fields, col_list))
+            except Exception as exc:
                 logger.error(
                     "Credential COPY chunk failed after retry; aborting parse instead of "
                     "silently dropping %d credentials: %s",
                     len(chunk),
-                    last_error,
+                    exc,
                 )
                 raise RuntimeError(
                     f"Credential COPY chunk failed after retry ({len(chunk)} rows)"
-                ) from last_error
+                ) from exc
 
         return inserted
+
+    def _copy_insert_chunk(
+        self,
+        ctx: PipelineContext,
+        chunk: list[dict[str, object]],
+        fields: tuple[str, ...],
+        col_list: str,
+    ) -> list[dict[str, object]]:
+        """COPY-insert one chunk inside a savepoint; halve-and-retry on failure.
+
+        A failed chunk is split in half and each half retried recursively so a
+        single pathological row (or a timeout on a large anti-join) cannot sink
+        the whole 50K chunk. Halving continues until a singleton fails, which
+        raises — the caller aborts the parse instead of silently dropping rows
+        (the job-wide delete-on-failure semantics stay with the caller).
+        """
+        savepoint = ctx.session.begin_nested()
+        try:
+            raw_conn = ctx.session.connection().connection
+            cursor = raw_conn.cursor()
+            try:
+                # The DB server default is statement_timeout=5min and the
+                # session-level SET (in _apply_pg_bulk_settings) is lost
+                # when the pooled connection is recycled between commits.
+                # Re-apply on the RAW connection that actually runs the
+                # COPY/INSERT. A generous 10-min bound (not 0) still
+                # allows legitimately slow disk-bound batches while
+                # auto-cancelling the pathological 11+ minute anti-join
+                # INSERTs (cold index reads on a 200M+ row table); the
+                # chunk savepoint + halve-retry + abort-on-persistent-error
+                # path keeps that safe — no rows are lost.
+                cursor.execute("SET statement_timeout = 600000")
+                cursor.execute("SET lock_timeout = 0")
+                cursor.execute("SET synchronous_commit = off")
+                # Session-level SETs from _apply_pg_bulk_settings are
+                # lost when the pooled connection is recycled between
+                # commits — re-apply on the raw connection too. A
+                # default 32MB gin_pending_list_limit means 4x more
+                # GIN flush stalls on the 23GB username trigram index.
+                cursor.execute("SET gin_pending_list_limit = 134217728")
+                cursor.execute("SET maintenance_work_mem = '1GB'")
+                cursor.execute("SET work_mem = '64MB'")
+                # Reuse the staging temp table across chunks within the
+                # same transaction for fewer DDL ticks.
+                cursor.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS _pc_staging "
+                    "(LIKE parsed_credentials INCLUDING DEFAULTS) "
+                    "ON COMMIT DROP"
+                )
+                cursor.execute("TRUNCATE _pc_staging")
+                # No unique index on the staging table: the Python-side
+                # _seen_hashes set already drops duplicate credential
+                # hashes before COPY, and PostgreSQL treats NULLs as
+                # distinct, so the index never rejects anything. The
+                # INSERT-SELECT below only needs the staging rows.
+
+                buf = io.StringIO()
+                write = buf.write
+                esc = self._copy_escape
+                # In-chunk dedup: repeated credential_hash rows (the
+                # same victim's log line appearing twice in one file)
+                # violate _pc_staging_hash during COPY — PostgreSQL
+                # treats a COPY constraint violation as a hard error
+                # that discards the WHOLE chunk. Deduplicating here
+                # keeps the batch intact; dropped rows still count as
+                # duplicates in the caller (dup_count = rows - new).
+                _seen_hashes: set[str] = set()
+                for row in chunk:
+                    _h = row.get("credential_hash")
+                    if isinstance(_h, str):
+                        if _h in _seen_hashes:
+                            continue
+                        _seen_hashes.add(_h)
+                    write("\t".join(esc(row.get(f)) for f in fields))
+                    write("\n")
+                buf.seek(0)
+                cursor.copy_expert(
+                    f"COPY _pc_staging ({col_list}) FROM STDIN",
+                    buf,
+                )
+
+                # Two-stage dedup:
+                #  1. Anti-join against a compact hash index to reject
+                #     the bulk of duplicates in one pass. The 64-bit
+                #     expression index is more cache-friendly than
+                #     probing the full credential hash index for every
+                #     row.
+                #  2. ON CONFLICT (credential_hash) stays as the exact
+                #     correctness backstop for hash collisions (risk
+                #     collision risk remains negligible for the
+                #     prefilter's purpose).
+                # NULL credential_hashes pass straight through.
+                # The SELECT list must be qualified with the staging
+                # alias: both tables have url/domain/... and unqualified
+                # references raise "AmbiguousColumn" and can make
+                # every insert chunk fail.
+                # NOT EXISTS (instead of LEFT JOIN ... OR p.id IS NULL)
+                # lets the planner use an anti-join with the ix_pc_hash64
+                # expression index; the LEFT JOIN variant degrades to a
+                # Seq Scan of the whole parsed_credentials table per
+                # chunk and can exceed the database statement timeout.
+                _sel = ", ".join(f"s.{f}" for f in fields)
+                if _has_hash64_index(ctx.session.get_bind()):
+                    cursor.execute(
+                        f"INSERT INTO parsed_credentials ({col_list}) "
+                        f"SELECT {_sel} FROM _pc_staging s "
+                        "WHERE s.credential_hash IS NULL "
+                        "   OR NOT EXISTS (SELECT 1 FROM parsed_credentials p "
+                        f"      WHERE {_hash64_expr('p')} = {_hash64_expr('s')}) "
+                        "ON CONFLICT (credential_hash) DO NOTHING "
+                        "RETURNING credential_hash, domain"
+                    )
+                else:
+                    cursor.execute(
+                        f"INSERT INTO parsed_credentials ({col_list}) "
+                        f"SELECT {_sel} FROM _pc_staging s "
+                        "WHERE s.credential_hash IS NULL "
+                        "   OR NOT EXISTS (SELECT 1 FROM parsed_credentials p "
+                        "      WHERE left(p.credential_hash, 32) = left(s.credential_hash, 32)) "
+                        "ON CONFLICT (credential_hash) DO NOTHING "
+                        "RETURNING credential_hash, domain"
+                    )
+                rows_returned = cursor.fetchall()
+            finally:
+                cursor.close()
+            savepoint.commit()
+            return [
+                {"credential_hash": credential_hash, "domain": domain}
+                for credential_hash, domain in rows_returned
+            ]
+        except Exception as exc:
+            try:
+                savepoint.rollback()
+            except Exception:
+                pass
+            if len(chunk) == 1:
+                logger.warning(
+                    "Credential COPY single row failed (%s): %s — continuing",
+                    type(exc).__name__, exc,
+                )
+                raise RuntimeError(
+                    f"Credential COPY single row failed ({len(chunk)} row)"
+                ) from exc
+            half = len(chunk) // 2
+            logger.info(
+                "Credential COPY chunk failed (%s: %s) — splitting %d rows in half and retrying",
+                type(exc).__name__, exc, len(chunk),
+            )
+            first_half = self._copy_insert_chunk(ctx, chunk[:half], fields, col_list)
+            second_half = self._copy_insert_chunk(ctx, chunk[half:], fields, col_list)
+            return first_half + second_half
 
     def _bulk_insert_via_values(
         self,

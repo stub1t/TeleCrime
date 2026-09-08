@@ -30,6 +30,11 @@ from telecrime.models import (
 from telecrime.pipeline.lock import pipeline_run_lock
 from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
 
+# Maximum extraction attempts per group before startup recovery gives up and
+# marks the group FAILED_TERMINAL. Bounds both the FAILED→READY retry loop and
+# the PASSWORD_NEEDED→PENDING reset (each run counts one attempt).
+_EXTRACTION_MAX_ATTEMPTS = 3
+
 if TYPE_CHECKING:
     from telecrime.notify import TelegramNotifier
     from telecrime.pipeline.display import PipelineDisplay
@@ -146,6 +151,11 @@ class Pipeline:
 
         with pipeline_run_lock(self.config.data_dir):
             logger.info("Starting pipeline with %d stages", len(self.stages))
+            # Startup recovery shared with sequential mode: batch mode's
+            # stage sweeps exclude DOWNLOADING artifacts / EXTRACTING groups /
+            # PASSWORD_NEEDED jobs, so without this a crashed batch run
+            # strands them forever.
+            _run_startup_recovery(self.session, self.config)
             run_record = _start_pipeline_run(self.session, mode="batch", dry_run=dry_run)
             stages_completed: list[str] = []
             stages_failed: list[str] = []
@@ -685,6 +695,310 @@ def _update_display_shutdown(
         )
 
 
+def _run_startup_recovery(session: Session, config: Config) -> None:
+    """Crash-safe startup recovery shared by sequential and batch modes.
+
+    Resets artifacts/groups/jobs left in a transient state by a crashed run
+    (DOWNLOADING, INCOMPLETE, EXTRACTING, FAILED, PASSWORD_NEEDED, IN_PROGRESS)
+    so the current run re-processes them. Bounded: groups whose extraction
+    already exceeded the attempt cap go FAILED_TERMINAL instead of retrying
+    once per run forever. Sequential mode additionally runs the stale-group
+    cleanup (batch mode's AcquireStage.run does its own)."""
+    from telecrime.pipeline.acquire import AcquireStage
+
+    acquire_stage = AcquireStage()
+
+    # Startup recovery: reset any artifacts stuck in DOWNLOADING state
+    # from a previous crashed run so they are re-downloaded this run.
+    acquire_stage.recover_stuck_downloads(session, config.downloads_dir)
+
+    # Startup recovery: promote INCOMPLETE groups whose parts are all
+    # COMPLETED to READY. recover_stuck_downloads may mark artifacts
+    # COMPLETED (file already on disk) without updating group status,
+    # leaving groups permanently stranded as INCOMPLETE.
+    _incomplete_ready = (
+        session.execute(
+            select(ArchiveGroup)
+            .options(
+                joinedload(ArchiveGroup.parts).joinedload(ArchiveGroupPart.artifact)
+            )
+            .where(ArchiveGroup.status == GroupStatus.INCOMPLETE)
+        )
+        .unique()
+        .scalars()
+        .all()
+    )
+    _promoted = 0
+    _terminal = 0
+    for _g in _incomplete_ready:
+        if not _g.parts:
+            continue
+        statuses = {p.artifact.status for p in _g.parts}
+        no_active = not (statuses & {DownloadStatus.PENDING, DownloadStatus.DOWNLOADING})
+        if no_active:
+            # A FAILED_TERMINAL part is "covered" when another part in
+            # the group holds the same physical file (identical
+            # platform_file_unique_id) and is COMPLETED — the repost
+            # copy serves as the archive part. Without this, a group
+            # with {COMPLETED, FAILED_TERMINAL} parts fell through both
+            # branches below and stayed INCOMPLETE forever.
+            _completed_ids = {
+                p.artifact.attachment.platform_file_unique_id
+                for p in _g.parts
+                if p.artifact.attachment
+                and p.artifact.status == DownloadStatus.COMPLETED
+                and p.artifact.attachment.platform_file_unique_id
+            }
+            _failed_uids = {
+                p.artifact.attachment.platform_file_unique_id
+                for p in _g.parts
+                if p.artifact.status == DownloadStatus.FAILED_TERMINAL
+                and p.artifact.attachment
+                and p.artifact.attachment.platform_file_unique_id
+            }
+            # Coverage is NOT vacuous: all-failed parts with no
+            # platform_file_unique_id must not be treated as covered by
+            # an empty completed set (that would promote a group with
+            # no usable archive to READY, re-extracting it forever).
+            _covered = bool(_failed_uids) and _failed_uids <= _completed_ids
+            if statuses <= {DownloadStatus.COMPLETED}:
+                _g.status = GroupStatus.READY
+                _promoted += 1
+            elif (
+                DownloadStatus.FAILED_TERMINAL in statuses
+                and DownloadStatus.COMPLETED not in statuses
+                and not _covered
+            ):
+                _g.status = GroupStatus.FAILED_TERMINAL
+                _terminal += 1
+            elif statuses <= {DownloadStatus.COMPLETED, DownloadStatus.FAILED_TERMINAL} and _covered:
+                # All parts settled; failed parts covered by reposts.
+                _g.status = GroupStatus.READY
+                _promoted += 1
+            elif statuses <= {DownloadStatus.COMPLETED, DownloadStatus.FAILED_TERMINAL}:
+                # All parts settled but a failed part is NOT covered.
+                _g.status = GroupStatus.FAILED_TERMINAL
+                _terminal += 1
+    if _promoted or _terminal:
+        session.commit()
+    if _promoted:
+        logger.info("Startup recovery: promoted %d INCOMPLETE→READY groups (all parts downloaded)", _promoted)
+    if _terminal:
+        logger.info(
+            "Startup recovery: marked %d INCOMPLETE→FAILED_TERMINAL groups "
+            "(all downloads permanently failed)",
+            _terminal,
+        )
+
+    # Sequential mode has no AcquireStage.run — without this call,
+    # stale zero-progress INCOMPLETE groups (the _next_pending_artifact
+    # fallback deliberately deprioritizes them) were never cleaned up,
+    # stranding them forever.
+    try:
+        _stale_cleaned = AcquireStage().cleanup_stale_incomplete_groups(
+            session, max_age_days=30
+        )
+        if _stale_cleaned:
+            logger.info(
+                "Startup recovery: cleaned %d stale INCOMPLETE groups",
+                _stale_cleaned,
+            )
+    except Exception as _e:
+        logger.warning("cleanup_stale_incomplete_groups failed: %s", _e)
+
+    # Startup recovery: reset any groups stuck in EXTRACTING (crash
+    # during extraction) or transiently FAILED (retryable extraction
+    # error) back to READY so they are re-processed this run.  Groups
+    # whose extraction already failed the configured max number of
+    # Collapse duplicate PENDING jobs per group: _extract_group only ever uses
+    # the oldest PENDING job, so accumulated duplicates (from failed
+    # runs pre-round-14 reset) are dead rows that grew unboundedly
+    # (2,733 live). Keep the highest-attempts one so the terminal cap
+    # still trips; terminalize the rest.
+    _pending_rows = session.execute(
+        select(
+            ExtractionJob.id,
+            ExtractionJob.group_id,
+            ExtractionJob.attempts_count,
+        )
+        .where(ExtractionJob.status == ExtractionStatus.PENDING)
+        .order_by(
+            ExtractionJob.group_id,
+            ExtractionJob.attempts_count.desc(),
+            ExtractionJob.id,
+        )
+    ).all()
+    _best_per_group: dict[int, int] = {}
+    for _pid, _gid, _att in _pending_rows:
+        _best_per_group.setdefault(_gid, _pid)
+    _collapse_ids = [
+        r[0] for r in _pending_rows if _best_per_group.get(r[1]) != r[0]
+    ]
+    if _collapse_ids:
+        session.execute(
+            update(ExtractionJob)
+            .where(ExtractionJob.id.in_(_collapse_ids))
+            .values(status=ExtractionStatus.FAILED_TERMINAL)
+        )
+        logger.info(
+            "Startup recovery: collapsed %d duplicate PENDING jobs "
+            "(kept highest-attempts per group)",
+            len(_collapse_ids),
+        )
+        session.commit()
+
+    # times stay FAILED_TERMINAL (no endless retry loop).
+    stuck = session.execute(
+        select(ArchiveGroup).where(
+            ArchiveGroup.status.in_(
+                [GroupStatus.EXTRACTING, GroupStatus.FAILED]
+            )
+        )
+    ).scalars().all()
+    if stuck:
+        job_max_attempts = _EXTRACTION_MAX_ATTEMPTS
+        retry_ids: list[int] = []
+        terminal_ids: list[int] = []
+        for _g in stuck:
+            if _g.status == GroupStatus.EXTRACTING:
+                retry_ids.append(_g.id)
+                continue
+            # FAILED: retry up to MAX_ATTEMPTS total extraction attempts.
+            # Count attempts on the job _extract_group will actually
+            # pick AFTER the reset below: the oldest PENDING/
+            # PASSWORD_NEEDED job if one exists, ELSE the oldest FAILED
+            # job (which the reset turns into PENDING). Round-15's
+            # PENDING-only query ran BEFORE the reset and saw None for
+            # all-FAILED groups — the cap never tripped and failed
+            # groups were re-extracted once per run forever.
+            _retained = session.execute(
+                select(ExtractionJob.id, ExtractionJob.attempts_count)
+                .where(
+                    ExtractionJob.group_id == _g.id,
+                    ExtractionJob.status.in_(
+                        [
+                            ExtractionStatus.PENDING,
+                            ExtractionStatus.PASSWORD_NEEDED,
+                            ExtractionStatus.FAILED,
+                        ]
+                    ),
+                )
+                .order_by(ExtractionJob.id)
+                .limit(1)
+            ).first()
+            _retained_attempts = _retained[1] if _retained else 0
+            if _retained_attempts >= job_max_attempts:
+                terminal_ids.append(_g.id)
+            else:
+                retry_ids.append(_g.id)
+        if retry_ids:
+            session.execute(
+                update(ArchiveGroup)
+                .where(ArchiveGroup.id.in_(retry_ids))
+                .values(status=GroupStatus.READY)
+            )
+            # Reset the groups' FAILED jobs to PENDING so the retry
+            # bound accumulates on the SAME job. Without this,
+            # _extract_group creates a fresh job every run
+            # (attempts_count=0) and max(attempts) never reaches the
+            # terminal cap — the group retried once per run forever.
+            session.execute(
+                update(ExtractionJob)
+                .where(
+                    ExtractionJob.group_id.in_(retry_ids),
+                    ExtractionJob.status == ExtractionStatus.FAILED,
+                )
+                .values(status=ExtractionStatus.PENDING)
+            )
+            logger.info(
+                "Startup recovery: reset %d EXTRACTING/FAILED groups → READY "
+                "for re-processing",
+                len(retry_ids),
+            )
+        if terminal_ids:
+            session.execute(
+                update(ArchiveGroup)
+                .where(ArchiveGroup.id.in_(terminal_ids))
+                .values(status=GroupStatus.FAILED_TERMINAL)
+            )
+            logger.info(
+                "Startup recovery: %d FAILED groups exceeded %d attempts → "
+                "FAILED_TERMINAL",
+                len(terminal_ids),
+                job_max_attempts,
+            )
+        session.commit()
+
+    # Startup recovery: reset PASSWORD_NEEDED jobs back to PENDING so
+    # their (READY) groups are picked up by this run's READY sweeps.
+    # Without this, the PASSWORD_NEEDED exclusion in the sweeps would
+    # strand the group forever (batch mode has no other retry path).
+    # Bounded: attempts_count accumulates one per run, so groups whose
+    # job already exceeded the cap go FAILED_TERMINAL instead of
+    # retrying once per run forever.
+    _pwd_rows = session.execute(
+        select(
+            ExtractionJob.id,
+            ExtractionJob.group_id,
+            ExtractionJob.attempts_count,
+        ).where(ExtractionJob.status == ExtractionStatus.PASSWORD_NEEDED)
+    ).all()
+    _pwd_retry = [r[0] for r in _pwd_rows if (r[2] or 0) < _EXTRACTION_MAX_ATTEMPTS]
+    _pwd_terminal = [r[1] for r in _pwd_rows if (r[2] or 0) >= _EXTRACTION_MAX_ATTEMPTS]
+    if _pwd_retry:
+        session.execute(
+            update(ExtractionJob)
+            .where(ExtractionJob.id.in_(_pwd_retry))
+            .values(status=ExtractionStatus.PENDING)
+        )
+        session.commit()
+        logger.info(
+            "Startup recovery: reset %d PASSWORD_NEEDED jobs → PENDING for retry",
+            len(_pwd_retry),
+        )
+    if _pwd_terminal:
+        session.execute(
+            update(ExtractionJob)
+            .where(
+                ExtractionJob.group_id.in_(_pwd_terminal),
+                ExtractionJob.status == ExtractionStatus.PASSWORD_NEEDED,
+            )
+            .values(status=ExtractionStatus.FAILED_TERMINAL)
+        )
+        session.execute(
+            update(ArchiveGroup)
+            .where(
+                ArchiveGroup.id.in_(_pwd_terminal),
+                ArchiveGroup.status.in_(
+                    [GroupStatus.READY, GroupStatus.EXTRACTING]
+                ),
+            )
+            .values(status=GroupStatus.FAILED_TERMINAL)
+        )
+        session.commit()
+        logger.info(
+            "Startup recovery: %d PASSWORD_NEEDED groups exceeded %d "
+            "attempts → FAILED_TERMINAL",
+            len(_pwd_terminal),
+            _EXTRACTION_MAX_ATTEMPTS,
+        )
+
+    # Startup recovery: orphaned IN_PROGRESS jobs (a crash mid-
+    # extraction leaves them behind; the group is reset to READY but
+    # the job stays IN_PROGRESS and accumulates forever — 150+ live).
+    _inprog = session.execute(
+        update(ExtractionJob)
+        .where(ExtractionJob.status == ExtractionStatus.IN_PROGRESS)
+        .values(status=ExtractionStatus.PENDING)
+        .returning(ExtractionJob.id)
+    ).all()
+    if _inprog:
+        session.commit()
+        logger.info(
+            "Startup recovery: reset %d orphaned IN_PROGRESS jobs → PENDING",
+            len(_inprog),
+        )
+
 async def run_sequential_pipeline(
     config: Config,
     session: Session,
@@ -841,259 +1155,10 @@ async def run_sequential_pipeline(
 
             channel_joiner = ChannelJoiner()
 
-            # Startup recovery: reset any artifacts stuck in DOWNLOADING state
-            # from a previous crashed run so they are re-downloaded this run.
-            acquire_stage.recover_stuck_downloads(session, config.downloads_dir)
+            # Startup recovery (shared with batch mode): reset stuck
+            # artifacts/groups/jobs from a crashed run.
+            _run_startup_recovery(session, config)
 
-            # Startup recovery: promote INCOMPLETE groups whose parts are all
-            # COMPLETED to READY. recover_stuck_downloads may mark artifacts
-            # COMPLETED (file already on disk) without updating group status,
-            # leaving groups permanently stranded as INCOMPLETE.
-            _incomplete_ready = (
-                session.execute(
-                    select(ArchiveGroup)
-                    .options(
-                        joinedload(ArchiveGroup.parts).joinedload(ArchiveGroupPart.artifact)
-                    )
-                    .where(ArchiveGroup.status == GroupStatus.INCOMPLETE)
-                )
-                .unique()
-                .scalars()
-                .all()
-            )
-            _promoted = 0
-            _terminal = 0
-            for _g in _incomplete_ready:
-                if not _g.parts:
-                    continue
-                statuses = {p.artifact.status for p in _g.parts}
-                no_active = not (statuses & {DownloadStatus.PENDING, DownloadStatus.DOWNLOADING})
-                if no_active:
-                    # A FAILED_TERMINAL part is "covered" when another part in
-                    # the group holds the same physical file (identical
-                    # platform_file_unique_id) and is COMPLETED — the repost
-                    # copy serves as the archive part. Without this, a group
-                    # with {COMPLETED, FAILED_TERMINAL} parts fell through both
-                    # branches below and stayed INCOMPLETE forever.
-                    _completed_ids = {
-                        p.artifact.attachment.platform_file_unique_id
-                        for p in _g.parts
-                        if p.artifact.attachment
-                        and p.artifact.status == DownloadStatus.COMPLETED
-                        and p.artifact.attachment.platform_file_unique_id
-                    }
-                    _failed_uids = {
-                        p.artifact.attachment.platform_file_unique_id
-                        for p in _g.parts
-                        if p.artifact.status == DownloadStatus.FAILED_TERMINAL
-                        and p.artifact.attachment
-                        and p.artifact.attachment.platform_file_unique_id
-                    }
-                    # Coverage is NOT vacuous: all-failed parts with no
-                    # platform_file_unique_id must not be treated as covered by
-                    # an empty completed set (that would promote a group with
-                    # no usable archive to READY, re-extracting it forever).
-                    _covered = bool(_failed_uids) and _failed_uids <= _completed_ids
-                    if statuses <= {DownloadStatus.COMPLETED}:
-                        _g.status = GroupStatus.READY
-                        _promoted += 1
-                    elif (
-                        DownloadStatus.FAILED_TERMINAL in statuses
-                        and DownloadStatus.COMPLETED not in statuses
-                        and not _covered
-                    ):
-                        _g.status = GroupStatus.FAILED_TERMINAL
-                        _terminal += 1
-                    elif statuses <= {DownloadStatus.COMPLETED, DownloadStatus.FAILED_TERMINAL} and _covered:
-                        # All parts settled; failed parts covered by reposts.
-                        _g.status = GroupStatus.READY
-                        _promoted += 1
-                    elif statuses <= {DownloadStatus.COMPLETED, DownloadStatus.FAILED_TERMINAL}:
-                        # All parts settled but a failed part is NOT covered.
-                        _g.status = GroupStatus.FAILED_TERMINAL
-                        _terminal += 1
-            if _promoted or _terminal:
-                session.commit()
-            if _promoted:
-                logger.info("Startup recovery: promoted %d INCOMPLETE→READY groups (all parts downloaded)", _promoted)
-            if _terminal:
-                logger.info(
-                    "Startup recovery: marked %d INCOMPLETE→FAILED_TERMINAL groups "
-                    "(all downloads permanently failed)",
-                    _terminal,
-                )
-
-            # Sequential mode has no AcquireStage.run — without this call,
-            # stale zero-progress INCOMPLETE groups (the _next_pending_artifact
-            # fallback deliberately deprioritizes them) were never cleaned up,
-            # stranding them forever.
-            try:
-                _stale_cleaned = AcquireStage().cleanup_stale_incomplete_groups(
-                    session, max_age_days=30
-                )
-                if _stale_cleaned:
-                    logger.info(
-                        "Startup recovery: cleaned %d stale INCOMPLETE groups",
-                        _stale_cleaned,
-                    )
-            except Exception as _e:
-                logger.warning("cleanup_stale_incomplete_groups failed: %s", _e)
-
-            # Startup recovery: reset any groups stuck in EXTRACTING (crash
-            # during extraction) or transiently FAILED (retryable extraction
-            # error) back to READY so they are re-processed this run.  Groups
-            # whose extraction already failed the configured max number of
-            # Collapse duplicate PENDING jobs per group: _extract_group only ever uses
-            # the oldest PENDING job, so accumulated duplicates (from failed
-            # runs pre-round-14 reset) are dead rows that grew unboundedly
-            # (2,733 live). Keep the highest-attempts one so the terminal cap
-            # still trips; terminalize the rest.
-            _pending_rows = session.execute(
-                select(
-                    ExtractionJob.id,
-                    ExtractionJob.group_id,
-                    ExtractionJob.attempts_count,
-                )
-                .where(ExtractionJob.status == ExtractionStatus.PENDING)
-                .order_by(
-                    ExtractionJob.group_id,
-                    ExtractionJob.attempts_count.desc(),
-                    ExtractionJob.id,
-                )
-            ).all()
-            _best_per_group: dict[int, int] = {}
-            for _pid, _gid, _att in _pending_rows:
-                _best_per_group.setdefault(_gid, _pid)
-            _collapse_ids = [
-                r[0] for r in _pending_rows if _best_per_group.get(r[1]) != r[0]
-            ]
-            if _collapse_ids:
-                session.execute(
-                    update(ExtractionJob)
-                    .where(ExtractionJob.id.in_(_collapse_ids))
-                    .values(status=ExtractionStatus.FAILED_TERMINAL)
-                )
-                logger.info(
-                    "Startup recovery: collapsed %d duplicate PENDING jobs "
-                    "(kept highest-attempts per group)",
-                    len(_collapse_ids),
-                )
-                session.commit()
-
-            # times stay FAILED_TERMINAL (no endless retry loop).
-            stuck = session.execute(
-                select(ArchiveGroup).where(
-                    ArchiveGroup.status.in_(
-                        [GroupStatus.EXTRACTING, GroupStatus.FAILED]
-                    )
-                )
-            ).scalars().all()
-            if stuck:
-                job_max_attempts = 3
-                retry_ids: list[int] = []
-                terminal_ids: list[int] = []
-                for _g in stuck:
-                    if _g.status == GroupStatus.EXTRACTING:
-                        retry_ids.append(_g.id)
-                        continue
-                    # FAILED: retry up to MAX_ATTEMPTS total extraction attempts.
-                    # Count attempts on the job _extract_group will actually
-                    # pick AFTER the reset below: the oldest PENDING/
-                    # PASSWORD_NEEDED job if one exists, ELSE the oldest FAILED
-                    # job (which the reset turns into PENDING). Round-15's
-                    # PENDING-only query ran BEFORE the reset and saw None for
-                    # all-FAILED groups — the cap never tripped and failed
-                    # groups were re-extracted once per run forever.
-                    _retained = session.execute(
-                        select(ExtractionJob.id, ExtractionJob.attempts_count)
-                        .where(
-                            ExtractionJob.group_id == _g.id,
-                            ExtractionJob.status.in_(
-                                [
-                                    ExtractionStatus.PENDING,
-                                    ExtractionStatus.PASSWORD_NEEDED,
-                                    ExtractionStatus.FAILED,
-                                ]
-                            ),
-                        )
-                        .order_by(ExtractionJob.id)
-                        .limit(1)
-                    ).first()
-                    _retained_attempts = _retained[1] if _retained else 0
-                    if _retained_attempts >= job_max_attempts:
-                        terminal_ids.append(_g.id)
-                    else:
-                        retry_ids.append(_g.id)
-                if retry_ids:
-                    session.execute(
-                        update(ArchiveGroup)
-                        .where(ArchiveGroup.id.in_(retry_ids))
-                        .values(status=GroupStatus.READY)
-                    )
-                    # Reset the groups' FAILED jobs to PENDING so the retry
-                    # bound accumulates on the SAME job. Without this,
-                    # _extract_group creates a fresh job every run
-                    # (attempts_count=0) and max(attempts) never reaches the
-                    # terminal cap — the group retried once per run forever.
-                    session.execute(
-                        update(ExtractionJob)
-                        .where(
-                            ExtractionJob.group_id.in_(retry_ids),
-                            ExtractionJob.status == ExtractionStatus.FAILED,
-                        )
-                        .values(status=ExtractionStatus.PENDING)
-                    )
-                    logger.info(
-                        "Startup recovery: reset %d EXTRACTING/FAILED groups → READY "
-                        "for re-processing",
-                        len(retry_ids),
-                    )
-                if terminal_ids:
-                    session.execute(
-                        update(ArchiveGroup)
-                        .where(ArchiveGroup.id.in_(terminal_ids))
-                        .values(status=GroupStatus.FAILED_TERMINAL)
-                    )
-                    logger.info(
-                        "Startup recovery: %d FAILED groups exceeded %d attempts → "
-                        "FAILED_TERMINAL",
-                        len(terminal_ids),
-                        job_max_attempts,
-                    )
-                session.commit()
-
-            # Startup recovery: reset PASSWORD_NEEDED jobs back to PENDING so
-            # their (READY) groups are picked up by this run's READY sweeps.
-            # Without this, the PASSWORD_NEEDED exclusion in the sweeps would
-            # strand the group forever (batch mode has no other retry path).
-            _pwd_retry = session.execute(
-                update(ExtractionJob)
-                .where(ExtractionJob.status == ExtractionStatus.PASSWORD_NEEDED)
-                .values(status=ExtractionStatus.PENDING)
-                .returning(ExtractionJob.id)
-            ).all()
-            if _pwd_retry:
-                session.commit()
-                logger.info(
-                    "Startup recovery: reset %d PASSWORD_NEEDED jobs → PENDING for retry",
-                    len(_pwd_retry),
-                )
-
-            # Startup recovery: orphaned IN_PROGRESS jobs (a crash mid-
-            # extraction leaves them behind; the group is reset to READY but
-            # the job stays IN_PROGRESS and accumulates forever — 150+ live).
-            _inprog = session.execute(
-                update(ExtractionJob)
-                .where(ExtractionJob.status == ExtractionStatus.IN_PROGRESS)
-                .values(status=ExtractionStatus.PENDING)
-                .returning(ExtractionJob.id)
-            ).all()
-            if _inprog:
-                session.commit()
-                logger.info(
-                    "Startup recovery: reset %d orphaned IN_PROGRESS jobs → PENDING",
-                    len(_inprog),
-                )
 
             total_pending = (
                 session.execute(

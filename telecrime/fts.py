@@ -2,7 +2,14 @@
 
 from sqlalchemy import inspect, text
 
-_PG_SEARCH_COLUMNS = ["domain", "username", "email_domain"]
+_PG_SEARCH_COLUMNS = ["domain", "username"]
+
+# Trigram GIN indexes backing the ILIKE search path, keyed by column.
+_PG_TRGM_INDEXES = {
+    "ix_pc_domain_trgm": "domain",
+    "ix_pc_username_trgm": "username",
+    "ix_pc_url_trgm": "url",
+}
 
 # Schema introspection cache: (engine_url, table, column) -> bool.
 _column_cache: dict[tuple[str, str, str], bool] = {}
@@ -46,11 +53,27 @@ def fts_available(engine) -> bool:
 
 
 def ensure_fts(engine, rebuild: bool = False) -> bool:
-    """Enable pg_trgm extension (GIN indexes created by Alembic migration)."""
-    del rebuild  # PG: GIN indexes are managed by Alembic, no per-call rebuild
+    """Enable pg_trgm extension and (optionally) rebuild the trigram indexes.
+
+    The GIN indexes are normally created by Alembic migration i9j0k1l2m3n4;
+    indexes deliberately dropped by later migrations (email_domain,
+    source_archive) are not recreated here. rebuild=True drops and recreates
+    the remaining indexes inside a single transaction — if any step fails the
+    transaction rolls back and the old indexes stay intact.
+    """
     try:
         with engine.begin() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            if rebuild:
+                for name in _PG_TRGM_INDEXES:
+                    conn.execute(text(f"DROP INDEX IF EXISTS {name}"))
+                for name, column in _PG_TRGM_INDEXES.items():
+                    conn.execute(
+                        text(
+                            f"CREATE INDEX {name} ON parsed_credentials "
+                            f"USING GIN ({column} gin_trgm_ops)"
+                        )
+                    )
         return True
     except Exception:
         return False

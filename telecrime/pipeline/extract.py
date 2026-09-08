@@ -192,8 +192,15 @@ class ExtractStage(PipelineStage):
 
         if not archive_paths:
             logger.error("No local paths for group %s", group.base_name)
-            job.status = ExtractionStatus.FAILED_TERMINAL
+            # Retryable FAILED (not FAILED_TERMINAL): the files may come back
+            # (re-download / recovery). Startup recovery's attempt cap bounds
+            # the retry — marking the job FAILED_TERMINAL here instead left the
+            # group READY with a terminal job the cap never saw, so a fresh
+            # job row was created every run forever.
+            job.attempts_count = (job.attempts_count or 0) + 1
+            job.status = ExtractionStatus.FAILED
             job.last_error_message = "No archive files found"
+            group.status = GroupStatus.FAILED
             return False
 
         # Main archive is the first one (or only one)

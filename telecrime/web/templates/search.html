@@ -525,8 +525,8 @@
         .then(function(r) { return r.json(); })
         .then(function(data) {
           var html = '';
-          var titles = {domain: 'Domain', stealer_type: 'Stealer Type', application: 'Application', email_domain: 'Email Domain'};
-          ['domain', 'stealer_type', 'application', 'email_domain'].forEach(function(key) {
+          var titles = {domain: 'Domain', stealer_type: 'Stealer Type', application: 'Application'};
+          ['domain', 'stealer_type', 'application'].forEach(function(key) {
             var items = data[key] || [];
             html += '<div class="facet-group"><div class="facet-title">' + titles[key] + '</div>';
             items.forEach(function(item) {

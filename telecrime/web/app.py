@@ -313,7 +313,7 @@ def _get_exclusions(session) -> tuple[set[int], set[int]]:
     return excluded_conversations, excluded_channels
 
 
-_PG_CREDENTIAL_SEARCH_COLUMNS = ("domain", "username", "email_domain")
+_PG_CREDENTIAL_SEARCH_COLUMNS = ("domain", "username")
 
 
 def _pg_try_ids_for_column(
@@ -3153,7 +3153,6 @@ def create_app(database_url: str | None = None) -> FastAPI:
             "domain": [],
             "stealer_type": [],
             "application": [],
-            "email_domain": [],
         }
         if not terms:
             return JSONResponse(_decorate_facets(facet_counts, terms, filters))
@@ -3162,10 +3161,40 @@ def create_app(database_url: str | None = None) -> FastAPI:
             "domain": "domain",
             "stealer_type": "stealer_type",
             "application": "application",
-            "email_domain": "email_domain",
         }
 
         with get_session(engine) as session:
+            if session.get_bind().dialect.name == "postgresql":
+                # Bounded-candidate facets: group the search terms' candidate
+                # id pool instead of GROUP BY scans over the whole table (the
+                # parsed_credentials_fts table only exists on SQLite).
+                candidate_ids = _pg_bounded_candidate_ids(
+                    session,
+                    terms=terms,
+                    limit=5000,
+                    timeout_ms=2500,
+                )
+                if candidate_ids:
+                    params: dict[str, object] = {
+                        **{f"candidate_{idx}": row_id for idx, row_id in enumerate(candidate_ids)},
+                    }
+                    candidate_params = ", ".join(
+                        f":candidate_{idx}" for idx in range(len(candidate_ids))
+                    )
+                    for facet_key, col_name in facet_columns.items():
+                        rows = session.execute(
+                            text(
+                                f"SELECT pc.{col_name}, count(*) as cnt "
+                                f"FROM parsed_credentials pc "
+                                f"WHERE pc.{col_name} IS NOT NULL "
+                                f"AND pc.id IN ({candidate_params}) "
+                                f"GROUP BY pc.{col_name} ORDER BY cnt DESC LIMIT 10"
+                            ),
+                            params,
+                        ).fetchall()
+                        facet_counts[facet_key] = [(row[0], row[1]) for row in rows]
+                return JSONResponse(_decorate_facets(facet_counts, terms, filters))
+
             for facet_key, col_name in facet_columns.items():
                 if app.state.fts_enabled and not False:
                     try:

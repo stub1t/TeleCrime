@@ -530,13 +530,21 @@ def run(
                         "errors": _prog.get("errors"),
                     }
 
-                from telecrime.scheduler import _collect_watchlist_alerts
+                from telecrime.scheduler import (
+                    _advance_watchlist_alerts,
+                    _collect_watchlist_alerts,
+                )
 
                 async def _watchlist_provider():
                     return await asyncio.to_thread(_collect_watchlist_alerts, engine)
 
+                async def _watchlist_sent(alerts):
+                    # Advance the alert window only after a confirmed delivery.
+                    return await asyncio.to_thread(_advance_watchlist_alerts, engine, alerts)
+
                 notifier.status_provider = _status_provider
                 notifier.watchlist_provider = _watchlist_provider
+                notifier.watchlist_sent_callback = _watchlist_sent
 
                 with get_session(engine) as session:
                     # Disable idle-in-transaction timeout for the pipeline session.

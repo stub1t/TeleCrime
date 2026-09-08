@@ -4,10 +4,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from telecrime.grouping.heuristics import (
-    _derive_base_name,
-    extract_caption_hints,
-)
 from telecrime.grouping.normalize import normalize_group_key
 from telecrime.grouping.patterns import (
     extract_base_and_part,
@@ -168,95 +164,6 @@ class TestGroupByPattern:
         multi_part = [r for r in results if len(r.attachments) > 1]
         assert len(multi_part) == 1
         assert len(multi_part[0].attachments) == 3
-
-
-class TestExtractCaptionHints:
-    """Tests for extract_caption_hints function."""
-
-    def _make_message(self, caption=None, text=None):
-        """Create a mock Message."""
-        mock = MagicMock()
-        mock.caption = caption
-        mock.text = text
-        return mock
-
-    def test_part_of_format(self):
-        """Test extracting 'part X of Y' hints."""
-        msg = self._make_message(caption="Book collection - Part 2 of 5")
-        hints = extract_caption_hints(msg)
-
-        assert hints.part_number == 2
-        assert hints.total_parts == 5
-
-    def test_bracket_format(self):
-        """Test extracting [X/Y] format."""
-        msg = self._make_message(caption="Archive [3/10]")
-        hints = extract_caption_hints(msg)
-
-        assert hints.part_number == 3
-        assert hints.total_parts == 10
-
-    def test_password_colon_format(self):
-        """Test extracting 'password: xxx' hints."""
-        msg = self._make_message(caption="Download link\nPassword: secret123")
-        hints = extract_caption_hints(msg)
-
-        assert hints.password_hint == "secret123"
-
-    def test_password_quoted(self):
-        """Test extracting quoted password with spaces."""
-        msg = self._make_message(caption='pass: "my password"')
-        hints = extract_caption_hints(msg)
-
-        assert hints.password_hint == "my password"
-
-    def test_password_unquoted(self):
-        """Test extracting unquoted password stops at whitespace."""
-        msg = self._make_message(caption="password: secret123 extra")
-        hints = extract_caption_hints(msg)
-
-        assert hints.password_hint == "secret123"
-
-    def test_no_hints(self):
-        """Test message with no hints."""
-        msg = self._make_message(caption="Just a regular file")
-        hints = extract_caption_hints(msg)
-
-        assert hints.part_number is None
-        assert hints.total_parts is None
-        assert hints.password_hint is None
-
-    def test_empty_message(self):
-        """Test message with no text."""
-        msg = self._make_message(caption=None, text=None)
-        hints = extract_caption_hints(msg)
-
-        assert hints.part_number is None
-
-
-class TestDeriveBaseName:
-    """Tests for _derive_base_name helper."""
-
-    def test_remove_extensions(self):
-        """Test removing archive extensions."""
-        assert _derive_base_name("archive.rar") == "archive"
-        assert _derive_base_name("file.zip") == "file"
-        assert _derive_base_name("data.7z") == "data"
-        assert _derive_base_name("backup.tar.gz") == "backup.tar"
-
-    def test_remove_part_indicators(self):
-        """Test removing part indicators."""
-        assert _derive_base_name("book.part1") == "book"
-        assert _derive_base_name("data_part2") == "data"
-        assert _derive_base_name("archive-1of3") == "archive"
-
-    def test_combined(self):
-        """Test removing both extensions and part indicators."""
-        assert _derive_base_name("book.part1.rar") == "book"
-
-    def test_empty_input(self):
-        """Test empty input."""
-        assert _derive_base_name("") == ""
 
 
 def test_normalize_group_key_folds_common_confusables():

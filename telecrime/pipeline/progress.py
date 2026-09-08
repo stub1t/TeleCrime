@@ -48,8 +48,8 @@ def _progress_path() -> Path:
     return Path(os.environ.get("TELECRIME_PROGRESS_FILE", str(default_path)))
 
 
-def _write_progress_data(data: dict[str, object]) -> None:
-    path = _progress_path()
+def _write_progress_data(data: dict[str, object], path: Path | None = None) -> None:
+    path = path or _progress_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Unique temp name per write: the pipeline's heartbeat thread and the
@@ -206,7 +206,7 @@ class PipelineProgressWriter:
             # This ensures note clears survive subsequent _write() calls from update_creds etc.
             with _NOTE_LOCK:
                 data.update(_NOTE_OVERRIDES)
-            _write_progress_data(data)
+            _write_progress_data(data, self._path)
 
     def finish(self) -> None:
         """Mark pipeline as not running (call after pipeline exits)."""

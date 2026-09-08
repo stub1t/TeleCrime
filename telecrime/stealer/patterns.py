@@ -66,28 +66,6 @@ SYSTEM_INFO_PATTERNS = [
     r"machine\s*info\.txt$",
 ]
 
-# Cookie file patterns
-COOKIE_FILE_PATTERNS = [
-    r"cookies?\.txt$",
-    r".*_cookies?\.txt$",
-]
-
-# Credit card file patterns
-CREDIT_CARD_PATTERNS = [
-    r"credit\s*cards?\.txt$",
-    r"cards?\.txt$",
-    r"cc\.txt$",
-]
-
-# Crypto wallet patterns
-CRYPTO_WALLET_PATTERNS = [
-    r"wallets?\.txt$",
-    r"exodus.*\.txt$",
-    r"atomic.*\.txt$",
-    r"metamask.*\.txt$",
-    r"electrum.*\.txt$",
-]
-
 # Compiled regex for efficiency
 _credential_regex = re.compile(
     "|".join(f"({p})" for p in CREDENTIAL_FILE_PATTERNS),

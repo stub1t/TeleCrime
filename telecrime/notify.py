@@ -162,6 +162,9 @@ class TelegramNotifier:
         # The scheduler's own watchlist job defers while the pipeline runs —
         # this path carries the alerts on the pipeline's Telegram session.
         self.watchlist_provider = None
+        # Called after a watchlist alert batch was CONFIRMED sent (advances
+        # the alerted window). Set by the pipeline entry point.
+        self.watchlist_sent_callback = None
         # Digest accumulator for per-archive parse results.
         try:
             self._digest_archives_cap = max(
@@ -190,12 +193,18 @@ class TelegramNotifier:
             self._me = await client.get_me()
         return self._me
 
-    async def send(self, message: str, force: bool = False):
-        """Send an HTML-formatted notification to Saved Messages."""
+    async def send(self, message: str, force: bool = False) -> bool:
+        """Send an HTML-formatted notification to Saved Messages.
+
+        Returns True when the message was delivered (or notifications are
+        disabled), False when it could not be sent — callers that advance
+        state on delivery (e.g. the watchlist alert window) must only do so
+        on a confirmed send.
+        """
         del force  # accepted for API compat; no rate-limit gate
         if not self.enabled:
             logger.info("[NOTIFY] %s", message)
-            return
+            return True
 
         try:
             client = self.client
@@ -221,15 +230,17 @@ class TelegramNotifier:
                     "Notification not sent: Telegram client disconnected (%s)",
                     _trunc(message, 80),
                 )
-                return
+                return False
             me = await asyncio.wait_for(self._get_me(client), timeout=_SEND_TIMEOUT_SECONDS)
             await asyncio.wait_for(
                 client.send_message(me.id, message, parse_mode="html"),
                 timeout=_SEND_TIMEOUT_SECONDS,
             )
             logger.debug("Notification sent: %s", _trunc(message, 80))
+            return True
         except (Exception, asyncio.CancelledError) as e:
             logger.warning("Failed to send notification: %s", e)
+            return False
 
     # -------------------------------------------------------------- digests
 
@@ -362,9 +373,19 @@ class TelegramNotifier:
                 alerts = None
             if alerts:
                 try:
-                    await self.watchlist_alerts(alerts)
+                    sent = await self.watchlist_alerts(alerts)
                 except Exception as _we:
+                    sent = False
                     logger.warning("Watchlist alert send failed: %s", _we)
+                if sent and self.watchlist_sent_callback is not None:
+                    # Advance the alerted window only on a confirmed delivery —
+                    # otherwise a transient send failure would drop the hits.
+                    try:
+                        await asyncio.wait_for(
+                            self.watchlist_sent_callback(alerts), timeout=45
+                        )
+                    except Exception as _a:
+                        logger.warning("Watchlist window advance failed: %s", _a)
         # Keep _reported_archives: a digest flush mid-run must not re-report
         # archives already counted once this run.
 
@@ -504,10 +525,14 @@ class TelegramNotifier:
 
     # ------------------------------------------------------------- watchlist
 
-    async def watchlist_alerts(self, alerts: list[dict]):
-        """Watchlist hits — passwords redacted by default for over-the-wire safety."""
+    async def watchlist_alerts(self, alerts: list[dict]) -> bool:
+        """Watchlist hits — passwords redacted by default for over-the-wire safety.
+
+        Returns True when delivered (or nothing to send), False on a failed
+        send — the caller must only advance the alerted window on True.
+        """
         if not alerts:
-            return
+            return True
 
         lines = [_header("🚨", f"Watchlist hits — {len(alerts)} item(s)")]
         for alert in alerts[:8]:
@@ -540,4 +565,4 @@ class TelegramNotifier:
                 lines.append(f"  …and {_fmt_int(hidden)} more new hits")
         if len(alerts) > 8:
             lines.append(f"\n…and {len(alerts) - 8} more watchlist items")
-        await self.send("\n".join(lines))
+        return await self.send("\n".join(lines))

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -263,6 +264,14 @@ class FinalizeStage(PipelineStage):
         if not downloads_dir.exists():
             return
 
+        # Files younger than this are skipped: the sequential pipeline's
+        # prefetch tasks rename+commit files concurrently with this sweep, and
+        # a READ COMMITTED snapshot taken before that commit does not see the
+        # artifact row — the sweep would otherwise unlink a file the DB
+        # considers COMPLETED (permanent archive loss). In-flight prefetches
+        # are always recent; leftovers from previous runs are old.
+        _recent_seconds = 10 * 60
+
         # Get the set of local_paths that are currently being downloaded
         # (DOWNLOADING status) — do not touch those.
         active_paths = {
@@ -281,6 +290,11 @@ class FinalizeStage(PipelineStage):
             entry_str = str(entry)
             if entry_str in active_paths:
                 continue  # Currently downloading — leave alone
+            try:
+                if (time.time() - entry.stat().st_mtime) < _recent_seconds:
+                    continue  # Recently written — possibly an in-flight prefetch
+            except OSError:
+                continue
 
             artifact_rows = ctx.session.execute(
                 select(DownloadArtifact, ArchiveGroup.status)

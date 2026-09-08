@@ -38,10 +38,6 @@ class ExtractionJob(Base, TimestampMixin):
     )
     password_attempts: Mapped[int] = mapped_column(Integer, default=0)
 
-    # Extractor info
-    extractor_name: Mapped[str] = mapped_column(String(50), default="7z")
-    extractor_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
-
     # Attempt tracking
     attempts_count: Mapped[int] = mapped_column(Integer, default=0)
     last_error_code: Mapped[str | None] = mapped_column(String(50), nullable=True)

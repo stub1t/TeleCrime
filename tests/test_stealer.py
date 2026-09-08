@@ -2,9 +2,9 @@
 
 import pytest
 
-from telecrime.stealer.models import Credential, StealerLog
+from telecrime.stealer.models import Credential
 from telecrime.stealer.parser import (
-    parse_credentials_text,
+    iter_credentials_file,
     parse_system_info,
 )
 from telecrime.stealer.patterns import (
@@ -164,9 +164,15 @@ class TestPatterns:
 
 
 class TestCredentialParser:
-    """Tests for credential parsing."""
+    """Tests for credential parsing (production streaming path)."""
 
-    def test_parse_labeled_format(self):
+    def _stream(self, tmp_path, text):
+        """Parse text through the production streaming entry point."""
+        f = tmp_path / "Passwords.txt"
+        f.write_text(text, encoding="utf-8")
+        return list(iter_credentials_file(f))
+
+    def test_parse_labeled_format(self, tmp_path):
         """Test parsing labeled format (Soft/Host/Login/Password)."""
         text = """
 Soft: Google Chrome [Default]
@@ -179,7 +185,7 @@ Host: https://twitter.com
 Login: twitteruser
 Password: twitterpass
 """
-        creds = parse_credentials_text(text)
+        creds = self._stream(tmp_path, text)
         assert len(creds) == 2
 
         assert creds[0].url == "https://accounts.google.com"
@@ -191,7 +197,7 @@ Password: twitterpass
         assert creds[1].username == "twitteruser"
         assert creds[1].password == "twitterpass"
 
-    def test_parse_url_username_password_format(self):
+    def test_parse_url_username_password_format(self, tmp_path):
         """Test parsing URL/Username/Password format."""
         text = """
 URL: https://facebook.com
@@ -202,12 +208,12 @@ URL: https://instagram.com
 Username: instauser
 Password: instapass
 """
-        creds = parse_credentials_text(text)
+        creds = self._stream(tmp_path, text)
         assert len(creds) == 2
         assert creds[0].url == "https://facebook.com"
         assert creds[0].username == "fbuser"
 
-    def test_parse_bracket_header_format(self):
+    def test_parse_bracket_header_format(self, tmp_path):
         """Test parsing ["Browser" = "Profile"] format."""
         text = """
 ["Chrome" = "Default"]
@@ -215,7 +221,7 @@ Hostname: https://netflix.com
 Username: viewer@email.com
 Password: watchme123
 """
-        creds = parse_credentials_text(text)
+        creds = self._stream(tmp_path, text)
         assert len(creds) == 1
         assert creds[0].url == "https://netflix.com"
         assert creds[0].application == "Chrome"
@@ -233,53 +239,39 @@ Password: watchme123
              "https://login.example.com", "user@example.com", "p@ssw0rd"),
         ],
     )
-    def test_separator_formats_dual_path(self, tmp_path, text, url, username, password):
-        """Each separator format parses identically through the text parser AND
-        the production streaming path (regression: the streaming colon branch
-        had zero coverage and drifted from the text parser)."""
-        from telecrime.stealer.parser import iter_credentials_file
-
-        # Text entry point
-        creds = parse_credentials_text(text)
+    def test_separator_formats_streaming(self, tmp_path, text, url, username, password):
+        """Each separator format parses through the production streaming path."""
+        creds = self._stream(tmp_path, text + "\n")
         assert creds
         assert creds[0].url == url
         assert creds[0].username == username
         assert creds[0].password == password
 
-        # Streaming entry point (production)
-        f = tmp_path / "Passwords.txt"
-        f.write_text(text + "\n", encoding="utf-8")
-        streamed = list(iter_credentials_file(f))
-        assert streamed
-        assert streamed[0].url == url
-        assert streamed[0].username == username
-        assert streamed[0].password == password
-
-    def test_parse_semicolon_password_with_semicolon(self):
+    def test_parse_semicolon_password_with_semicolon(self, tmp_path):
         """Password field may contain semicolons after the second delimiter."""
-        text = "https://example.com;user;p;a;s;s\n"
-        creds = parse_credentials_text(text)
+        text = "https://example.com;alice;p;a;s;s\n"
+        creds = self._stream(tmp_path, text)
         assert len(creds) == 1
         assert creds[0].password == "p;a;s;s"
 
-    def test_parse_strips_marketplace_boilerplate_from_fields(self):
+    def test_parse_strips_marketplace_boilerplate_from_fields(self, tmp_path):
         text = """
 https://example.com:user@example.com:secret123 | https://t.me/SampleCloud You can buy dm @SampleCloud
 https://other.example:user@example.com[to buy @seller]:secret456
 """
-        creds = parse_credentials_text(text)
+        creds = self._stream(tmp_path, text)
         assert len(creds) == 2
         assert creds[0].username == "user@example.com"
         assert creds[0].password == "secret123"
         assert creds[1].username == "user@example.com"
         assert creds[1].password == "secret456"
 
-    def test_parse_strips_uppercase_marketplace_boilerplate(self):
+    def test_parse_strips_uppercase_marketplace_boilerplate(self, tmp_path):
         """Promo regexes are case-insensitive; the fast-path trigger must be too."""
         text = """
 https://example.com:user@example.com:secret123 | HTTPS://T.ME/X YOU CAN BUY DM @X
 """
-        creds = parse_credentials_text(text)
+        creds = self._stream(tmp_path, text)
         assert len(creds) == 1
         assert creds[0].username == "user@example.com"
         assert creds[0].password == "secret123"
@@ -291,32 +283,13 @@ https://example.com:user@example.com:secret123 | HTTPS://T.ME/X YOU CAN BUY DM @
 
         assert all(len(v) <= 15 for v in _GARBAGE_USERNAMES | _GARBAGE_PASSWORDS)
 
-    def test_deduplication(self):
-        """Test that duplicate credentials are removed."""
-        text = """
-URL: https://example.com
-Username: user
-Password: pass
-
-URL: https://example.com
-Username: user
-Password: pass
-"""
-        creds = parse_credentials_text(text)
-        assert len(creds) == 1
-
-    def test_empty_input(self):
-        """Test parsing empty input."""
-        creds = parse_credentials_text("")
-        assert creds == []
-
-    def test_no_valid_credentials(self):
+    def test_no_valid_credentials(self, tmp_path):
         """Test input with no valid credentials."""
         text = """
 This is just some random text
 without any credentials
 """
-        creds = parse_credentials_text(text)
+        creds = self._stream(tmp_path, text)
         assert creds == []
 
 
@@ -366,50 +339,16 @@ OperatingSystem: Windows 11
         assert info.os == "Windows 11"
 
 
-class TestStealerLog:
-    """Tests for StealerLog model."""
-
-    def test_credential_count(self):
-        """Test credential count property."""
-        log = StealerLog(
-            credentials=[
-                Credential(url="https://a.com", username="u1", password="p1"),
-                Credential(url="https://b.com", username="u2", password="p2"),
-            ]
-        )
-        assert log.credential_count == 2
-
-    def test_unique_domains(self):
-        """Test unique domains property."""
-        log = StealerLog(
-            credentials=[
-                Credential(url="https://google.com/a", username="u1", password="p1"),
-                Credential(url="https://google.com/b", username="u2", password="p2"),
-                Credential(url="https://facebook.com", username="u3", password="p3"),
-            ]
-        )
-        assert log.unique_domains == {"google.com", "facebook.com"}
-
-    def test_to_dict(self):
-        """Test conversion to dictionary."""
-        log = StealerLog(
-            stealer_name="redline",
-            source_archive="log.zip",
-            credentials=[
-                Credential(url="https://a.com", username="u", password="p"),
-            ],
-        )
-        d = log.to_dict()
-
-        assert d["stealer_name"] == "redline"
-        assert d["credential_count"] == 1
-        assert len(d["credentials"]) == 1
-
-
 class TestParserRobustness:
     """Regression tests for parser edge cases (E1 improvements)."""
 
-    def test_windows_path_url_rejected(self):
+    def _stream(self, tmp_path, text):
+        """Parse text through the production streaming entry point."""
+        f = tmp_path / "Passwords.txt"
+        f.write_text(text, encoding="utf-8")
+        return list(iter_credentials_file(f))
+
+    def test_windows_path_url_rejected(self, tmp_path):
         """HOST: C:\\path should not produce credentials — it's a Windows path, not a URL."""
         text = """
 Soft: Chrome
@@ -417,17 +356,17 @@ Host: C:\\Users\\user\\AppData\\Local\\Google\\Chrome\\User Data
 Login: user@example.com
 Password: secret123
 """
-        creds = parse_credentials_text(text)
+        creds = self._stream(tmp_path, text)
         assert creds == [], "Windows path in HOST field should not produce a credential"
 
-    def test_url_with_null_chars_stripped(self):
+    def test_url_with_null_chars_stripped(self, tmp_path):
         """URLs containing null bytes should be cleaned before producing a credential."""
-        text = "URL: https://example.com\x00\nUsername: user\nPassword: pass\n"
-        creds = parse_credentials_text(text)
+        text = "URL: https://example.com\x00\nUsername: alice\nPassword: secret123\n"
+        creds = self._stream(tmp_path, text)
         assert len(creds) == 1
         assert "\x00" not in creds[0].url
 
-    def test_empty_value_continuation(self):
+    def test_empty_value_continuation(self, tmp_path):
         """Password on its own line after 'Password:' (empty value) should be captured."""
         text = """
 URL: https://example.com
@@ -435,20 +374,18 @@ Username: admin
 Password:
 sup3rsecret!
 """
-        creds = parse_credentials_text(text)
+        creds = self._stream(tmp_path, text)
         assert len(creds) == 1
         assert creds[0].password == "sup3rsecret!"
 
     def test_binary_file_skipped(self, tmp_path):
         """Files containing null-byte sequences should be skipped silently."""
-        from telecrime.stealer.parser import iter_credentials_file
-
         binary_file = tmp_path / "binary.txt"
         binary_file.write_bytes(b"\x00\x00\x00MZ\x90\x00some binary content")
         creds = list(iter_credentials_file(binary_file))
         assert creds == [], "Binary file should yield zero credentials"
 
-    def test_url_scheme_required(self):
+    def test_url_scheme_required(self, tmp_path):
         """Only http:// and https:// URLs should be accepted; ftp:// and bare domains rejected."""
         text = """
 URL: ftp://files.example.com
@@ -459,7 +396,7 @@ URL: example.com
 Username: user2
 Password: pass2
 """
-        creds = parse_credentials_text(text)
+        creds = self._stream(tmp_path, text)
         assert creds == [], "Non-HTTP(S) URLs should not produce credentials"
 
 

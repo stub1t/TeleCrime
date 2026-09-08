@@ -1,6 +1,6 @@
 """Data models for stealer log parsing."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 
@@ -99,35 +99,4 @@ class SystemInfo:
             "screen_size": self.screen_size,
             "log_date": self.log_date.isoformat() if self.log_date else None,
             "stealer_name": self.stealer_name,
-        }
-
-
-@dataclass
-class StealerLog:
-    """Parsed stealer log containing credentials and system info."""
-
-    credentials: list[Credential] = field(default_factory=list)
-    system_info: SystemInfo | None = None
-    stealer_name: str | None = None
-    source_archive: str | None = None
-    parse_errors: list[str] = field(default_factory=list)
-
-    @property
-    def credential_count(self) -> int:
-        return len(self.credentials)
-
-    @property
-    def unique_domains(self) -> set[str]:
-        return {c.domain for c in self.credentials if c.domain}
-
-    def to_dict(self) -> dict[str, object]:
-        """Convert to dictionary."""
-        return {
-            "stealer_name": self.stealer_name,
-            "source_archive": self.source_archive,
-            "credential_count": self.credential_count,
-            "unique_domains": list(self.unique_domains),
-            "credentials": [c.to_dict() for c in self.credentials],
-            "system_info": self.system_info.to_dict() if self.system_info else None,
-            "parse_errors": self.parse_errors,
         }
