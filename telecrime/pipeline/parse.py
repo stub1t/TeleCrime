@@ -1266,6 +1266,25 @@ class ParseStage(PipelineStage):
             finally:
                 cursor.close()
             savepoint.commit()
+            # Drain the trigram GIN pending lists OUTSIDE the timed INSERT:
+            # pending entries accumulate across chunks (the transaction commits
+            # per archive, not per chunk) and the NEXT INSERT-SELECT triggers an
+            # inline merge that can blow the 10-min statement timeout — the
+            # "Credential COPY chunk failed ... retrying" storm. Cleaning here
+            # keeps the pending list near-empty so inserts stay fast. Best-
+            # effort: a failed clean is a performance issue, not correctness.
+            try:
+                cursor = ctx.session.connection().connection.cursor()
+                try:
+                    cursor.execute(
+                        "SELECT gin_clean_pending_list('ix_pc_username_trgm'), "
+                        "gin_clean_pending_list('ix_pc_domain_trgm')"
+                    )
+                    cursor.fetchall()
+                finally:
+                    cursor.close()
+            except Exception:
+                pass
             return [
                 {"credential_hash": credential_hash, "domain": domain}
                 for credential_hash, domain in rows_returned
