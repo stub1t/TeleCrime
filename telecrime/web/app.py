@@ -230,7 +230,6 @@ def _decorate_facets(
         "domain": "domain",
         "stealer_type": "stealer",
         "application": "application",
-        "email_domain": "email_domain",
     }
     for facet_key, items in facets.items():
         query_key = key_map.get(facet_key, facet_key)

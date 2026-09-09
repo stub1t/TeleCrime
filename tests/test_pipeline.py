@@ -1241,6 +1241,38 @@ class TestParseParallelChunking:
         assert worker_creds == sequential
         assert len(worker_result) >= 2
 
+    def test_parse_lines_chunk_worker_combo_fast_path(self, tmp_path):
+        """A pure-combo chunk (the dominant ULP class) parsed through the worker
+        takes the combo fast path and matches the sequential parser."""
+        from telecrime.pipeline.parse import _parse_lines_chunk_worker
+        from telecrime.stealer.parser import parse_credential_lines
+
+        src = "/tmp/combo-fast-chunk.txt"
+        lines = [f"https://site{i}.com;u{i};p{i}" for i in range(5000)]
+        worker_result = _parse_lines_chunk_worker((lines, src))
+        sequential = [
+            (c.url, c.username, c.password, c.application, c.profile)
+            for c in parse_credential_lines(iter(lines), src)
+        ]
+        worker_creds = [(t[0], t[2], t[3], t[5], t[6]) for t in worker_result]
+        assert worker_creds == sequential
+        assert len(worker_result) == 5000
+
+    def test_combo_decision_cached_across_chunk_calls(self):
+        """parse_credential_lines chunk calls sharing a source_file reuse the
+        cached per-file combo decision; chunked parsing equals one-shot."""
+        from telecrime.stealer.parser import _COMBO_CLASS_CACHE, parse_credential_lines
+
+        src = "/tmp/combo-cache-chunked.txt"
+        _COMBO_CLASS_CACHE.pop(src, None)
+        lines = [f"https://site{i}.com:user{i}:pass{i}" for i in range(1000)]
+        combined = list(parse_credential_lines(iter(lines), src))
+        assert _COMBO_CLASS_CACHE.get(src) is True
+        split = []
+        for start in range(0, 1000, 250):
+            split.extend(parse_credential_lines(iter(lines[start : start + 250]), src))
+        assert split == combined
+
 
 class TestAcquireStaleCleanup:
     """Tests for AcquireStage stale group cleanup."""

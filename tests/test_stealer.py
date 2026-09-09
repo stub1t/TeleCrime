@@ -552,3 +552,205 @@ class TestCredentialGateExpanded:
         from telecrime.stealer.patterns import is_credential_file
 
         assert is_credential_file(name) is False, name
+
+
+# Lines that stress the fast/slow equivalence: branch-precedence traps (a
+# digit "user" that the colon regex can read as a URL port), passwords that
+# contain the other separators, marketplace boilerplate (mixed case), NULs,
+# ports, indentation, and non-matching junk. Deliberately no embedded "\n" —
+# delivered lines never contain one in production (file iteration and
+# parse.py's chunking split on newlines).
+_COMBO_EDGE_LINES = [
+    "https://a.com:5804:&ZrYK%uzW",
+    "https://sbyzpjqsnd.com:user@fyz.org:r80mShGe@",
+    "http://thcdm.net | 5804 | &ZrYK%uzW",
+    "https://a.com:u:p",
+    "https://b.com:q:r",
+    "https://x.com | u | p",
+    "https://x.com|u|p",
+    "https://x.com\t|\tu\t|\tp",
+    "https://x.com;u;p;q",
+    "https://x.com | u | p|q|r",
+    "https://a.com:u:p | https://t.me/X You can buy dm @X",
+    "  https://indented.com:u:p  ",
+    "http://legacy.com:u:p",
+    "https://host:8080:user1:pass1",
+    "https://host:8080 | admin | secret",
+    "https://login.example.com;user@example.com;p@ssw0rd",
+    "https://example.com;alice;p;a;s;s",
+    "https://other.example:user@example.com[to buy @seller]:secret456",
+    "https://example.com:user@example.com:secret123 | HTTPS://T.ME/X YOU CAN BUY DM @X",
+    "https://x.com:u:p\x00withnul",
+    "https://x.com:user:secret123 | https://t.me/SampleCloud You can buy dm @SampleCloud",
+    "some random text",
+    "---",
+    "https://example.com",
+]
+
+
+def _random_combo_lines(seed, n):
+    """Deterministic mix of combo rows (colon/pipe/semicolon) plus a small
+    amount of blanks/separators/junk, mirroring real ULP dumps."""
+    import random
+
+    rng = random.Random(seed)
+    hosts = ["google.com", "yahoo.co.jp", "sub.example.org", "x.com", "login.microsoftonline.com"]
+    users = ["alice", "bob_23", "user@example.com", "caf\u00e9\u00df", "na\u00efve"]
+    passwords = [
+        "p@ssw0rd", "\u00e9\u00e8\u00ea", "a|b|c", "x;y;z", "x:y:z",
+        "<br>", "secret123 | https://t.me/X You can buy dm @X", "I want to buy stuff",
+        "\x00nul\x00", "p\x00", " \t p \t ",
+    ]
+    fmt = [
+        lambda h, u, p: f"https://{h}:{u}:{p}",
+        lambda h, u, p: f"http://{h} | {u} | {p}",
+        lambda h, u, p: f"http://{h};{u};{p}",
+        lambda h, u, p: f"https://{h}:8080:{u}:{p}",
+        lambda h, u, p: f"https://{h}/a/b?c=1:{u}:{p}",
+    ]
+    out = []
+    for _ in range(n):
+        r = rng.random()
+        if r < 0.06:
+            out.append(rng.choice(["", "---", "====", "junk", "# comment", "https://x.com"]))
+        else:
+            h = rng.choice(hosts)
+            u = rng.choice(users)
+            p = rng.choice(passwords)
+            out.append(rng.choice(fmt)(h, u, p))
+    return out
+
+
+class TestComboFastPath:
+    """Combo/ULP fast path: classification heuristic, differential equality
+    with the general parser, and per-file decision caching."""
+
+    def _slow_filtered(self, lines, source):
+        from telecrime.stealer.parser import (
+            _is_garbage_credential,
+            _iter_credentials_from_lines_slow,
+        )
+
+        for c in _iter_credentials_from_lines_slow(iter(lines), source):
+            if not _is_garbage_credential(c.username, c.password):
+                yield c
+
+    def test_classify_combo_head(self):
+        from telecrime.stealer.parser import _classify_combo_head
+
+        assert _classify_combo_head(_COMBO_EDGE_LINES[:20]) is True
+        assert _classify_combo_head(_COMBO_EDGE_LINES) is False  # 3 junk of 24 < 90%
+        assert _classify_combo_head(["https://a.com:u:p"]) is True
+        assert _classify_combo_head(["junk"]) is False
+        assert _classify_combo_head(["", "  "]) is False
+        assert _classify_combo_head([]) is False
+        assert _classify_combo_head(["https://a.com:u:p", "", "  "]) is True
+        assert _classify_combo_head(["https://a.com:u:p", "", "---"]) is False
+        # Bare-URL junk rows look labeled ("https" : "//x.com") but can never
+        # seed a block credential — they must not veto the fast path.
+        assert _classify_combo_head(
+            ["https://a.com:u:p"] * 10 + ["https://x.com"]
+        ) is True
+
+    def test_classify_combo_head_vetoes_labeled_blocks(self):
+        from telecrime.stealer.parser import _classify_combo_head
+
+        labeled = [
+            "Soft: Chrome", "Host: https://a.com", "Login: u", "Password: p", "",
+            "URL: https://b.com", "Username: v", "Password: q",
+        ]
+        assert _classify_combo_head(labeled) is False
+        # A single labeled line anywhere in the probe window vetoes the fast path.
+        mixed = _COMBO_EDGE_LINES[:10] + ["Host: https://a.com"] + _COMBO_EDGE_LINES[10:20]
+        assert _classify_combo_head(mixed) is False
+        # Bracket headers too.
+        brack = _COMBO_EDGE_LINES[:10] + ['["Chrome" = "Default"]'] + _COMBO_EDGE_LINES[10:20]
+        assert _classify_combo_head(brack) is False
+
+    def test_combo_fast_matches_slow_edge_lines(self):
+        from telecrime.stealer.parser import _iter_combo_lines, _iter_credentials_from_lines_slow
+
+        slow = list(_iter_credentials_from_lines_slow(iter(_COMBO_EDGE_LINES), None))
+        fast = list(_iter_combo_lines(iter(_COMBO_EDGE_LINES), None))
+        assert len(slow) == 21
+        assert slow == fast
+
+    @pytest.mark.parametrize("seed", [7, 42, 99, 2024])
+    def test_combo_fast_matches_slow_random(self, seed):
+        from telecrime.stealer.parser import _iter_combo_lines, _iter_credentials_from_lines_slow
+
+        lines = _random_combo_lines(seed, 4000)
+        slow = list(_iter_credentials_from_lines_slow(iter(lines), None))
+        fast = list(_iter_combo_lines(iter(lines), None))
+        assert slow == fast
+        assert slow  # the corpora actually produce credentials
+
+    def test_combo_public_path_matches_slow(self):
+        from telecrime.stealer.parser import parse_credential_lines
+
+        src = "combo-fast-e2e-1"
+        lines = _random_combo_lines(5, 3000)
+        public = list(parse_credential_lines(iter(lines), src))
+        slow = list(self._slow_filtered(lines, src))
+        assert public == slow
+
+    def test_combo_file_entry_matches_slow(self, tmp_path):
+        from telecrime.stealer.parser import iter_credentials_file
+
+        lines = _random_combo_lines(11, 2500)
+        f = tmp_path / "combo_list.txt"
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        public = list(iter_credentials_file(f))
+        slow = list(self._slow_filtered(lines, str(f)))
+        assert public == slow
+
+    def test_labeled_files_keep_slow_path_results(self, tmp_path):
+        from telecrime.stealer.parser import iter_credentials_file
+
+        text = """Soft: Chrome
+Host: C:\\Users\\user\\AppData\\Local\\Google\\Chrome\\User Data
+Login: user@example.com
+Password: secret123
+
+["Firefox" = "Default"]
+Host: https://netflix.com
+Username: viewer@email.com
+Password: watchme123
+
+URL: https://twitter.com
+Username: twit
+Password: pass123
+"""
+        f = tmp_path / "Passwords.txt"
+        f.write_text(text, encoding="utf-8")
+        public = list(iter_credentials_file(f))
+        slow = list(self._slow_filtered(text.splitlines(), str(f)))
+        assert public == slow
+        assert [c.username for c in public] == ["viewer@email.com", "twit"]
+
+    def test_combo_decision_cached_per_file(self):
+        from telecrime.stealer.parser import _COMBO_CLASS_CACHE, parse_credential_lines
+
+        combo_src = "combo-fast-cache-1"
+        labeled_src = "combo-fast-cache-2"
+        _COMBO_CLASS_CACHE.pop(combo_src, None)
+        _COMBO_CLASS_CACHE.pop(labeled_src, None)
+        combo_lines = _random_combo_lines(13, 500)
+        list(parse_credential_lines(iter(combo_lines), combo_src))
+        assert _COMBO_CLASS_CACHE.get(combo_src) is True
+        labeled = ["Soft: Chrome", "Host: https://a.com", "Login: u", "Password: p"]
+        list(parse_credential_lines(iter(labeled), labeled_src))
+        assert _COMBO_CLASS_CACHE.get(labeled_src) is False
+
+    def test_combo_chunked_parses_equal_combined(self):
+        from telecrime.stealer.parser import parse_credential_lines
+
+        src = "combo-fast-chunked-1"
+        lines = [f"https://site{i}.com:user{i}:pass{i}" for i in range(1000)]
+        combined = list(parse_credential_lines(iter(lines), src))
+        split = []
+        for start in range(0, 1000, 250):
+            split.extend(
+                parse_credential_lines(iter(lines[start : start + 250]), src)
+            )
+        assert split == combined

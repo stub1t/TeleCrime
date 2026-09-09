@@ -1,5 +1,6 @@
 """Parser for stealer log credential files."""
 
+import itertools
 import logging
 import re
 from collections.abc import Generator, Iterator
@@ -26,6 +27,26 @@ _PIPE_LINE_RE = re.compile(
 )
 _SEMICOLON_LINE_RE = re.compile(
     r"^(?P<url>https?://[^\s;]+);(?P<username>[^;]+);(?P<password>.+)$"
+)
+# Combo fast path: one C-level finditer over whole text buffers instead of up
+# to three anchored regex matches per line. Branch order (colon, pipe,
+# semicolon) mirrors the per-line trio above and alternation is ordered, so
+# this matches exactly the lines/fields the slow path would. Group names are
+# prefixed per branch because a group name may not repeat across alternatives;
+# the branch-marker groups (colon/pipe/semi) identify which branch matched.
+# The per-line char classes are newline-hardened ([^\S\n]* instead of \s*,
+# [^:\n] etc.): greedy classes like [^:]+ would otherwise swallow the "\n"
+# between buffer lines and match across them, which the per-line slow path
+# (whose input is a single stripped line) can never do. Lockstep with the
+# per-line trio is asserted by the differential test.
+_COMBO_FAST_RE = re.compile(
+    r"^(?P<colon>https?://[^\s:]+(?::\d{1,5})?):"
+    r"(?P<colon_user>[^:\n]+):(?P<colon_pass>.+)$"
+    r"|^(?P<pipe>https?://[^\s|]+)[^\S\n]*\|[^\S\n]*"
+    r"(?P<pipe_user>[^|\n]+)[^\S\n]*\|[^\S\n]*(?P<pipe_pass>.+)$"
+    r"|^(?P<semi>https?://[^\s;]+);"
+    r"(?P<semi_user>[^;\n]+);(?P<semi_pass>.+)$",
+    re.MULTILINE,
 )
 _LABELED_LINE_RE = re.compile(r"^([A-Za-z_]+)\s*[:=]\s*(.*)$")
 _BRACKET_LINE_RE = re.compile(
@@ -54,6 +75,17 @@ _GARBAGE_USERNAMES = frozenset({
 _GARBAGE_PASSWORDS = frozenset({
     "null", "undefined", "password", "pass",
 })
+
+# Combo fast-path tuning. The classifier probes only the first lines of a file
+# so the decision is O(1) per file; a misclassified late-labeled-block file
+# would silently drop its labeled credentials, so the probe is deliberately
+# conservative (any labeled/bracket header in the window vetoes the fast path).
+_COMBO_CLASSIFY_LINES = 200
+_COMBO_SCAN_BYTES = 8 * 1024 * 1024
+# Decision is per file (cached so parallel chunks of one file share it);
+# the cache is bounded because long-running workers see many files.
+_COMBO_CACHE_MAX = 256
+_COMBO_CLASS_CACHE: dict[str, bool] = {}
 
 
 def _is_garbage_credential(username: str, password: str) -> bool:
@@ -245,7 +277,7 @@ def _credential_from_fields(
     return None
 
 
-def _iter_credentials_from_lines(
+def _iter_credentials_from_lines_slow(
     lines: Iterator[str],
     source_file: str | None,
 ) -> Generator[Credential, None, None]:
@@ -326,6 +358,136 @@ def _iter_credentials_from_lines(
 
     # Flush final block
     yield from flush_block()
+
+
+def _classify_combo_head(head: list[str]) -> bool:
+    """Return True when the first lines look like a combo-only file.
+
+    Combo/ULP files are line-independent ``url:user:pass`` rows (colon, pipe
+    or semicolon). Any labeled/bracket header in the probe window means the
+    file may use block semantics (a credential can then span several lines),
+    which the fast path cannot reproduce — veto it. Otherwise ≥90% of the
+    non-blank lines must match a single-line combo pattern.
+    """
+    examined = 0
+    matched = 0
+    for raw in head:
+        line = raw.strip()
+        if not line:
+            continue
+        examined += 1
+        # Combo rows like "https://a.com:u:p" also fit _LABELED_LINE_RE (key
+        # "https"), so the combo check must run first, mirroring per-line order.
+        if (
+            _COLON_LINE_RE.match(line)
+            or _PIPE_LINE_RE.match(line)
+            or _SEMICOLON_LINE_RE.match(line)
+        ):
+            matched += 1
+            continue
+        lm = _LABELED_LINE_RE.match(line)
+        if lm is not None:
+            # A bare "https://x.com" junk row reads as key "https", value
+            # "//x.com" — a URL-scheme artifact, not a block header: it can
+            # never yield a credential in block context, so it must not veto.
+            if not lm.group(2).lstrip().startswith("//"):
+                return False
+        elif _BRACKET_LINE_RE.match(line):
+            return False
+    # At least 90% of the examined lines must be single-line combo rows.
+    return examined > 0 and matched * 10 >= examined * 9
+
+
+def _scan_combo_buffer(
+    text: str, source_file: str | None
+) -> Generator[Credential, None, None]:
+    """Yield credentials from one whole-buffer combo scan."""
+    make = _make_credential
+    for m in _COMBO_FAST_RE.finditer(text):
+        if m.group("colon") is not None:
+            yield make(
+                url=m.group("colon"),
+                username=m.group("colon_user"),
+                password=m.group("colon_pass"),
+                source_file=source_file,
+            )
+        elif m.group("pipe") is not None:
+            yield make(
+                url=m.group("pipe"),
+                username=m.group("pipe_user"),
+                password=m.group("pipe_pass"),
+                source_file=source_file,
+            )
+        else:
+            yield make(
+                url=m.group("semi"),
+                username=m.group("semi_user"),
+                password=m.group("semi_pass"),
+                source_file=source_file,
+            )
+
+
+def _iter_combo_lines(
+    lines: Iterator[str],
+    source_file: str | None,
+) -> Generator[Credential, None, None]:
+    """Combo fast path: batch lines into ~8 MB buffers and scan each with one
+    C-level finditer instead of up to three regex matches per line.
+
+    Combo lines are line-independent — a credential never spans two lines — so
+    cutting the buffer at a line boundary cannot lose or truncate a row. Lines
+    are stripped exactly like the general path strips them before matching.
+    """
+    buf: list[str] = []
+    buf_size = 0
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        buf.append(line)
+        buf_size += len(line)
+        if buf_size >= _COMBO_SCAN_BYTES:
+            yield from _scan_combo_buffer("\n".join(buf), source_file)
+            buf = []
+            buf_size = 0
+    if buf:
+        yield from _scan_combo_buffer("\n".join(buf), source_file)
+
+
+def _iter_credentials_from_lines(
+    lines: Iterator[str],
+    source_file: str | None,
+) -> Generator[Credential, None, None]:
+    """Stream credentials from an iterator of lines.
+
+    Strategy is picked once per file (cached by source_file for the parallel
+    chunk workers, which parse one file across many calls): combo-only files
+    take the whole-buffer fast path, everything else the general path below.
+    The probe only reads the first _COMBO_CLASSIFY_LINES lines, so labeled
+    blocks appearing later in a probed-combo file are the accepted trade-off
+    for skipping the per-line regex work on the dominant ULP class.
+    """
+    it = iter(lines)
+    head: list[str] = []
+    decision: bool | None = None
+    if source_file is not None:
+        decision = _COMBO_CLASS_CACHE.get(source_file)
+    if decision is None:
+        for _ in range(_COMBO_CLASSIFY_LINES):
+            try:
+                head.append(next(it))
+            except StopIteration:
+                break
+        decision = _classify_combo_head(head)
+        if source_file is not None:
+            if len(_COMBO_CLASS_CACHE) >= _COMBO_CACHE_MAX:
+                _COMBO_CLASS_CACHE.clear()
+            _COMBO_CLASS_CACHE[source_file] = decision
+    rest = itertools.chain(head, it)
+    if decision:
+        yield from _iter_combo_lines(rest, source_file)
+    else:
+        yield from _iter_credentials_from_lines_slow(rest, source_file)
 
 
 def _iter_credentials_from_file(
