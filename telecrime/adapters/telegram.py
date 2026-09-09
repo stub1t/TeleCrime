@@ -282,6 +282,18 @@ class TelegramAdapter(BaseAdapter):
                     f"Telegram reconnect for {reason!r} exceeded "
                     f"{budget}s budget — aborting"
                 ) from exc
+            except Exception:
+                # A failed reconnect must not leave the "reconnect pending"
+                # note behind: it is what the watchdog uses to decide whether
+                # to kill the pipeline, and a stale note from a long-gone
+                # connect attempt killed a HEALTHY parse hours later (the
+                # note outlives the failure; only _reconnect_blocking used to
+                # clear it). The caller retries/reconnects on its own.
+                try:
+                    self._clear_runtime_note()
+                except Exception:
+                    pass
+                raise
 
     # Maximum wall-clock per attempt of the wrapped Telethon op. Without
     # this, a Telethon call that gets stuck in an internal `await` (network

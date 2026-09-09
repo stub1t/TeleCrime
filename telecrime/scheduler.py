@@ -715,6 +715,15 @@ def _check_pipeline_health(config) -> PipelineHealth:
         # Fail-safe: an UNKNOWN age must not trigger the kill either.
         and meaningful_age is not None
         and meaningful_age > min(stale_threshold, 600)
+        # The note alone must never kill a live pipeline: a note set once
+        # (e.g. a 30s connect timeout) can outlive the failure by hours, and
+        # a long legitimate parse chunk can starve last_progress_at past the
+        # threshold — together they killed a HEALTHY run mid-parse (2026-09-09).
+        # With auto_reconnect=False the adapter's reconnects are bounded and
+        # clear the note on failure, so a genuinely wedged reconnect also
+        # freezes the heartbeat — require that here.
+        and updated_age is not None
+        and updated_age > min(stale_threshold, 600)
     ):
         reasons.append(f"telegram reconnect wait exceeded {int(runtime_note_since_age)}s")
     pipeline_started_age = _iso_age_seconds(pipeline_status.last_run) if pipeline_status else None
