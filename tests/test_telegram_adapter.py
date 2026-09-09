@@ -220,6 +220,58 @@ async def test_iter_messages_raises_on_cancelled():
 
 
 @pytest.mark.asyncio
+async def test_iter_messages_stalls_bounded():
+    """A half-open socket (Telethon page fetch that never completes) must not
+    hang ingest forever: the bounded iterator raises RuntimeError after the
+    stall bound so the watchdog can restart the run with a fresh connection."""
+    from telecrime.adapters.telegram import TelegramAdapter
+
+    config = MagicMock()
+    config.telegram.api_id = 1
+    config.telegram.api_hash = "x"
+    config.telegram.session_name = "test"
+    adapter = TelegramAdapter(config)
+    adapter._ITER_STALL_SECONDS = 1  # tighten for the test
+
+    client = AsyncMock()
+    adapter.client = client
+
+    async def _hangs():
+        await asyncio.sleep(60)
+        yield  # never reached
+
+    client.iter_messages = lambda **kw: _hangs()
+    with pytest.raises(RuntimeError, match="stalled"):
+        async for _ in adapter.iter_messages(1, min_id=0):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_iter_conversations_stalls_bounded():
+    """Same stall bound for the conversation scan."""
+    from telecrime.adapters.telegram import TelegramAdapter
+
+    config = MagicMock()
+    config.telegram.api_id = 1
+    config.telegram.api_hash = "x"
+    config.telegram.session_name = "test"
+    adapter = TelegramAdapter(config)
+    adapter._ITER_STALL_SECONDS = 1
+
+    client = AsyncMock()
+    adapter.client = client
+
+    async def _hangs():
+        await asyncio.sleep(60)
+        yield  # never reached
+
+    client.iter_dialogs = lambda: _hangs()
+    with pytest.raises(RuntimeError, match="stalled"):
+        async for _ in adapter.iter_conversations():
+            pass
+
+
+@pytest.mark.asyncio
 async def test_run_with_reconnect_propagates_external_cancel(monkeypatch):
     """An EXTERNAL task.cancel() must not be swallowed into a reconnect+retry
     loop — that leak left _run_with_reconnect tasks alive after the download

@@ -244,6 +244,16 @@ class TelegramAdapter(BaseAdapter):
     # the reconnect lock indefinitely.
     _DISCONNECT_TIMEOUT_SECONDS: int = 15
 
+    # Bounded-wait on each telethon iterator page. A half-open socket (server
+    # accepted the connection, then stopped responding) makes Telethon's
+    # RequestIter._load_next_chunk hang forever inside `async for` — the
+    # heartbeat thread keeps the watchdog happy while the main loop is stuck,
+    # so a truly hung ingest/scan never recovered on its own. Each page fetch
+    # is pure network I/O, so a timeout here is a genuine stall, not parse-DB
+    # contention. On timeout the run fails and the watchdog restarts it with a
+    # fresh connection.
+    _ITER_STALL_SECONDS: int = 120
+
     async def _ensure_connected(self, timeout: int = 30, reason: str = "telegram operation") -> None:
         if self.client is not None and self.client.is_connected():
             return
@@ -436,7 +446,11 @@ class TelegramAdapter(BaseAdapter):
         await self._ensure_connected(reason="iterating conversations")
 
         try:
-            async for dialog in self.client.iter_dialogs():
+            async for dialog in self._bounded_aiter(
+                self.client.iter_dialogs(),
+                "iterating conversations",
+                self._ITER_STALL_SECONDS,
+            ):
                 entity = dialog.entity
 
                 conv_type = self._get_conversation_type(entity)
@@ -482,6 +496,39 @@ class TelegramAdapter(BaseAdapter):
             return "channel"
         return "unknown"
 
+    async def _bounded_aiter(
+        self,
+        it,
+        operation: str,
+        stall_seconds: int,
+    ) -> AsyncIterator[object]:
+        """Async-iterate with a per-item stall bound.
+
+        Telethon's RequestIter can hang forever on a half-open socket (server
+        accepted the connection then stopped responding): `async for` blocks
+        in _load_next_chunk with no timeout, and the heartbeat thread keeps
+        the watchdog believing the pipeline is healthy. Each yielded item here
+        is bounded by `stall_seconds`; a timeout raises so the run fails and
+        the watchdog restarts it with a fresh connection.
+        """
+        while True:
+            try:
+                item = await asyncio.wait_for(
+                    it.__anext__(), timeout=stall_seconds
+                )
+            except StopAsyncIteration:
+                return
+            except TimeoutError as exc:
+                logger.error(
+                    "%s stalled for %ds (no data from Telegram) — aborting",
+                    operation,
+                    stall_seconds,
+                )
+                raise RuntimeError(
+                    f"Telegram {operation} stalled for {stall_seconds}s"
+                ) from exc
+            yield item
+
     async def iter_messages(
         self,
         conversation_id: int,
@@ -503,7 +550,11 @@ class TelegramAdapter(BaseAdapter):
             kwargs["limit"] = limit
 
         try:
-            async for message in self.client.iter_messages(**kwargs):
+            async for message in self._bounded_aiter(
+                self.client.iter_messages(**kwargs),
+                f"iterating messages for conversation {conversation_id}",
+                self._ITER_STALL_SECONDS,
+            ):
                 if not isinstance(message, TelegramMessage):
                     continue
 
