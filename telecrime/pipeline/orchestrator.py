@@ -1788,7 +1788,16 @@ def _finish_pipeline_run(
     stages_failed: list[str],
 ) -> None:
     """Persist final pipeline run counters and stage outcomes."""
-    run_id = run.id
+    # Capture the id WITHOUT touching `run`'s attributes: after the many
+    # mid-run commits the instance is expired, and once the session has been
+    # invalidated/rolled back a lazy refresh on `run.id` raises
+    # DetachedInstanceError (observed: 'Instance <PipelineRun> is not bound
+    # to a Session'). The identity lives in the instance state — no query.
+    _state = sqlalchemy.inspect(run)
+    run_id = _state.identity[0] if _state.identity else None
+    if run_id is None:
+        logger.warning("Pipeline run finalization skipped (no persisted id)")
+        return
     try:
         session.rollback()
     except Exception:
