@@ -1409,6 +1409,12 @@ async def run_sequential_pipeline(
                         )
                         _next_task.cancel()
                         await asyncio.wait({_next_task}, timeout=5.0)
+                        if not _next_task.done():
+                            # Telethon can swallow CancelledError; a still-live
+                            # zombie would keep writing the .partial and could
+                            # later commit FAILED over our reset. Give it more
+                            # time before touching the artifact.
+                            await asyncio.wait({_next_task}, timeout=25.0)
                         # Reset artifact so recover_stuck_downloads picks it up next run
                         _reset_prefetch_artifact(session, artifact.id)
                         session.commit()

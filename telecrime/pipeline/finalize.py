@@ -497,7 +497,22 @@ class FinalizeStage(PipelineStage):
                         # Deleted concurrently by another finalize run — fine.
                         artifact.is_deleted = True
                     except Exception as e:
-                        logger.warning("Failed to delete %s: %s", archive_path, e)
+                        # Transient failures (EBUSY, EIO) resolve on a retry.
+                        # The group is still marked CLEANED by the caller, so
+                        # leave is_deleted=False: the orphan sweep (or the next
+                        # run's cleanup) reclaims the file. Retry once with a
+                        # short backoff to avoid relying on that backstop.
+                        try:
+                            time.sleep(1.0)
+                            archive_path.unlink()
+                            artifact.is_deleted = True
+                            logger.warning("Deleted %s after retry: %s", archive_path, e)
+                        except FileNotFoundError:
+                            artifact.is_deleted = True
+                        except Exception as e2:
+                            logger.warning(
+                                "Failed to delete %s after retry: %s", archive_path, e2
+                            )
                 else:
                     artifact.is_deleted = True  # Already gone
 

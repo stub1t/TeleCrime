@@ -1112,6 +1112,15 @@ def _stats_worker(engine_url: str, presets: list[tuple[int, int]], interval: int
                     data: dict[str, object] = raw_data if isinstance(raw_data, dict) else {}
                     data[f"{days}:{limit}"] = payload
                     cache["data"] = data
+                    # Per-preset freshness: the top-level generated_at is also
+                    # bumped by the home worker, so labeling the stats page with
+                    # it lied about how fresh the numbers were. Keep both — the
+                    # stats route prefers the per-preset stamp.
+                    key_times = cache.get("key_times")
+                    if not isinstance(key_times, dict):
+                        key_times = {}
+                    key_times[f"{days}:{limit}"] = datetime.now(UTC).isoformat()
+                    cache["key_times"] = key_times
                     cache["generated_at"] = datetime.now(UTC).isoformat()
                     _write_stats_cache(cache)
             except Exception as e:
@@ -1370,14 +1379,15 @@ def _watchlist_count(
     else:
         # PostgreSQL cannot use multiple GIN trgm indexes with OR — run per-column
         # queries and UNION to deduplicate, letting each query use its own index.
+        # NOTE: no url branch — matches the scheduler's "any" alert filter
+        # (domain ∪ username), and the url trgm index was deliberately dropped
+        # (migration v2w3x4y5z6a7) so a url scan would be a full-table seq scan.
         row = conn.execute(
             text(
                 f"SELECT COUNT(*) FROM ("
                 f"  SELECT id FROM parsed_credentials WHERE {since_sql}domain ILIKE :q"
                 f"  UNION"
                 f"  SELECT id FROM parsed_credentials WHERE {since_sql}username ILIKE :q"
-                f"  UNION"
-                f"  SELECT id FROM parsed_credentials WHERE {since_sql}url ILIKE :q"
                 f") _wl"
             ),
             params,
@@ -2691,9 +2701,17 @@ def create_app(database_url: str | None = None) -> FastAPI:
             cache_data = cache.get("data")
             if isinstance(cache_data, dict):
                 cached = cache_data.get(cache_key)
-            last_updated = cache.get("generated_at")
+            # Prefer the per-preset freshness stamp (the top-level generated_at
+            # is also bumped by the home worker, which lied about how fresh the
+            # stats numbers were).
+            key_times = cache.get("key_times")
+            if isinstance(key_times, dict):
+                last_updated = key_times.get(cache_key)
+            if last_updated is None:
+                last_updated = cache.get("generated_at")
 
         if not cached:
+            _stats_disabled = os.environ.get("TELECRIME_DISABLE_STATS_WORKER") == "1"
             payload = {
                 "days": days,
                 "limit": limit,
@@ -2723,7 +2741,12 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 "deleted_channels": [],
                 "top_countries": [],
                 "dork_channels": [],
-                "stats_note": "Stats are warming up. Please refresh in a minute.",
+                "stats_note": (
+                    "Stats are warming up. Please refresh in a minute."
+                    if not _stats_disabled
+                    else "Stats worker is disabled (TELECRIME_DISABLE_STATS_WORKER). "
+                    "Enable it in the environment to see stats."
+                ),
                 "last_updated": None,
             }
         else:
