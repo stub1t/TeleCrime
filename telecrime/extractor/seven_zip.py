@@ -3,9 +3,14 @@
 import asyncio
 import logging
 import os
+import re
 from pathlib import Path
 
-from telecrime.extractor.interface import ArchiveExtractor, ExtractionResult
+from telecrime.extractor.interface import (
+    DEFAULT_LIST_TIMEOUT_SECONDS,
+    ArchiveExtractor,
+    ExtractionResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +82,25 @@ class SevenZipExtractor(ArchiveExtractor):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+        except FileNotFoundError:
+            return ExtractionResult(
+                success=False,
+                error_code="EXTRACTOR_NOT_FOUND",
+                error_message=f"7z executable not found: {self.executable}",
+            )
+        except Exception as e:
+            return ExtractionResult(
+                success=False,
+                error_code="EXTRACTION_ERROR",
+                error_message=str(e),
+            )
 
+        # The finally guarantees the child is killed and reaped on EVERY exit
+        # path, including asyncio.CancelledError (a BaseException, so the
+        # `except Exception` below does not intercept it but the finally still
+        # runs). Without this, a cancelled/wedged extraction kept writing into
+        # output_dir after callers had rmtree()d and re-extracted it.
+        try:
             try:
                 # Drain both pipes concurrently, keeping only a bounded tail:
                 # 7z emits one line per extracted file — a 100k-file archive
@@ -102,7 +125,6 @@ class SevenZipExtractor(ArchiveExtractor):
                         _read_tail(process.stdout), _read_tail(process.stderr)
                     )
             except TimeoutError:
-                process.kill()
                 return ExtractionResult(
                     success=False,
                     error_code="TIMEOUT",
@@ -118,7 +140,7 @@ class SevenZipExtractor(ArchiveExtractor):
             # archive deleted by finalize → permanent data loss.
             await process.wait()
 
-            return self._parse_result(
+            return await self._parse_result(
                 process.returncode or 0,
                 stdout_text,
                 stderr_text,
@@ -126,20 +148,16 @@ class SevenZipExtractor(ArchiveExtractor):
                 target_extensions,
             )
 
-        except FileNotFoundError:
-            return ExtractionResult(
-                success=False,
-                error_code="EXTRACTOR_NOT_FOUND",
-                error_message=f"7z executable not found: {self.executable}",
-            )
         except Exception as e:
             return ExtractionResult(
                 success=False,
                 error_code="EXTRACTION_ERROR",
                 error_message=str(e),
             )
+        finally:
+            await self._kill_and_reap(process)
 
-    def _parse_result(
+    async def _parse_result(
         self,
         return_code: int,
         stdout: str,
@@ -150,8 +168,19 @@ class SevenZipExtractor(ArchiveExtractor):
         """Parse 7z output and determine result."""
         combined_output = stdout + stderr
 
-        # Check for password errors
         if return_code != 0:
+            # Killed by a signal (OOM killer, container kill) is checked FIRST:
+            # 7z's partial output often contains member names like
+            # "passwords.txt", and that bare substring previously misclassified
+            # a killed run as PASSWORD_REQUIRED, burning password candidates.
+            # Signal death is never an archive problem — always transient.
+            if return_code < 0:
+                return ExtractionResult(
+                    success=False,
+                    error_code="KILLED",
+                    error_message=f"extractor killed by signal {-return_code}",
+                )
+
             if "Wrong password" in combined_output:
                 return ExtractionResult(
                     success=False,
@@ -164,7 +193,7 @@ class SevenZipExtractor(ArchiveExtractor):
             # without encryption context it means corruption
             if "Data Error" in combined_output:
                 is_encrypted = (
-                    "encrypted" in combined_output.lower() or "password" in combined_output.lower()
+                    "encrypted" in combined_output.lower() or "Wrong password" in combined_output
                 )
                 if is_encrypted:
                     return ExtractionResult(
@@ -180,7 +209,12 @@ class SevenZipExtractor(ArchiveExtractor):
                         error_message="Archive is corrupted (data error)",
                     )
 
-            if "Enter password" in combined_output or "password" in combined_output.lower():
+            # Only 7z's actual password prompts/messages count. A bare
+            # "password" substring matched member names (passwords.txt) and
+            # other unrelated output.
+            if "Enter password" in combined_output or re.search(
+                r"ERROR:.*password", combined_output, re.IGNORECASE
+            ):
                 return ExtractionResult(
                     success=False,
                     error_code="PASSWORD_REQUIRED",
@@ -202,25 +236,17 @@ class SevenZipExtractor(ArchiveExtractor):
                     error_message="Unsupported archive format",
                 )
 
-            if return_code < 0:
-                # Killed by a signal (OOM killer, container kill) — NOT an
-                # archive problem. Callers must treat this as transient and
-                # retryable, never terminal (a terminal classification lets
-                # finalize delete the archive).
-                return ExtractionResult(
-                    success=False,
-                    error_code="KILLED",
-                    error_message=f"extractor killed by signal {-return_code}",
-                )
-
             return ExtractionResult(
                 success=False,
                 error_code=f"EXIT_{return_code}",
                 error_message=combined_output[:500],
             )
 
-        # Success - find extracted files
-        extracted_files = self._find_extracted_files(output_dir, target_extensions)
+        # Success - find extracted files (off-loop: an rglob+stat over a
+        # 100k-file tree blocks the shared event loop and stalls downloads).
+        extracted_files = await asyncio.to_thread(
+            self._find_extracted_files, output_dir, target_extensions
+        )
 
         if not extracted_files:
             # Check if extraction succeeded but no matching files
@@ -267,8 +293,14 @@ class SevenZipExtractor(ArchiveExtractor):
         self,
         archive_path: Path,
         password: str | None = None,
+        timeout_seconds: float | None = DEFAULT_LIST_TIMEOUT_SECONDS,
     ) -> list[str]:
-        """List contents of an archive."""
+        """List contents of an archive.
+
+        Returns [] on failure/timeout (matching the previous behavior); the
+        child is always killed and reaped before returning, including when the
+        caller cancels us.
+        """
         cmd = [self.executable, "l", "-slt"]  # List with technical info
 
         if password:
@@ -287,7 +319,11 @@ class SevenZipExtractor(ArchiveExtractor):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
+        except Exception as e:
+            logger.warning("Failed to start archive listing: %s", e)
+            return []
 
+        async def _read_listing() -> list[str]:
             # Parse file list from output.
             # 7z -slt output begins with the archive's own metadata block:
             #   --
@@ -315,20 +351,12 @@ class SevenZipExtractor(ArchiveExtractor):
                 elif line.startswith("Folder = +"):
                     is_folder = True
                 elif line.startswith("--") and not line.startswith("Path"):
-                    if (
-                        path
-                        and path != archive_path_str
-                        and not is_folder
-                    ):
+                    if path and path != archive_path_str and not is_folder:
                         files.append(path)
                     path = None
                     is_folder = False
                 line_bytes = await process.stdout.readline()
-            if (
-                path
-                and path != archive_path_str
-                and not is_folder
-            ):
+            if path and path != archive_path_str and not is_folder:
                 files.append(path)
 
             # Wait for the process to exit; return [] on non-zero (password
@@ -339,9 +367,24 @@ class SevenZipExtractor(ArchiveExtractor):
 
             return files
 
+        # No timeout when explicitly passed None (legacy behavior); the
+        # default bound stops a wedged 7z from hanging the pipeline forever.
+        try:
+            if timeout_seconds:
+                return await asyncio.wait_for(_read_listing(), timeout=timeout_seconds)
+            return await _read_listing()
+        except TimeoutError:
+            logger.warning(
+                "Listing archive contents timed out after %ss: %s",
+                timeout_seconds,
+                archive_path,
+            )
+            return []
         except Exception as e:
             logger.warning("Failed to list archive contents: %s", e)
             return []
+        finally:
+            await self._kill_and_reap(process)
 
     async def test_password(
         self,

@@ -9,7 +9,11 @@ import logging
 import shutil
 from pathlib import Path
 
-from telecrime.extractor.interface import ArchiveExtractor, ExtractionResult
+from telecrime.extractor.interface import (
+    DEFAULT_LIST_TIMEOUT_SECONDS,
+    ArchiveExtractor,
+    ExtractionResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,34 +71,6 @@ class UnrarExtractor(ArchiveExtractor):
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.DEVNULL,
             )
-
-            try:
-                if timeout_seconds:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=timeout_seconds
-                    )
-                else:
-                    stdout, stderr = await process.communicate()
-            except TimeoutError:
-                process.kill()
-                await asyncio.wait({asyncio.create_task(process.wait())}, timeout=5.0)
-                return ExtractionResult(
-                    success=False,
-                    error_code="TIMEOUT",
-                    error_message=f"Extraction timed out after {timeout_seconds}s",
-                )
-
-            stdout_text = stdout.decode("utf-8", errors="replace")
-            stderr_text = stderr.decode("utf-8", errors="replace")
-
-            return self._parse_result(
-                process.returncode or 0,
-                stdout_text,
-                stderr_text,
-                output_dir,
-                target_extensions,
-            )
-
         except FileNotFoundError:
             return ExtractionResult(
                 success=False,
@@ -108,7 +84,47 @@ class UnrarExtractor(ArchiveExtractor):
                 error_message=str(e),
             )
 
-    def _parse_result(
+        # The finally kills and reaps the child on ANY exit path, including
+        # asyncio.CancelledError (BaseException — the `except Exception` below
+        # does not intercept it, but the finally still runs). Otherwise a
+        # cancelled extraction kept writing into an output_dir the caller had
+        # already rmtree()d and started re-extracting into.
+        try:
+            try:
+                if timeout_seconds:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(), timeout=timeout_seconds
+                    )
+                else:
+                    stdout, stderr = await process.communicate()
+            except TimeoutError:
+                return ExtractionResult(
+                    success=False,
+                    error_code="TIMEOUT",
+                    error_message=f"Extraction timed out after {timeout_seconds}s",
+                )
+
+            stdout_text = stdout.decode("utf-8", errors="replace")
+            stderr_text = stderr.decode("utf-8", errors="replace")
+
+            return await self._parse_result(
+                process.returncode or 0,
+                stdout_text,
+                stderr_text,
+                output_dir,
+                target_extensions,
+            )
+
+        except Exception as e:
+            return ExtractionResult(
+                success=False,
+                error_code="EXTRACTION_ERROR",
+                error_message=str(e),
+            )
+        finally:
+            await self._kill_and_reap(process)
+
+    async def _parse_result(
         self,
         return_code: int,
         stdout: str,
@@ -119,6 +135,19 @@ class UnrarExtractor(ArchiveExtractor):
         combined = stdout + stderr
 
         if return_code != 0:
+            # Signal death (OOM killer) is never an archive problem: check it
+            # before parsing output so a killed run whose partial output
+            # mentions "password" is not misclassified as needing one.
+            if return_code < 0:
+                # ALWAYS transient, even if some files landed: accepting
+                # partial data and letting finalize delete the archive loses
+                # the unextracted remainder.
+                return ExtractionResult(
+                    success=False,
+                    error_code="KILLED",
+                    error_message=f"extractor killed by signal {-return_code}",
+                )
+
             if "Incorrect password" in combined:
                 return ExtractionResult(
                     success=False,
@@ -164,16 +193,6 @@ class UnrarExtractor(ArchiveExtractor):
             # finalize delete ALL volumes while the group is only partially
             # parsed. That must be retryable so a late-arriving part (plan's
             # late-part linking) can rescue the group.
-            if return_code < 0:
-                # Killed by a signal (OOM killer) — ALWAYS transient, even if
-                # some files landed: accepting partial data and letting
-                # finalize delete the archive loses the unextracted remainder.
-                return ExtractionResult(
-                    success=False,
-                    error_code="KILLED",
-                    error_message=f"extractor killed by signal {-return_code}",
-                )
-
             # Narrow the volume check to unrar's actual messages (a bare
             # "volume" substring could appear in normal multi-volume output).
             if "Unexpected end of archive" in combined or "Cannot find volume" in combined:
@@ -183,7 +202,9 @@ class UnrarExtractor(ArchiveExtractor):
                     error_message="Archive incomplete — missing or renamed volume",
                 )
 
-            extracted = self._find_extracted_files(output_dir, target_extensions)
+            extracted = await asyncio.to_thread(
+                self._find_extracted_files, output_dir, target_extensions
+            )
             if extracted:
                 logger.warning(
                     "unrar exited with code %d but extracted %d files",
@@ -198,7 +219,9 @@ class UnrarExtractor(ArchiveExtractor):
                 error_message=combined[:500],
             )
 
-        extracted = self._find_extracted_files(output_dir, target_extensions)
+        extracted = await asyncio.to_thread(
+            self._find_extracted_files, output_dir, target_extensions
+        )
         return ExtractionResult(success=True, extracted_files=extracted)
 
     @staticmethod
@@ -230,7 +253,14 @@ class UnrarExtractor(ArchiveExtractor):
         self,
         archive_path: Path,
         password: str | None = None,
+        timeout_seconds: float | None = DEFAULT_LIST_TIMEOUT_SECONDS,
     ) -> list[str]:
+        """List contents of an archive.
+
+        Returns [] on failure/timeout (matching the previous behavior); the
+        child is always killed and reaped before returning, including when the
+        caller cancels us.
+        """
         cmd = [self.executable, "lb"]  # bare list (filenames only)
 
         if password:
@@ -247,6 +277,11 @@ class UnrarExtractor(ArchiveExtractor):
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.DEVNULL,
             )
+        except Exception as e:
+            logger.warning("Failed to start archive listing with unrar: %s", e)
+            return []
+
+        async def _read_listing() -> list[str]:
             stdout, _ = await process.communicate()
 
             if process.returncode != 0:
@@ -258,9 +293,24 @@ class UnrarExtractor(ArchiveExtractor):
                 if line.strip() and not line.strip().endswith("/")
             ]
 
+        # None disables the bound (legacy behavior); the default stops a
+        # wedged unrar from hanging the pipeline forever.
+        try:
+            if timeout_seconds:
+                return await asyncio.wait_for(_read_listing(), timeout=timeout_seconds)
+            return await _read_listing()
+        except TimeoutError:
+            logger.warning(
+                "Listing archive contents with unrar timed out after %ss: %s",
+                timeout_seconds,
+                archive_path,
+            )
+            return []
         except Exception as e:
             logger.warning("Failed to list archive contents with unrar: %s", e)
             return []
+        finally:
+            await self._kill_and_reap(process)
 
     async def test_password(
         self,

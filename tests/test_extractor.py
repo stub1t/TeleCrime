@@ -1,5 +1,6 @@
 """Tests for archive extractor."""
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -7,6 +8,7 @@ import pytest
 
 from telecrime.extractor.interface import ExtractionResult
 from telecrime.extractor.seven_zip import SevenZipExtractor
+from telecrime.extractor.unrar import UnrarExtractor
 
 
 class _AsyncLineReader:
@@ -27,6 +29,23 @@ class _AsyncLineReader:
         out = self._buf[:n] if n >= 0 else self._buf
         self._buf = self._buf[n:] if n >= 0 else b""
         return out
+
+
+class _BlockingReader:
+    """Reader that never returns, so the parent blocks until cancelled/timed out."""
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+
+    async def read(self, n: int = -1) -> bytes:
+        self.entered.set()
+        await asyncio.Event().wait()
+        return b""
+
+    async def readline(self) -> bytes:
+        self.entered.set()
+        await asyncio.Event().wait()
+        return b""
 
 
 
@@ -105,8 +124,8 @@ class TestSevenZipExtractor:
         output_dir = tmp_path / "output" / "nested"
 
         # Will fail because it's not a real archive, but should create dir
-        with patch.object(extractor, "_parse_result") as mock_parse:
-            mock_parse.return_value = ExtractionResult(success=False, error_code="TEST")
+        mock_parse = AsyncMock(return_value=ExtractionResult(success=False, error_code="TEST"))
+        with patch.object(extractor, "_parse_result", new=mock_parse):
 
             with patch("asyncio.create_subprocess_exec") as mock_exec:
                 mock_process = AsyncMock()
@@ -154,17 +173,19 @@ class TestSevenZipExtractor:
             (2, "Data Error in encrypted file", "", False, "WRONG_PASSWORD", True, False),
             (2, "Data Error : some_file.txt", "", False, "CORRUPTED", False, False),
             (2, "Enter password", "", False, "PASSWORD_REQUIRED", False, True),
+            (2, "ERROR: Cannot open encrypted archive. Wrong password?", "", False, "WRONG_PASSWORD", True, False),
             (2, "Cannot open the file", "", False, "CANNOT_OPEN", False, False),
             (2, "Unsupported archive type", "", False, "UNSUPPORTED_FORMAT", False, False),
             (1, "", "some other failure", False, "EXIT_1", False, False),
         ],
     )
-    def test_parse_result_error_cases(
+    @pytest.mark.asyncio
+    async def test_parse_result_error_cases(
         self, rc, stdout, stderr, success, error_code, wrong_password, needs_password
     ):
         """Table-driven _parse_result error classification."""
         extractor = SevenZipExtractor()
-        result = extractor._parse_result(
+        result = await extractor._parse_result(
             return_code=rc,
             stdout=stdout,
             stderr=stderr,
@@ -176,7 +197,42 @@ class TestSevenZipExtractor:
         assert result.wrong_password is wrong_password
         assert result.needs_password is needs_password
 
-    def test_parse_result_success(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_parse_result_killed_beats_password_filename(self, tmp_path):
+        """Regression: a signal-killed (OOM) extraction whose partial output
+        mentions a file named e.g. passwords.txt must classify as KILLED, not
+        PASSWORD_REQUIRED — otherwise the pipeline burns password candidates.
+        """
+        extractor = SevenZipExtractor()
+        result = await extractor._parse_result(
+            return_code=-9,
+            stdout="Extracting  passwords.txt\nEnter password",
+            stderr="",
+            output_dir=tmp_path,
+            target_extensions=None,
+        )
+        assert result.error_code == "KILLED"
+        assert result.needs_password is False
+        assert result.wrong_password is False
+
+    @pytest.mark.asyncio
+    async def test_parse_result_bare_password_substring_not_password_required(self, tmp_path):
+        """A non-zero exit whose output only mentions a password-looking
+        filename is not a password prompt and must not be classified as one.
+        """
+        extractor = SevenZipExtractor()
+        result = await extractor._parse_result(
+            return_code=2,
+            stdout="Extracting passwords.txt: some unrelated error",
+            stderr="",
+            output_dir=tmp_path,
+            target_extensions=None,
+        )
+        assert result.error_code == "EXIT_2"
+        assert result.needs_password is False
+
+    @pytest.mark.asyncio
+    async def test_parse_result_success(self, tmp_path):
         """Test parsing successful extraction."""
         # Create some test files
         output_dir = tmp_path / "output"
@@ -185,7 +241,7 @@ class TestSevenZipExtractor:
         (output_dir / "file2.epub").write_text("data")
 
         extractor = SevenZipExtractor()
-        result = extractor._parse_result(
+        result = await extractor._parse_result(
             return_code=0,
             stdout="Everything is Ok",
             stderr="",
@@ -196,7 +252,8 @@ class TestSevenZipExtractor:
         assert result.success is True
         assert len(result.extracted_files) == 2
 
-    def test_parse_result_success_with_filter(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_parse_result_success_with_filter(self, tmp_path):
         """Test parsing successful extraction with extension filter."""
         output_dir = tmp_path / "output"
         output_dir.mkdir()
@@ -205,7 +262,7 @@ class TestSevenZipExtractor:
         (output_dir / "file3.pdf").write_text("data")
 
         extractor = SevenZipExtractor()
-        result = extractor._parse_result(
+        result = await extractor._parse_result(
             return_code=0,
             stdout="Everything is Ok",
             stderr="",
@@ -391,6 +448,104 @@ Folder = +
 
         assert result.success is False
         assert result.error_code == "TIMEOUT"
+
+
+class TestSubprocessLifecycle:
+    """Child-process kill/reap guarantees on cancellation and list timeouts."""
+
+    @pytest.mark.asyncio
+    async def test_extract_cancellation_kills_seven_zip_child(self, tmp_path):
+        extractor = SevenZipExtractor()
+        archive = tmp_path / "test.zip"
+        archive.touch()
+
+        process = MagicMock()
+        reader = _BlockingReader()
+        process.stdout = reader
+        process.stderr = reader
+        process.returncode = None
+        process.kill = MagicMock()
+        process.wait = AsyncMock(return_value=-9)
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_exec.return_value = process
+            task = asyncio.create_task(extractor.extract(archive, tmp_path / "out"))
+            await asyncio.wait_for(reader.entered.wait(), timeout=2.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        process.kill.assert_called_once()
+        process.wait.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_extract_cancellation_kills_unrar_child(self, tmp_path):
+        extractor = UnrarExtractor()
+        archive = tmp_path / "test.rar"
+        archive.touch()
+
+        entered = asyncio.Event()
+
+        async def _blocked_communicate(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+            return b"", b""
+
+        process = MagicMock()
+        process.returncode = None
+        process.communicate = AsyncMock(side_effect=_blocked_communicate)
+        process.kill = MagicMock()
+        process.wait = AsyncMock(return_value=-9)
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_exec.return_value = process
+            task = asyncio.create_task(extractor.extract(archive, tmp_path / "out"))
+            await asyncio.wait_for(entered.wait(), timeout=2.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        process.kill.assert_called_once()
+        process.wait.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_list_contents_timeout_kills_seven_zip_child(self):
+        extractor = SevenZipExtractor()
+        process = MagicMock()
+        process.stdout = _BlockingReader()
+        process.returncode = None
+        process.kill = MagicMock()
+        process.wait = AsyncMock(return_value=-9)
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_exec.return_value = process
+            files = await extractor.list_contents(Path("/tmp/test.7z"), timeout_seconds=0.05)
+
+        assert files == []
+        process.kill.assert_called_once()
+        process.wait.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_list_contents_timeout_kills_unrar_child(self):
+        extractor = UnrarExtractor()
+
+        async def _blocked_communicate(*args, **kwargs):
+            await asyncio.Event().wait()
+            return b"", b""
+
+        process = MagicMock()
+        process.returncode = None
+        process.communicate = AsyncMock(side_effect=_blocked_communicate)
+        process.kill = MagicMock()
+        process.wait = AsyncMock(return_value=-9)
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_exec.return_value = process
+            files = await extractor.list_contents(Path("/tmp/test.rar"), timeout_seconds=0.05)
+
+        assert files == []
+        process.kill.assert_called_once()
+        process.wait.assert_awaited()
 
 
 class TestExtractionTimeoutHelper:
