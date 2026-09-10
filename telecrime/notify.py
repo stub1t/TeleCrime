@@ -22,9 +22,9 @@ Rules:
   digest and `flush()` emits it every N archives or M minutes (env-tunable).
   High-signal events (errors, watchlist hits, start/complete, summaries) are
   still sent immediately.
-- Watchlist alert hits **redact password fields** by default — they sync to
-  all your devices and a shoulder surfer can read Saved Messages. The
-  dashboard shows the full record.
+- Watchlist alert hits include the full url, username and password — the
+  feed is Saved Messages (message-to-self), private by construction, and the
+  dashboard shows the same record. HTML-escaped via `_esc`.
 """
 
 import asyncio
@@ -72,17 +72,6 @@ def _trunc(value: str, limit: int = 64) -> str:
     if not value:
         return ""
     return value if len(value) <= limit else value[: limit - 1] + "…"
-
-
-def _redact_password(password: object) -> str:
-    """Default-redact a password field for over-the-wire safety."""
-    if password is None or password == "":
-        return "—"
-    s = str(password)
-    n = len(s)
-    if n <= 2:
-        return "•" * n
-    return f"{s[0]}{'•' * (n - 2)}{s[-1]} ({n} chars)"
 
 
 def _fmt_int(n: Any) -> str:
@@ -165,6 +154,12 @@ class TelegramNotifier:
         # Called after a watchlist alert batch was CONFIRMED sent (advances
         # the alerted window). Set by the pipeline entry point.
         self.watchlist_sent_callback = None
+        # Background digest flusher: archive_parsed() only checks the time
+        # cap when a new archive completes, so during a multi-hour single-file
+        # parse (the norm) NO digest ever flushed — no ingest news and no
+        # watchlist alerts for hours. A periodic task flushes on the time cap
+        # regardless of archive completions.
+        self._flusher_task: asyncio.Task | None = None
         # Digest accumulator for per-archive parse results.
         try:
             self._digest_archives_cap = max(
@@ -187,6 +182,41 @@ class TelegramNotifier:
         # Archive names already reported this run — a re-parse of the same
         # job (after a wedge) must not double-count it in the digest.
         self._reported_archives: set[str] = set()
+
+    def start_background_flusher(self) -> None:
+        """Start the periodic digest-flush task (call from the pipeline entry)."""
+        if self._flusher_task is not None and not self._flusher_task.done():
+            return
+        self._flusher_task = asyncio.get_event_loop().create_task(
+            self._flusher_loop()
+        )
+
+    async def stop_background_flusher(self) -> None:
+        if self._flusher_task is None:
+            return
+        self._flusher_task.cancel()
+        try:
+            await self._flusher_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._flusher_task = None
+
+    async def _flusher_loop(self) -> None:
+        """Every 60s, flush the digest if its time cap elapsed.
+
+        The cap check inside archive_parsed() never runs while a single
+        archive is being parsed for hours; this task makes the time-based
+        flush independent of archive completions.
+        """
+        while True:
+            await asyncio.sleep(60)
+            try:
+                if self._digest_since is not None:
+                    elapsed = asyncio.get_event_loop().time() - self._digest_since
+                    if elapsed >= self._digest_seconds_cap:
+                        await self.flush()
+            except (Exception, asyncio.CancelledError):
+                return
 
     async def _get_me(self, client: "TelegramClient"):
         if self._me is None:
@@ -534,7 +564,7 @@ class TelegramNotifier:
     # ------------------------------------------------------------- watchlist
 
     async def watchlist_alerts(self, alerts: list[dict]) -> bool:
-        """Watchlist hits — passwords redacted by default for over-the-wire safety.
+        """Watchlist hits — full url/username/password included.
 
         Returns True when delivered (or nothing to send), False on a failed
         send — the caller must only advance the alerted window on True.
@@ -556,16 +586,13 @@ class TelegramNotifier:
                 source = _esc(_trunc(
                     str(hit.get("source_archive") or hit.get("source_file") or "—"), 60
                 ))
-                domain = _esc(_trunc(
-                    str(hit.get("domain") or hit.get("url") or "—"), 80
-                ))
-                username = _esc(_trunc(str(hit.get("username") or "—"), 60))
-                # Redact password — see module docstring.
-                pwd = _esc(_redact_password(hit.get("password")))
+                url = _esc(str(hit.get("url") or hit.get("domain") or "—"))
+                username = _esc(str(hit.get("username") or "—"))
+                pwd = _esc(str(hit.get("password") or "—"))
                 lines.append(
-                    f"  • <b>{domain}</b>\n"
+                    f"  • <b>{_trunc(url, 120)}</b>\n"
                     f"    user: {_code(username)}\n"
-                    f"    pwd:  {pwd}\n"
+                    f"    pwd:  {_code(pwd)}\n"
                     f"    src:  {_code(source)}"
                 )
             hidden = int(alert.get("new_matches", 0)) - len(hits)

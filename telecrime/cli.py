@@ -546,6 +546,13 @@ def run(
                 notifier.watchlist_provider = _watchlist_provider
                 notifier.watchlist_sent_callback = _watchlist_sent
 
+                # Digest flushes are time-capped inside archive_parsed(), which
+                # never fires during a multi-hour single-file parse — without
+                # this, no ingest news (and no watchlist alerts, which ride on
+                # digests) for hours. The background flusher makes the time cap
+                # independent of archive completions.
+                notifier.start_background_flusher()
+
                 with get_session(engine) as session:
                     # Disable idle-in-transaction timeout for the pipeline session.
                     # The pipeline commits before each long network/I/O operation,
@@ -591,6 +598,12 @@ def run(
             raise typer.Exit(75) from e  # EX_TEMPFAIL — not an error, just busy
 
         finally:
+            # Stop the periodic digest flusher before the adapters disconnect
+            # (a flush racing shutdown would send on a dead client).
+            try:
+                await notifier.stop_background_flusher()
+            except Exception:
+                pass
             try:
                 await adapter.disconnect()
             except Exception:

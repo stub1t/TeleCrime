@@ -11,7 +11,6 @@ from telecrime.notify import (
     _esc,
     _fmt_duration,
     _fmt_rate,
-    _redact_password,
 )
 
 
@@ -28,16 +27,6 @@ def notifier() -> tuple[TelegramNotifier, AsyncMock]:
 
 def test_esc_quotes_html_special_chars():
     assert _esc("Tom & Jerry <i>nested</i>") == "Tom &amp; Jerry &lt;i&gt;nested&lt;/i&gt;"
-
-
-def test_redact_password_short_and_long():
-    assert _redact_password(None) == "—"
-    assert _redact_password("") == "—"
-    assert _redact_password("a") == "•"
-    assert _redact_password("ab") == "••"
-    out = _redact_password("hunter2")
-    # First/last char visible, middle redacted, length disclosed.
-    assert out.startswith("h") and "2" in out and "(7 chars)" in out
 
 
 def test_fmt_duration():
@@ -303,7 +292,9 @@ async def test_pipeline_complete_shows_rate_and_duration(notifier):
 
 
 @pytest.mark.asyncio
-async def test_watchlist_alerts_redacts_passwords(notifier):
+async def test_watchlist_alerts_include_full_credentials(notifier):
+    """Watchlist hits carry the full url, username and password — the feed is
+    Saved Messages (message-to-self), private by construction."""
     n, send = notifier
     await n.watchlist_alerts([
         {
@@ -312,7 +303,8 @@ async def test_watchlist_alerts_redacts_passwords(notifier):
             "new_matches": 1,
             "hits": [
                 {
-                    "domain": "example.com",
+                    "url": "https://owlmail.example.com/login",
+                    "domain": "owlmail.example.com",
                     "username": "owlmail@example.com",
                     "password": "hunter2-supersecret",
                     "source_archive": "dump.zip",
@@ -321,10 +313,10 @@ async def test_watchlist_alerts_redacts_passwords(notifier):
         },
     ])
     text = send.call_args.args[1]
-    # Clear-text password must NOT appear.
-    assert "hunter2-supersecret" not in text
-    # Length must be disclosed in the redaction marker.
-    assert "(19 chars)" in text
+    assert "hunter2-supersecret" in text
+    assert "owlmail@example.com" in text
+    assert "https://owlmail.example.com/login" in text
+    assert "dump.zip" in text
 
 
 @pytest.mark.asyncio
