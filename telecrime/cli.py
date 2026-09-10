@@ -520,6 +520,20 @@ def run(
                         _free_gb = shutil.disk_usage(config.data_dir).free / (1024 ** 3)
                     except Exception:
                         pass
+                    # Credential parse rate since the run's last meaningful
+                    # progress tick (minutes) — shown on status-only pings.
+                    _rate_per_min = None
+                    try:
+                        _started = _prog.get("started_at")
+                        _creds = int(_prog.get("credentials") or 0)
+                        if _started:
+                            _mins = max(
+                                1.0,
+                                (datetime.now(UTC) - datetime.fromisoformat(_started)).total_seconds() / 60,
+                            )
+                            _rate_per_min = int(_creds / _mins)
+                    except Exception:
+                        pass
                     return {
                         "stage": _prog.get("current_stage"),
                         "archive_index": _prog.get("archive_index"),
@@ -528,6 +542,7 @@ def run(
                         "pending": _pending,
                         "free_disk_gb": _free_gb,
                         "errors": _prog.get("errors"),
+                        "rate_per_min": _rate_per_min,
                     }
 
                 from telecrime.scheduler import (

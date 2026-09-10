@@ -390,7 +390,64 @@ async def test_digest_includes_live_status_section():
 
 
 @pytest.mark.asyncio
-async def test_digest_flush_sends_watchlist_alerts():
+async def test_flush_sends_watchlist_alerts_without_digest_content():
+    """A multi-hour single-file parse must not silence watchlist alerts: the
+    flusher checks them independently of digest accumulation."""
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock()
+    n = TelegramNotifier(client=client, enabled=True)
+
+    async def _wl():
+        return [{
+            "label": "paypal",
+            "query": "paypal",
+            "new_matches": 3,
+            "hits": [{"url": "https://paypal.com/login",
+                      "username": "a@b.com",
+                      "password": "secret",
+                      "source_archive": "x.zip"}],
+        }]
+
+    n.watchlist_provider = _wl
+    await n.flush()  # empty digest — watchlist must still be checked
+    assert client.send_message.await_count == 1
+    text = client.send_message.call_args.args[1]
+    assert "Watchlist hits" in text
+    assert "paypal" in text
+
+
+@pytest.mark.asyncio
+async def test_flusher_loop_sends_status_only_when_no_digest(monkeypatch):
+    """During a long parse with no archive completions, the background flusher
+    sends a throttled live-status message instead of staying silent."""
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock()
+    n = TelegramNotifier(client=client, enabled=True)
+
+    async def _status():
+        return {
+            "stage": "parse",
+            "archive_index": 42,
+            "archive_total": 4537,
+            "current_archive": "big.txt",
+            "rate_per_min": 1200,
+            "pending": 3,
+            "free_disk_gb": 150,
+            "errors": 0,
+        }
+
+    n.status_provider = _status
+    await n._send_status_only()
+    assert client.send_message.await_count == 1
+    text = client.send_message.call_args.args[1]
+    assert "Pipeline status" in text
+    assert "parse" in text
+    assert "42 / 4,537" in text
+    assert "1,200 creds/min" in text
     """Watchlist hits ride on the digest flush via the provider."""
     client = MagicMock()
     client.get_me = AsyncMock(return_value=MagicMock(id=7))
@@ -410,6 +467,8 @@ async def test_digest_flush_sends_watchlist_alerts():
     await n.archive_parsed("a.zip", 100, 0, 1)
     await n.flush()
     assert client.send_message.await_count == 2
-    second = client.send_message.call_args_list[1].args[1]
-    assert "Watchlist hits" in second
-    assert "paypal" in second
+    texts = [c.args[1] for c in client.send_message.call_args_list]
+    # Watchlist check now runs FIRST (independent of digest content), then
+    # the digest — assert both contents are present regardless of order.
+    assert any("Watchlist hits" in t for t in texts)
+    assert any("Progress digest" in t for t in texts)

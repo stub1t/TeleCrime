@@ -182,6 +182,9 @@ class TelegramNotifier:
         # Archive names already reported this run — a re-parse of the same
         # job (after a wedge) must not double-count it in the digest.
         self._reported_archives: set[str] = set()
+        # When the last live-status-only message went out (throttle the
+        # flusher's status pings during long single-file parses).
+        self._last_status_sent: float | None = None
 
     def start_background_flusher(self) -> None:
         """Start the periodic digest-flush task (call from the pipeline entry)."""
@@ -202,21 +205,117 @@ class TelegramNotifier:
         self._flusher_task = None
 
     async def _flusher_loop(self) -> None:
-        """Every 60s, flush the digest if its time cap elapsed.
+        """Every 60s: flush the digest if its time cap elapsed, check the
+        watchlist regardless of digest content, and send a throttled
+        live-status ping when nothing else is flowing.
 
         The cap check inside archive_parsed() never runs while a single
-        archive is being parsed for hours; this task makes the time-based
-        flush independent of archive completions.
+        archive is being parsed for hours, and watchlist alerts ride on
+        digests — without this task, a multi-hour parse produced NO ingest
+        news and NO watchlist alerts at all.
         """
         while True:
             await asyncio.sleep(60)
             try:
+                now = asyncio.get_event_loop().time()
+                # Watchlist alerts must NOT wait for digest content: check
+                # them on every tick.
+                await self._check_watchlist()
                 if self._digest_since is not None:
-                    elapsed = asyncio.get_event_loop().time() - self._digest_since
+                    elapsed = now - self._digest_since
                     if elapsed >= self._digest_seconds_cap:
                         await self.flush()
+                elif self.status_provider is not None:
+                    # No archives parsed in this window (long single-file
+                    # parse): still report what the pipeline is doing, but
+                    # throttle so the feed doesn't flood every 60s.
+                    if (
+                        self._last_status_sent is None
+                        or now - self._last_status_sent >= self._digest_seconds_cap
+                    ):
+                        await self._send_status_only()
+                        self._last_status_sent = now
             except (Exception, asyncio.CancelledError):
                 return
+
+    async def _status_lines(self) -> list[str] | None:
+        """The live-pipeline section for digest/status messages."""
+        if self.status_provider is None:
+            return None
+        try:
+            status = await asyncio.wait_for(
+                self.status_provider(), timeout=10
+            )
+        except Exception:
+            status = None
+        if not status:
+            return None
+        lines = ["", "🟢 <b>Pipeline</b>"]
+        _stage = status.get("stage") or "—"
+        _idx = status.get("archive_index")
+        _tot = status.get("archive_total")
+        _pos = (
+            f"{_fmt_int(_idx)} / {_fmt_int(_tot)}"
+            if _idx is not None and _tot is not None
+            else "—"
+        )
+        lines.append(f"• <b>Stage:</b> {_esc(_stage)}")
+        lines.append(f"• <b>Position:</b> {_pos}")
+        if status.get("current_archive"):
+            lines.append(
+                f"• <b>Current:</b> {_code(_trunc(status['current_archive'], 55))}"
+            )
+        _rate = status.get("rate_per_min")
+        if _rate is not None:
+            lines.append(f"• <b>Rate:</b> {_fmt_int(_rate)} creds/min")
+        if status.get("pending") is not None:
+            lines.append(f"• <b>Queue:</b> {_fmt_int(status['pending'])} downloads")
+        if status.get("free_disk_gb") is not None:
+            lines.append(f"• <b>Free disk:</b> {status['free_disk_gb']:,.0f} GB")
+        if status.get("errors"):
+            lines.append(f"• <b>Errors:</b> ⚠️ {_fmt_int(status['errors'])}")
+        return lines
+
+    async def _send_status_only(self) -> None:
+        """Send a live-status-only message (no digest content yet)."""
+        status_lines = await self._status_lines()
+        if not status_lines:
+            return
+        lines = [_header("🟢", "Pipeline status")]
+        lines.extend(status_lines)
+        await self.send("\n".join(lines))
+
+    async def _check_watchlist(self) -> None:
+        """Fetch and send watchlist alerts (best-effort).
+
+        Runs on every flusher tick independent of digest content — a
+        multi-hour single-file parse must not silence alerts. The window
+        advances only on a confirmed send.
+        """
+        if self.watchlist_provider is None:
+            return
+        try:
+            alerts = await asyncio.wait_for(
+                self.watchlist_provider(), timeout=45
+            )
+        except Exception as _w:
+            return
+        if not alerts:
+            return
+        try:
+            sent = await self.watchlist_alerts(alerts)
+        except Exception as _we:
+            sent = False
+            logger.warning("Watchlist alert send failed: %s", _we)
+        if sent and self.watchlist_sent_callback is not None:
+            # Advance the alerted window only on a confirmed delivery —
+            # otherwise a transient send failure would drop the hits.
+            try:
+                await asyncio.wait_for(
+                    self.watchlist_sent_callback(alerts), timeout=45
+                )
+            except Exception as _a:
+                logger.warning("Watchlist window advance failed: %s", _a)
 
     async def _get_me(self, client: "TelegramClient"):
         if self._me is None:
@@ -319,7 +418,13 @@ class TelegramNotifier:
             await self.flush()
 
     async def flush(self):
-        """Send the accumulated progress digest (if any) and reset."""
+        """Send the accumulated progress digest (if any) and reset.
+
+        Watchlist alerts are checked here too (flush is also called from
+        archive_parsed) — but the background flusher calls _check_watchlist
+        directly every tick, so alerts never depend on digest content.
+        """
+        await self._check_watchlist()
         if not self._digest_archives:
             return
         new = self._digest_new
@@ -344,45 +449,9 @@ class TelegramNotifier:
         # Live status section: what the pipeline is doing right now. The
         # provider is called with a short budget — a wedged drive or slow
         # query must not stall the digest.
-        if self.status_provider is not None:
-            try:
-                status = await asyncio.wait_for(
-                    self.status_provider(), timeout=10
-                )
-            except Exception:
-                status = None
-            if status:
-                lines.append("")
-                lines.append("🟢 <b>Pipeline</b>")
-                _stage = status.get("stage") or "—"
-                _idx = status.get("archive_index")
-                _tot = status.get("archive_total")
-                _pos = (
-                    f"{_fmt_int(_idx)} / {_fmt_int(_tot)}"
-                    if _idx is not None and _tot is not None
-                    else "—"
-                )
-                # Credentials per minute since the last digest flush.
-                _rate = None
-                if self._digest_since:
-                    _mins = max(
-                        1.0, (asyncio.get_event_loop().time() - self._digest_since) / 60
-                    )
-                    _rate = new / _mins
-                lines.append(f"• <b>Stage:</b> {_esc(_stage)}")
-                lines.append(f"• <b>Position:</b> {_pos}")
-                if _rate is not None:
-                    lines.append(f"• <b>Rate:</b> {_rate:,.0f} creds/min")
-                if status.get("pending") is not None:
-                    lines.append(f"• <b>Queue:</b> {_fmt_int(status['pending'])} downloads")
-                if status.get("free_disk_gb") is not None:
-                    lines.append(f"• <b>Free disk:</b> {status['free_disk_gb']:,.0f} GB")
-                if status.get("errors"):
-                    lines.append(f"• <b>Errors:</b> ⚠️ {_fmt_int(status['errors'])}")
-                if status.get("current_archive"):
-                    lines.append(
-                        f"• <b>Current:</b> {_code(_trunc(status['current_archive'], 55))}"
-                    )
+        status_lines = await self._status_lines()
+        if status_lines:
+            lines.extend(status_lines)
 
         if self._digest_domains:
             top = self._digest_domains.most_common(5)
@@ -397,33 +466,8 @@ class TelegramNotifier:
         self._digest_domains.clear()
         self._digest_last_archive = None
         self._digest_since = None
+        self._last_status_sent = asyncio.get_event_loop().time()
         await self.send("\n".join(lines))
-
-        # Watchlist hits on the pipeline's session: the scheduler's
-        # watchlist job defers while the pipeline runs, so this is the only
-        # path alerts reach Saved Messages during multi-day runs.
-        if self.watchlist_provider is not None:
-            try:
-                alerts = await asyncio.wait_for(
-                    self.watchlist_provider(), timeout=45
-                )
-            except Exception as _w:
-                alerts = None
-            if alerts:
-                try:
-                    sent = await self.watchlist_alerts(alerts)
-                except Exception as _we:
-                    sent = False
-                    logger.warning("Watchlist alert send failed: %s", _we)
-                if sent and self.watchlist_sent_callback is not None:
-                    # Advance the alerted window only on a confirmed delivery —
-                    # otherwise a transient send failure would drop the hits.
-                    try:
-                        await asyncio.wait_for(
-                            self.watchlist_sent_callback(alerts), timeout=45
-                        )
-                    except Exception as _a:
-                        logger.warning("Watchlist window advance failed: %s", _a)
         # Keep _reported_archives: a digest flush mid-run must not re-report
         # archives already counted once this run.
 
