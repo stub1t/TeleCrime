@@ -235,10 +235,36 @@ class PlanStage(PipelineStage):
         fingerprint_data = "|".join(fingerprint_parts)
         fingerprint = hashlib.sha256(fingerprint_data.encode()).hexdigest()[:16]
 
+        # One probe for all artifacts in this grouping result instead of one
+        # ArchiveGroupPart existence query per attachment (and per same-name
+        # candidate group in the late-split loop below).
+        candidate_artifact_ids = [
+            a.id for a in unique_attachments if artifact_map.get(a.id) is not None
+        ]
+        already_linked_ids: set[int] = set()
+        if candidate_artifact_ids:
+            already_linked_ids = set(
+                ctx.session.execute(
+                    select(ArchiveGroupPart.artifact_id).where(
+                        ArchiveGroupPart.artifact_id.in_(candidate_artifact_ids)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
         # Check if group already exists
-        existing = ctx.session.execute(
-            select(ArchiveGroup).where(ArchiveGroup.fingerprint == fingerprint)
-        ).scalar_one_or_none()
+        existing = (
+            ctx.session.execute(
+                select(ArchiveGroup)
+                .where(ArchiveGroup.fingerprint == fingerprint)
+                .options(
+                    joinedload(ArchiveGroup.parts).joinedload(ArchiveGroupPart.artifact)
+                )
+            )
+            .unique()
+            .scalar_one_or_none()
+        )
 
         if existing:
             # The same physical file(s) were posted again (repost across
@@ -250,14 +276,7 @@ class PlanStage(PipelineStage):
             linked_any = False
             for idx, attachment in enumerate(unique_attachments):
                 artifact = artifact_map.get(attachment.id)
-                if artifact is None:
-                    continue
-                already_linked = ctx.session.execute(
-                    select(ArchiveGroupPart).where(
-                        ArchiveGroupPart.artifact_id == artifact.id
-                    )
-                ).scalar_one_or_none()
-                if already_linked:
+                if artifact is None or artifact.id in already_linked_ids:
                     continue
                 part = ArchiveGroupPart(
                     group_id=existing.id,
@@ -268,6 +287,7 @@ class PlanStage(PipelineStage):
                     role="part" if len(unique_attachments) > 1 else "main",
                 )
                 ctx.session.add(part)
+                already_linked_ids.add(artifact.id)
                 linked_any = True
             # A new source can rescue a group that already finished (CLEANED:
             # files deleted by finalize) or permanently failed: revert to
@@ -354,7 +374,10 @@ class PlanStage(PipelineStage):
                         ),
                     )
                     .options(
-                        joinedload(ArchiveGroup.parts).joinedload(ArchiveGroupPart.artifact)
+                        joinedload(ArchiveGroup.parts)
+                        .joinedload(ArchiveGroupPart.artifact)
+                        .joinedload(DownloadArtifact.attachment)
+                        .joinedload(FileAttachment.message)
                     )
                 )
                 # .unique() is REQUIRED: the joinedload of parts→artifact fans
@@ -422,14 +445,7 @@ class PlanStage(PipelineStage):
                 _linked_late = False
                 for idx, attachment in enumerate(unique_attachments):
                     artifact = artifact_map.get(attachment.id)
-                    if artifact is None:
-                        continue
-                    _already = ctx.session.execute(
-                        select(ArchiveGroupPart).where(
-                            ArchiveGroupPart.artifact_id == artifact.id
-                        )
-                    ).scalar_one_or_none()
-                    if _already:
+                    if artifact is None or artifact.id in already_linked_ids:
                         continue
                     _part_num = _new_part_numbers.get(attachment.id)
                     if _part_num is None:
@@ -446,6 +462,11 @@ class PlanStage(PipelineStage):
                             role="part" if len(unique_attachments) > 1 else "main",
                         )
                     )
+                    # artifact_id is UNIQUE: a later candidate in this same
+                    # loop must not try to link the same artifact again (the
+                    # old per-attachment query autoflushed and saw the pending
+                    # part; the precomputed set must be updated manually).
+                    already_linked_ids.add(artifact.id)
                     _linked_late = True
                 if _linked_late:
                     logger.info(

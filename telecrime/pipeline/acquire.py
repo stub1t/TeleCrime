@@ -87,8 +87,33 @@ class AcquireStage(PipelineStage):
             .all()
         )
 
-        # Collect temp paths BEFORE modifying them so orphan cleanup is accurate.
-        tracked_temps = {a.temp_path for a in stuck if a.temp_path}
+        # Paths another artifact may already own, restricted to the files this
+        # recovery can attribute (each stuck artifact's recorded local_path plus
+        # the main name and collision-suffixed variants recovery searches).
+        # Keeps the lookup bounded instead of loading every local_path row.
+        candidate_paths: set[str] = set()
+        for artifact in stuck:
+            if artifact.local_path:
+                candidate_paths.add(str(Path(artifact.local_path).resolve()))
+            filename = artifact.attachment.filename if artifact.attachment else None
+            if filename:
+                safe = self._sanitize_filename(filename)
+                stem, suffix = Path(safe).stem, Path(safe).suffix
+                candidate_paths.add(str((downloads_dir / safe).resolve()))
+                for i in range(1, 100):
+                    candidate_paths.add(
+                        str((downloads_dir / f"{stem}_{i}{suffix}").resolve())
+                    )
+
+        claimed_paths: dict[str, set[int]] = {}
+        if candidate_paths:
+            for owner_id, owner_path in session.execute(
+                select(DownloadArtifact.id, DownloadArtifact.local_path).where(
+                    DownloadArtifact.local_path.in_(candidate_paths)
+                )
+            ):
+                if owner_path:
+                    claimed_paths.setdefault(str(Path(owner_path).resolve()), set()).add(owner_id)
 
         recovered = 0
         for artifact in stuck:
@@ -97,12 +122,16 @@ class AcquireStage(PipelineStage):
             existing_path: Path | None = None
 
             def _candidate_matches(candidate: Path) -> bool:
-                """Only trust an on-disk file when its size matches the
-                expected artifact size — a same-named file from ANOTHER
-                artifact (different content) must not be attributed here."""
+                """Only trust an on-disk file when it is not owned by another
+                artifact and its size matches the expected artifact size — a
+                same-named file from ANOTHER artifact (different content) must
+                not be attributed here."""
                 if expected_size is None:
                     return False
                 try:
+                    owners = claimed_paths.get(str(candidate.resolve()))
+                    if owners and artifact.id not in owners:
+                        return False
                     return candidate.stat().st_size == expected_size
                 except OSError:
                     return False
@@ -128,21 +157,46 @@ class AcquireStage(PipelineStage):
                         break
 
             if existing_path is not None:
-                # File is on disk — mark COMPLETED without re-downloading.
-                artifact.local_path = str(existing_path)
-                artifact.temp_path = None
-                artifact.status = DownloadStatus.COMPLETED
                 # Size alone cannot distinguish a DIFFERENT same-name+same-size
                 # file — verify content. Recovery is startup-only, so the
                 # one-time hash read is cheap vs re-downloading multi-GB.
+                recovered_hash: str | None = None
                 try:
-                    artifact.content_hash = self._compute_hash_sync(existing_path)
-                    artifact.verified_size = existing_path.stat().st_size
+                    recovered_hash = self._compute_hash_sync(existing_path)
                 except Exception as hash_err:
                     logger.warning(
                         "Could not hash recovered artifact %d (%s): %s",
                         artifact.id, filename or "unknown", hash_err,
                     )
+
+                # A COMPLETED sibling with the same platform_file_unique_id is
+                # guaranteed by Telegram to be byte-identical. If this file
+                # hashes differently it is the wrong file — re-download.
+                sibling_hash = self._sibling_content_hash(session, artifact)
+                if (
+                    recovered_hash is not None
+                    and sibling_hash is not None
+                    and recovered_hash != sibling_hash
+                ):
+                    logger.warning(
+                        "Recovery candidate %s for artifact %d hashes differently "
+                        "from its completed sibling — keeping PENDING",
+                        existing_path.name,
+                        artifact.id,
+                    )
+                    existing_path = None
+
+            if existing_path is not None:
+                # File is on disk — mark COMPLETED without re-downloading.
+                artifact.local_path = str(existing_path)
+                artifact.temp_path = None
+                artifact.status = DownloadStatus.COMPLETED
+                # Claim it for later iterations so a second stuck artifact with
+                # a colliding name/size cannot take the same file this run.
+                claimed_paths.setdefault(str(existing_path.resolve()), set()).add(artifact.id)
+                if recovered_hash is not None:
+                    artifact.content_hash = recovered_hash
+                    artifact.verified_size = existing_path.stat().st_size
                 logger.info(
                     "Recovered artifact %d (%s) → COMPLETED (file on disk)",
                     artifact.id, filename or "unknown",
@@ -165,6 +219,10 @@ class AcquireStage(PipelineStage):
             recovered += 1
 
         # Clean up orphaned .partial files not referenced by any stuck artifact.
+        # Recomputed AFTER the loop: recovered artifacts clear temp_path, so a
+        # snapshot taken beforehand would keep their stale .partial "tracked"
+        # and leak it forever.
+        tracked_temps = {a.temp_path for a in stuck if a.temp_path}
         tmp_dir = downloads_dir / ".tmp"
         if tmp_dir.exists():
             for partial in tmp_dir.glob("*.partial"):
@@ -180,6 +238,34 @@ class AcquireStage(PipelineStage):
             logger.info("Startup recovery: resolved %d stuck DOWNLOADING artifacts", recovered)
 
         return recovered
+
+    @staticmethod
+    def _sibling_content_hash(
+        session, artifact: DownloadArtifact
+    ) -> str | None:
+        """Hash of a COMPLETED repost of the same Telegram file, if any.
+
+        ``platform_file_unique_id`` guarantees byte-identical content, so a
+        completed sibling's stored hash is authoritative when verifying a
+        file recovered from disk.
+        """
+        attachment = artifact.attachment
+        platform_file_unique_id = (
+            attachment.platform_file_unique_id if attachment else None
+        )
+        if not platform_file_unique_id:
+            return None
+        return session.execute(
+            select(DownloadArtifact.content_hash)
+            .join(FileAttachment, DownloadArtifact.attachment_id == FileAttachment.id)
+            .where(
+                DownloadArtifact.id != artifact.id,
+                DownloadArtifact.status == DownloadStatus.COMPLETED,
+                DownloadArtifact.content_hash.isnot(None),
+                FileAttachment.platform_file_unique_id == platform_file_unique_id,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
 
     def cleanup_stale_incomplete_groups(self, session, max_age_days: int = 30) -> int:
         """Mark very old INCOMPLETE groups with zero progress as FAILED_TERMINAL.
@@ -348,8 +434,11 @@ class AcquireStage(PipelineStage):
                         pass
                     ctx.errors.append(f"Download error: {e}")
 
-        # Update group statuses
-        await self._update_group_statuses(ctx, touched_group_ids)
+        # Update only the groups whose downloads actually changed. An empty
+        # touched set must NOT mean "all groups" — callers that mean all pass
+        # None explicitly (the prefetch drain in orchestrator does).
+        if touched_group_ids:
+            await self._update_group_statuses(ctx, touched_group_ids)
         ctx.session.commit()
 
         logger.info("Downloaded %d files", ctx.files_downloaded)
@@ -460,6 +549,10 @@ class AcquireStage(PipelineStage):
 
         max_retries = ctx.config.download.max_retries
         base_delay = ctx.config.download.retry_delay_seconds
+        # Attempts persist across pipeline runs: a crashed/aborted run leaves
+        # the artifact FAILED and it is re-selected on the next pass, so start
+        # counting from the stored value instead of resetting to 0.
+        persisted_retry_count = artifact.retry_count or 0
         local_retry_count = 0
 
         for attempt in range(max_retries):
@@ -643,7 +736,7 @@ class AcquireStage(PipelineStage):
                     pass
 
                 artifact.error_message = repr(e)[:500]
-                artifact.retry_count = local_retry_count
+                artifact.retry_count = persisted_retry_count + local_retry_count
                 artifact.temp_path = None
 
                 if _is_permanent_error(e):
@@ -699,8 +792,12 @@ class AcquireStage(PipelineStage):
     async def _update_group_statuses(
         self, ctx: PipelineContext, group_ids: set[int] | None = None
     ) -> None:
-        """Update archive group statuses based on download completions."""
-        if group_ids:
+        """Update archive group statuses based on download completions.
+
+        ``group_ids=None`` means "all INCOMPLETE groups"; an empty set is a
+        no-op (nothing was touched).
+        """
+        if group_ids is not None:
             query = select(ArchiveGroup).where(
                 ArchiveGroup.id.in_(group_ids),
                 ArchiveGroup.status == GroupStatus.INCOMPLETE,

@@ -160,11 +160,15 @@ def extract_telegram_links(text: str) -> list[tuple[str | None, str | None]]:
     return results
 
 
-def discover_channels_from_db(session: Session) -> DiscoveryScanResult:
+def discover_channels_from_db(
+    session: Session, *, include_conversations: bool = True
+) -> DiscoveryScanResult:
     """Discover channels from all database sources.
 
     Sources:
-    1. Conversations (subscribed channels)
+    1. Conversations (subscribed channels) — skipped when
+       ``include_conversations`` is False (already-saved rows only change when
+       a conversation row is inserted/updated, so callers can memoize it)
     2. Forwarded message sources
     3. @mentions in message text/captions
     4. @mentions in archive filenames
@@ -172,6 +176,9 @@ def discover_channels_from_db(session: Session) -> DiscoveryScanResult:
 
     Args:
         session: Database session
+        include_conversations: Whether to scan source #1 (subscribed
+            conversations). False is safe when the caller knows the
+            conversation table is unchanged since its last full scan.
 
     Returns:
         Discovered channels plus watermark values for incremental scans.
@@ -191,24 +198,25 @@ def discover_channels_from_db(session: Session) -> DiscoveryScanResult:
     )
 
     # 1. From conversations (subscribed channels)
-    logger.info("Discovering channels from conversations...")
-    conversations = session.execute(
-        select(Conversation)
-        .where(Conversation.conversation_type == "channel")
-        .execution_options(yield_per=500)
-    ).scalars()
+    if include_conversations:
+        logger.info("Discovering channels from conversations...")
+        conversations = session.execute(
+            select(Conversation)
+            .where(Conversation.conversation_type == "channel")
+            .execution_options(yield_per=500)
+        ).scalars()
 
-    for conv in conversations:
-        key = conv.username or f"id:{conv.platform_id}"
-        channels[key] = DiscoveredChannel(
-            username=conv.username,
-            platform_id=conv.platform_id,
-            title=conv.title,
-            source="subscribed",
-            discovered_from="conversation",
-        )
+        for conv in conversations:
+            key = conv.username or f"id:{conv.platform_id}"
+            channels[key] = DiscoveredChannel(
+                username=conv.username,
+                platform_id=conv.platform_id,
+                title=conv.title,
+                source="subscribed",
+                discovered_from="conversation",
+            )
 
-    logger.info(f"  Found {len(channels)} subscribed channels")
+        logger.info(f"  Found {len(channels)} subscribed channels")
 
     # 2. From forwarded messages
     logger.info("Discovering channels from forwarded messages...")
@@ -261,6 +269,14 @@ def discover_channels_from_db(session: Session) -> DiscoveryScanResult:
         .execution_options(yield_per=1000)
     )
 
+    # A forwarded-message channel is keyed "id:<platform_id>" but may already
+    # carry the same @username (extracted from the sender name). A later bare
+    # @mention of that username must not create a duplicate "@username" entry.
+    id_keyed_usernames = {
+        channel.username.lower()
+        for key, channel in channels.items()
+        if key.startswith("id:") and channel.username
+    }
     mention_count = 0
     for message_id, text, caption in messages:
         del message_id
@@ -268,7 +284,7 @@ def discover_channels_from_db(session: Session) -> DiscoveryScanResult:
             if content:
                 for username in extract_mentions_from_text(content):
                     key = f"@{username}"
-                    if key not in channels and "id:" not in str(channels.get(key, "")):
+                    if key not in channels and username not in id_keyed_usernames:
                         channels[key] = DiscoveredChannel(
                             username=username,
                             source="mentioned",
@@ -559,7 +575,6 @@ _DORK_DEFAULT_KEYWORDS = [
 ]
 
 _INVITE_RE = re.compile(r"t\.me/(?:joinchat/|\+)([\w-]+)", re.IGNORECASE)
-_USERNAME_RE = re.compile(r"t\.me/([A-Za-z][A-Za-z0-9_]{3,30}[A-Za-z0-9])", re.IGNORECASE)
 _DDG_URL = "https://html.duckduckgo.com/html/"
 _DDG_DELAY = 2.0  # seconds between requests
 

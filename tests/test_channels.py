@@ -1,18 +1,29 @@
 """Tests for channel discovery helpers."""
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
 
 from telecrime.channels.discover import (
     DISCOVERY_CREDENTIAL_WATERMARK,
     DISCOVERY_MESSAGE_WATERMARK,
+    DiscoveryScanResult,
     discover_channels_from_db,
     discover_channels_via_dork,
     persist_discovery_state,
     update_channel_stats,
 )
-from telecrime.channels.service import build_subscription_query
+from telecrime.channels.service import (
+    build_subscription_query,
+    mark_channel_check_failed,
+    mark_channel_join_failed,
+    mark_channel_join_result,
+)
 from telecrime.database import get_engine, get_session, init_db
 from telecrime.models import Conversation, Message, ParsedCredential, PipelineState, TelegramChannel
+from telecrime.pipeline.channel_discover import ChannelJoiner
 
 
 def test_build_subscription_query_filters_candidates(tmp_path):
@@ -262,3 +273,136 @@ def test_dork_multiple_keywords(tmp_path):
     assert fetched_keywords == ["stealer log", "cloud ulp"]
     assert new_count == 3  # deduped across both queries (3 unique links)
     assert len(found) == 6  # 3 per query × 2
+
+
+# ---------------------------------------------------------------------------
+# Transient failures must not permanently disqualify channels
+# ---------------------------------------------------------------------------
+
+
+def test_mark_channel_join_result_keeps_transient_failure_accessible():
+    """A generic join failure (False, no error) stays retryable."""
+    channel = TelegramChannel(
+        username="vidar_logs", source="mentioned", is_accessible=True, is_subscribed=False
+    )
+
+    assert mark_channel_join_result(channel, False) == "failed"
+    assert channel.is_accessible is True
+    assert channel.is_subscribed is False
+    assert channel.check_error == "Join failed"
+    assert channel.last_checked is not None
+
+    # Permanent classification still happens in mark_channel_join_failed.
+    permanent = TelegramChannel(username="gone", source="mentioned", is_accessible=True)
+    assert mark_channel_join_failed(permanent, "channel/supergroup not found") == "failed"
+    assert permanent.is_accessible is False
+
+
+def test_mark_channel_check_failed_none_entity_stays_accessible():
+    """get_entity() returning None must not permanently disable a channel."""
+    channel = TelegramChannel(
+        username="maybe_gone", source="mentioned", is_active=True, is_accessible=True
+    )
+
+    mark_channel_check_failed(channel, "Entity not found")
+
+    assert channel.is_active is True
+    assert channel.is_accessible is True
+    assert channel.check_error == "Entity not found"
+    assert channel.last_checked is not None
+
+    # Explicit Telegram "not found" errors still disable the channel.
+    confirmed = TelegramChannel(
+        username="really_gone", source="mentioned", is_active=True, is_accessible=True
+    )
+    mark_channel_check_failed(confirmed, 'No user has "really_gone" as username')
+    assert confirmed.is_active is False
+    assert confirmed.check_error == "Channel not found / deleted"
+
+
+def test_discover_channels_can_skip_conversation_source(tmp_path):
+    """Source #1 can be skipped while other incremental sources still run."""
+    engine = get_engine(f"sqlite:///{tmp_path / 'skipconv.db'}")
+    init_db(engine)
+
+    with get_session(engine) as session:
+        conv = Conversation(
+            platform_id=321, username="subscribed_chan", conversation_type="channel"
+        )
+        session.add(conv)
+        session.flush()
+        session.add(
+            Message(
+                conversation_id=conv.id,
+                platform_id=1,
+                platform_timestamp=datetime.now(UTC),
+                text="join @fresh_mention",
+            )
+        )
+        session.commit()
+
+    with get_session(engine) as session:
+        result = discover_channels_from_db(session, include_conversations=False)
+
+    sources = {channel.source for channel in result.channels.values()}
+    assert "subscribed" not in sources
+    assert "@fresh_mention" in result.channels
+
+
+def test_discover_mention_does_not_duplicate_id_keyed_username(tmp_path):
+    """A mention of a forwarded channel's username does not create a second key."""
+    engine = get_engine(f"sqlite:///{tmp_path / 'idsuppress.db'}")
+    init_db(engine)
+
+    with get_session(engine) as session:
+        conv = Conversation(platform_id=654, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        session.add(
+            Message(
+                conversation_id=conv.id,
+                platform_id=1,
+                platform_timestamp=datetime.now(UTC),
+                text="join @spamlogs",
+                is_forwarded=True,
+                forwarded_from_id=555,
+                forwarded_from_name="@spamlogs",
+            )
+        )
+        session.commit()
+
+    with get_session(engine) as session:
+        result = discover_channels_from_db(session)
+
+    assert "id:555" in result.channels
+    assert result.channels["id:555"].username == "spamlogs"
+    assert "@spamlogs" not in result.channels
+
+
+@pytest.mark.asyncio
+async def test_channel_joiner_memoizes_conversation_scan(tmp_path, monkeypatch):
+    """maybe_act() skips the full conversation scan until its signal changes."""
+    import telecrime.pipeline.channel_discover as cd
+
+    engine = get_engine(f"sqlite:///{tmp_path / 'joiner.db'}")
+    init_db(engine)
+    calls: list[bool] = []
+
+    def fake_discover(session, *, include_conversations=True):
+        calls.append(include_conversations)
+        return DiscoveryScanResult(channels={}, last_message_id=0, last_credential_id=0)
+
+    monkeypatch.setattr(cd, "discover_channels_from_db", fake_discover)
+
+    with get_session(engine) as session:
+        ctx = SimpleNamespace(session=session, adapter=MagicMock(), display=None)
+        joiner = ChannelJoiner()
+        await joiner.maybe_act(ctx)
+        await joiner.maybe_act(ctx)
+
+        # A new channel conversation changes the signal → full scan again.
+        session.add(Conversation(platform_id=777, conversation_type="channel"))
+        session.commit()
+        await joiner.maybe_act(ctx)
+
+    assert calls == [True, False, True]

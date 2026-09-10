@@ -113,17 +113,19 @@ def mark_channel_checked(channel: TelegramChannel, entity: object | None) -> Non
 
 
 def mark_channel_check_failed(channel: TelegramChannel, error_message: str) -> None:
-    """Apply a failed Telegram channel check result."""
+    """Apply a failed Telegram channel check result.
+
+    A ``None`` entity from ``get_entity()`` is NOT proof the channel is gone —
+    the adapter swallows transient network/flood errors and returns None. So a
+    bare "Entity not found" only records the failure (and ``last_checked``);
+    the channel stays retryable. Only explicit Telegram "not found"/"private"
+    errors are treated as permanent.
+    """
     channel.last_checked = datetime.now(UTC)
 
     if "No user has" in error_message or "Cannot find" in error_message:
         channel.is_active = False
         channel.check_error = "Channel not found / deleted"
-    elif error_message == "Entity not found":
-        # get_entity() returned None — channel deleted, banned, or never existed.
-        # Mark inaccessible so it is not retried as a join candidate.
-        channel.is_accessible = False
-        channel.check_error = "Entity not found"
     elif "private" in error_message.lower():
         channel.is_accessible = False
         channel.check_error = "Private channel"
@@ -132,14 +134,21 @@ def mark_channel_check_failed(channel: TelegramChannel, error_message: str) -> N
 
 
 def mark_channel_join_result(channel: TelegramChannel, success: bool) -> str:
-    """Apply a join attempt result and return a status label."""
+    """Apply a join attempt result and return a status label.
+
+    ``join_conversation`` returns False for BOTH permanent failures and
+    transient ones (flood wait, network error) — it does not tell us which.
+    A generic False therefore only records the failure; ``is_accessible`` is
+    left alone and ``build_subscription_query``'s last_checked backoff
+    throttles re-attempts. Permanent errors are classified separately in
+    ``mark_channel_join_failed``.
+    """
     channel.last_checked = datetime.now(UTC)
     if success:
         channel.is_subscribed = True
         channel.check_error = None
         return "joined"
 
-    channel.is_accessible = False
     channel.check_error = "Join failed"
     return "failed"
 

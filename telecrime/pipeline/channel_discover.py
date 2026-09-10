@@ -8,8 +8,9 @@ ChannelJoiner helper (one check or join per archive).
 import asyncio
 import logging
 import os
+from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from telecrime.channels.discover import (
     discover_channels_from_db,
@@ -23,7 +24,7 @@ from telecrime.channels.service import (
     mark_channel_join_failed,
     mark_channel_join_result,
 )
-from telecrime.models import TelegramChannel
+from telecrime.models import Conversation, TelegramChannel
 from telecrime.pipeline.orchestrator import PipelineContext, PipelineStage
 
 logger = logging.getLogger(__name__)
@@ -75,24 +76,39 @@ class ChannelJoiner:
         # Number of channels to verify per maybe_act() call. 0 = default.
         # Overridden by TELECRIME_CHANNEL_CHECK_BATCH.
         self.check_batch = check_batch or int(os.environ.get("TELECRIME_CHANNEL_CHECK_BATCH", "5"))
+        # Memoized source-#1 signal for discover_channels_from_db. Source #1
+        # materializes every channel conversation and maybe_act() runs after
+        # EVERY archive; an unchanged (count, max updated_at) means the
+        # conversation rows can't have changed since the last scan, so the
+        # full scan is skipped. None = not yet scanned in this process.
+        self._conversation_signal: tuple[int, datetime | None] | None = None
 
     async def maybe_act(self, ctx: PipelineContext) -> None:
         """Run incremental channel discovery then verify/join channels."""
         session = ctx.session
 
         # Step 1: incremental DB scan — picks up @mentions from just-parsed credentials
-        scan_result = discover_channels_from_db(session)
+        signal_row = session.execute(
+            select(
+                func.count(Conversation.id),
+                func.max(Conversation.updated_at),
+            ).where(Conversation.conversation_type == "channel")
+        ).one()
+        conversation_signal: tuple[int, datetime | None] = (
+            int(signal_row[0] or 0),
+            signal_row[1],
+        )
+        scan_result = discover_channels_from_db(
+            session,
+            include_conversations=conversation_signal != self._conversation_signal,
+        )
+        self._conversation_signal = conversation_signal
         save_discovered_channels(session, scan_result.channels)
         persist_discovery_state(session, scan_result)
 
-        # Step 2: Telegram check/join — skip if adapter doesn't support entity lookup
-        if not hasattr(ctx.adapter, "get_entity"):
-            return
-
-        # Priority 1: check a batch of channels — the oldest-checked first, so
-        # every channel is re-verified periodically and deleted/private ones
-        # drop out of the public channel list. Bounded by check_batch to stay
-        # inside Telegram's rate limits (get_entity is cheap, ~1 req each).
+        # Step 2: Telegram check/join — bounded by check_batch to stay inside
+        # Telegram's rate limits (get_entity is cheap, ~1 req each).
+        # Priority 1: check never-checked channels, oldest first.
         unchecked = session.execute(
             select(TelegramChannel)
             .where(
@@ -156,8 +172,11 @@ class ChannelJoiner:
                 self.channels_checked += 1
                 logger.info("Checked channel: %s (active)", channel.display_name)
             else:
-                mark_channel_check_failed(channel, "Entity not found")
-                logger.info("Checked channel: %s (not found)", channel.display_name)
+                # get_entity() also returns None on transient failures, so a
+                # None result only records the failure — it must not mark the
+                # channel permanently inaccessible.
+                mark_channel_check_failed(channel, "Entity lookup returned no result")
+                logger.info("Checked channel: %s (no entity returned)", channel.display_name)
         except Exception as e:
             mark_channel_check_failed(channel, str(e))
             logger.info("Checked channel: %s (%s)", channel.display_name, channel.check_error)

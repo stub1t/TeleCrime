@@ -758,6 +758,126 @@ class TestPlanStage:
         assert linked is not None, "reposted artifact was orphaned"
         assert linked.group_id == group.id
 
+    @pytest.mark.asyncio
+    async def test_late_split_merge_eager_loads_and_batches(self, session, test_config):
+        """Late-arriving parts link without per-part lazy loads or probes."""
+        from sqlalchemy import event
+
+        from telecrime.grouping.patterns import GroupingResult
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus, GroupStatus
+
+        conv = Conversation(platform_id=400, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+
+        def _attach(msg_pid, filename, file_id, pfid, part_number):
+            msg = Message(
+                conversation_id=conv.id,
+                platform_id=msg_pid,
+                platform_timestamp=datetime.now(UTC),
+            )
+            session.add(msg)
+            session.flush()
+            att = FileAttachment(
+                message_id=msg.id,
+                platform_file_id=file_id,
+                platform_file_unique_id=pfid,
+                filename=filename,
+                size=1000,
+                is_archive_candidate=True,
+                archive_type="rar",
+                detected_base_name="archive",
+                detected_part_number=part_number,
+            )
+            session.add(att)
+            session.flush()
+            return att
+
+        # Existing INCOMPLETE group holding part 1.
+        att1 = _attach(1, "archive.part1.rar", "111", "old_part_1", 1)
+        art1 = DownloadArtifact(attachment_id=att1.id, status=DownloadStatus.PENDING)
+        session.add(art1)
+        session.flush()
+        group = ArchiveGroup(
+            fingerprint="late-split-group",
+            base_name="archive.part1.rar",
+            expected_part_count=2,
+            detected_part_count=1,
+            status=GroupStatus.INCOMPLETE,
+        )
+        session.add(group)
+        session.flush()
+        session.add(ArchiveGroupPart(group_id=group.id, artifact_id=art1.id, part_index=1))
+        session.commit()
+
+        # Late part 2 arrives in a later grouping result.
+        att2 = _attach(2, "archive.part2.rar", "222", "new_part_2", 2)
+        art2 = DownloadArtifact(attachment_id=att2.id, status=DownloadStatus.PENDING)
+        session.add(art2)
+        session.flush()
+        session.commit()
+        # Candidates reach the stage with .message eagerly loaded in run().
+        _ = att2.message
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        result = GroupingResult(
+            base_name="archive.part2.rar",
+            attachments=[att2],
+            expected_parts=1,
+            part_numbers={att2.id: 0},
+        )
+
+        statements: list[str] = []
+        engine = session.get_bind()
+
+        def _record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", _record)
+        try:
+            returned = await PlanStage()._create_or_update_group(
+                ctx, result, {att2.id: art2}
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", _record)
+        session.commit()
+
+        assert returned is not None and returned.id == group.id
+        linked = session.execute(
+            select(ArchiveGroupPart).where(ArchiveGroupPart.artifact_id == art2.id)
+        ).scalar_one_or_none()
+        assert linked is not None and linked.part_index == 2
+
+        # One batched artifact_id probe (not one per attachment/candidate) and
+        # no per-part lazy loads of attachment/message.
+        part_probes = [
+            s
+            for s in statements
+            if " FROM ARCHIVE_GROUP_PARTS" in s.upper() and " JOIN " not in s.upper()
+        ]
+        assert len(part_probes) <= 1, f"expected one batched probe, got: {part_probes}"
+        lazy_files = [
+            s
+            for s in statements
+            if " FROM FILE_ATTACHMENTS" in s.upper() and " JOIN " not in s.upper()
+        ]
+        lazy_messages = [
+            s
+            for s in statements
+            if " FROM MESSAGES" in s.upper() and " JOIN " not in s.upper()
+        ]
+        assert lazy_files == []
+        assert lazy_messages == []
+
+
 
 class TestAcquireStage:
     """Tests for AcquireStage."""
@@ -937,6 +1057,374 @@ class TestAcquireStage:
         session.refresh(untouched_group)
         assert ready_group.status == GroupStatus.READY
         assert untouched_group.status == GroupStatus.INCOMPLETE
+
+    @pytest.mark.asyncio
+    async def test_update_group_statuses_empty_set_touches_nothing(self, session, test_config):
+        """An explicitly empty touched set must not be treated as "all groups"."""
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus, GroupStatus
+
+        conv = Conversation(platform_id=2, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id, platform_id=20, platform_timestamp=datetime.now(UTC)
+        )
+        session.add(msg)
+        session.flush()
+
+        group = ArchiveGroup(
+            fingerprint="empty-set-group",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.INCOMPLETE,
+        )
+        session.add(group)
+        session.flush()
+        attachment = FileAttachment(message_id=msg.id, platform_file_id="empty-set-file")
+        session.add(attachment)
+        session.flush()
+        artifact = DownloadArtifact(attachment_id=attachment.id, status=DownloadStatus.COMPLETED)
+        session.add(artifact)
+        session.flush()
+        session.add(ArchiveGroupPart(group_id=group.id, artifact_id=artifact.id, part_index=0))
+        session.commit()
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        await AcquireStage()._update_group_statuses(ctx, set())
+        session.commit()
+
+        session.refresh(group)
+        assert group.status == GroupStatus.INCOMPLETE
+
+    @pytest.mark.asyncio
+    async def test_acquire_run_skips_group_update_when_nothing_touched(self, session, test_config):
+        """run() must not scan all groups when the touched set stayed empty."""
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        conv = Conversation(platform_id=3, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id, platform_id=30, platform_timestamp=datetime.now(UTC)
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(message_id=msg.id, platform_file_id="no-group-file")
+        session.add(attachment)
+        session.flush()
+        artifact = DownloadArtifact(attachment_id=attachment.id, status=DownloadStatus.PENDING)
+        session.add(artifact)
+        session.commit()
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        stage = AcquireStage()
+        with patch.object(stage, "_download_artifact", new=AsyncMock(return_value=False)) as dl:
+            with patch.object(stage, "_update_group_statuses", new=AsyncMock()) as update:
+                await stage.run(ctx)
+
+        dl.assert_awaited()
+        update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_count_accumulates_from_persisted_value(self, session, test_config):
+        """Attempts from previous runs are preserved, not reset each call."""
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        test_config.download.max_retries = 2
+        test_config.download.retry_delay_seconds = 0
+        test_config.extraction.min_free_disk_mb = 0
+
+        conv = Conversation(platform_id=4, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id, platform_id=40, platform_timestamp=datetime.now(UTC)
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id,
+            platform_file_id="failing-file",
+            filename="boom.rar",
+            size=10,
+        )
+        session.add(attachment)
+        session.flush()
+        artifact = DownloadArtifact(
+            attachment_id=attachment.id,
+            status=DownloadStatus.FAILED,
+            retry_count=5,
+        )
+        session.add(artifact)
+        session.commit()
+
+        adapter = MagicMock()
+        adapter.download_message_media = AsyncMock(side_effect=RuntimeError("transient boom"))
+        ctx = PipelineContext(config=test_config, session=session, adapter=adapter)
+
+        result = await AcquireStage()._download_artifact(ctx, artifact)
+
+        assert result is False
+        session.commit()
+        session.refresh(artifact)
+        assert artifact.status == DownloadStatus.FAILED_TERMINAL
+        assert artifact.retry_count == 7  # 5 persisted + 2 attempts this call
+
+    def test_recover_skips_file_claimed_by_other_artifact(self, session, tmp_path):
+        """A same-name file already owned by another artifact is not recovered here."""
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        downloads_dir = tmp_path / "downloads"
+        downloads_dir.mkdir()
+        shared = downloads_dir / "shared.rar"
+        shared.write_bytes(b"claimed content 1234")
+
+        conv = Conversation(platform_id=200, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id, platform_id=200, platform_timestamp=datetime.now(UTC)
+        )
+        session.add(msg)
+        session.flush()
+
+        owner_att = FileAttachment(
+            message_id=msg.id, filename="shared.rar", platform_file_id="owner", size=20
+        )
+        session.add(owner_att)
+        session.flush()
+        owner = DownloadArtifact(
+            attachment_id=owner_att.id,
+            status=DownloadStatus.COMPLETED,
+            local_path=str(shared),
+        )
+        session.add(owner)
+
+        stuck_att = FileAttachment(
+            message_id=msg.id, filename="shared.rar", platform_file_id="stuck", size=20
+        )
+        session.add(stuck_att)
+        session.flush()
+        stuck = DownloadArtifact(attachment_id=stuck_att.id, status=DownloadStatus.DOWNLOADING)
+        session.add(stuck)
+        session.commit()
+
+        recovered = AcquireStage().recover_stuck_downloads(session, downloads_dir)
+
+        assert recovered == 1
+        session.refresh(stuck)
+        assert stuck.status == DownloadStatus.PENDING
+        assert stuck.local_path is None
+
+    def test_recover_hash_mismatch_with_sibling_forces_redownload(self, session, tmp_path):
+        """A same-name file whose hash differs from a same-ID sibling is rejected."""
+        import hashlib
+
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        downloads_dir = tmp_path / "downloads"
+        downloads_dir.mkdir()
+        content = b"sibling content"
+        other_content = b"different content!"
+        candidate = downloads_dir / "twin.rar"
+        candidate.write_bytes(content)
+        sibling_file = downloads_dir / "sibling.rar"
+        sibling_file.write_bytes(other_content)
+
+        conv = Conversation(platform_id=201, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id, platform_id=201, platform_timestamp=datetime.now(UTC)
+        )
+        session.add(msg)
+        session.flush()
+
+        sibling_att = FileAttachment(
+            message_id=msg.id,
+            filename="sibling.rar",
+            platform_file_id="sibling",
+            platform_file_unique_id="same_doc_id",
+            size=len(other_content),
+        )
+        session.add(sibling_att)
+        session.flush()
+        sibling = DownloadArtifact(
+            attachment_id=sibling_att.id,
+            status=DownloadStatus.COMPLETED,
+            local_path=str(sibling_file),
+            content_hash=hashlib.sha256(other_content).hexdigest(),
+        )
+        session.add(sibling)
+
+        stuck_att = FileAttachment(
+            message_id=msg.id,
+            filename="twin.rar",
+            platform_file_id="stuck",
+            platform_file_unique_id="same_doc_id",
+            size=len(content),
+        )
+        session.add(stuck_att)
+        session.flush()
+        stuck = DownloadArtifact(attachment_id=stuck_att.id, status=DownloadStatus.DOWNLOADING)
+        session.add(stuck)
+        session.commit()
+
+        AcquireStage().recover_stuck_downloads(session, downloads_dir)
+
+        session.refresh(stuck)
+        assert stuck.status == DownloadStatus.PENDING
+        assert stuck.local_path is None
+
+    def test_recover_hash_match_with_sibling_marks_completed(self, session, tmp_path):
+        """A recovered file matching its same-ID sibling's hash is accepted."""
+        import hashlib
+
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        downloads_dir = tmp_path / "downloads"
+        downloads_dir.mkdir()
+        content = b"sibling content"
+        candidate = downloads_dir / "twin.rar"
+        candidate.write_bytes(content)
+        sibling_file = downloads_dir / "sibling.rar"
+        sibling_file.write_bytes(content)
+        content_hash = hashlib.sha256(content).hexdigest()
+
+        conv = Conversation(platform_id=202, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id, platform_id=202, platform_timestamp=datetime.now(UTC)
+        )
+        session.add(msg)
+        session.flush()
+
+        sibling_att = FileAttachment(
+            message_id=msg.id,
+            filename="sibling.rar",
+            platform_file_id="sibling",
+            platform_file_unique_id="same_doc_id",
+            size=len(content),
+        )
+        session.add(sibling_att)
+        session.flush()
+        sibling = DownloadArtifact(
+            attachment_id=sibling_att.id,
+            status=DownloadStatus.COMPLETED,
+            local_path=str(sibling_file),
+            content_hash=content_hash,
+        )
+        session.add(sibling)
+
+        stuck_att = FileAttachment(
+            message_id=msg.id,
+            filename="twin.rar",
+            platform_file_id="stuck",
+            platform_file_unique_id="same_doc_id",
+            size=len(content),
+        )
+        session.add(stuck_att)
+        session.flush()
+        stuck = DownloadArtifact(attachment_id=stuck_att.id, status=DownloadStatus.DOWNLOADING)
+        session.add(stuck)
+        session.commit()
+
+        AcquireStage().recover_stuck_downloads(session, downloads_dir)
+
+        session.refresh(stuck)
+        assert stuck.status == DownloadStatus.COMPLETED
+        assert stuck.content_hash == content_hash
+        assert stuck.local_path == str(candidate)
+
+    def test_recover_sweeps_partial_of_recovered_artifact(self, session, tmp_path):
+        """The .partial of a recovered artifact is no longer left behind."""
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        downloads_dir = tmp_path / "downloads"
+        downloads_dir.mkdir()
+        tmp_dir = downloads_dir / ".tmp"
+        tmp_dir.mkdir()
+        content = b"complete archive bytes"
+        final_file = downloads_dir / "leak.rar"
+        final_file.write_bytes(content)
+        partial = tmp_dir / "tmpLEAK.partial"
+        partial.write_bytes(b"partial leftovers")
+
+        conv = Conversation(platform_id=203, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id, platform_id=203, platform_timestamp=datetime.now(UTC)
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id,
+            filename="leak.rar",
+            platform_file_id="leak",
+            size=len(content),
+        )
+        session.add(attachment)
+        session.flush()
+        artifact = DownloadArtifact(
+            attachment_id=attachment.id,
+            status=DownloadStatus.DOWNLOADING,
+            temp_path=str(partial),
+        )
+        session.add(artifact)
+        session.commit()
+
+        AcquireStage().recover_stuck_downloads(session, downloads_dir)
+
+        session.refresh(artifact)
+        assert artifact.status == DownloadStatus.COMPLETED
+        assert not partial.exists()
+
 
 
 class TestParseStage:
