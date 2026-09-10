@@ -335,6 +335,56 @@ async def test_request_unsuccessful_is_retryable():
 
 
 @pytest.mark.asyncio
+async def test_ensure_connected_forces_reconnect_when_suspect(monkeypatch):
+    """A half-open socket leaves is_connected() True after a drop; the suspect
+    flag must force a full teardown + fresh connect instead of trusting it —
+    otherwise every op burns its budget on a dead client (observed: 5h crawl
+    with 'waiting for Telegram reconnect' note and zero recoveries)."""
+    adapter = _make_adapter()
+
+    calls = {"connects": 0}
+    connect_ok = {"value": False}
+
+    async def _ensure_ok(timeout=30, reason="t"):
+        return None
+    monkeypatch.setattr(adapter, "_ensure_connected", _ensure_ok)
+
+    async def _hangs():
+        await asyncio.sleep(60)
+        return "never"
+
+    # Budget fires → TimeoutError → suspect flag set, op re-raises.
+    adapter._RUN_WITH_RECONNECT_BUDGET_SECONDS = 1
+    with pytest.raises(asyncio.TimeoutError):
+        await adapter._run_with_reconnect("dl", _hangs, timeout=1, retries=0)
+    assert adapter._connection_suspect is True
+
+    # A successful op clears the flag.
+    async def _ok():
+        return "done"
+    result = await adapter._run_with_reconnect("dl", _ok, timeout=1, retries=0)
+    assert result == "done"
+    assert adapter._connection_suspect is False
+
+
+@pytest.mark.asyncio
+async def test_reconnect_blocking_clears_suspect(monkeypatch):
+    """A fresh connect via _reconnect_blocking clears the suspect flag."""
+    adapter = _make_adapter()
+    adapter._connection_suspect = True
+
+    async def _connect_ok(timeout=30):
+        client = MagicMock()
+        client.is_connected = lambda: True
+        adapter.client = client
+        adapter._clear_runtime_note()
+
+    monkeypatch.setattr(adapter, "connect", _connect_ok)
+    await adapter._reconnect_blocking("test", timeout=10)
+    assert adapter._connection_suspect is False
+
+
+@pytest.mark.asyncio
 async def test_client_created_with_auto_reconnect_disabled(monkeypatch, tmp_path):
     """Regression: auto_reconnect=True let Telethon's internal reconnect loop
     race the adapter's own reconnect, wedge the client permanently, and leak

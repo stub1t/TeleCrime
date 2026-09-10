@@ -90,6 +90,12 @@ class TelegramAdapter(BaseAdapter):
         # reconnect: disconnecting mid-operation kills the op and a second
         # client on the same session file collides.
         self._active_ops = 0
+        # Set when a Telethon op exceeded its budget or died on a connection
+        # fault — Telethon's is_connected() can stay True on a half-open
+        # socket (recv/reconnect tasks crash with AttributeError after a
+        # drop without updating state). When suspect, _ensure_connected
+        # forces a full teardown + fresh connect instead of trusting it.
+        self._connection_suspect = False
 
         if not config.telegram.api_id or not config.telegram.api_hash:
             raise ValueError("Telegram API credentials not configured")
@@ -258,17 +264,31 @@ class TelegramAdapter(BaseAdapter):
     _ITER_STALL_SECONDS: int = 120
 
     async def _ensure_connected(self, timeout: int = 30, reason: str = "telegram operation") -> None:
-        if self.client is not None and self.client.is_connected():
+        if (
+            self.client is not None
+            and self.client.is_connected()
+            and not self._connection_suspect
+        ):
             return
 
         async with self._connect_lock:
-            if self.client is not None and self.client.is_connected():
+            if (
+                self.client is not None
+                and self.client.is_connected()
+                and not self._connection_suspect
+            ):
                 return
 
             self._set_runtime_note(
                 f"Waiting for Telegram reconnect during {reason}",
                 kind="telegram_reconnect",
             )
+            # A failed/expired operation poisoned the client (Telethon can
+            # leave is_connected() True on a half-open socket after a drop —
+            # its recv/reconnect tasks crashed with AttributeError and never
+            # updated the state). Once the lock is ours, force a full teardown
+            # and fresh connect regardless.
+            self._connection_suspect = False
             # Hard outer cap so a stuck Telethon (e.g. auto_reconnect spinning
             # forever after a network blip) cannot hold this coroutine
             # indefinitely. The inner `connect(timeout=timeout)` already has
@@ -360,7 +380,14 @@ class TelegramAdapter(BaseAdapter):
                     timeout=max(self._RUN_WITH_RECONNECT_BUDGET_SECONDS, timeout),
                 )
                 self._clear_runtime_note()
+                self._connection_suspect = False
                 return result
+            except TimeoutError:
+                # The op hit its wall-clock budget — Telethon's is_connected()
+                # can still report True on a half-open socket, so force the
+                # next _ensure_connected to tear down and reconnect fresh.
+                self._connection_suspect = True
+                raise
             except asyncio.CancelledError as exc:
                 # Distinguish Telethon cancelling our in-flight request because
                 # the connection dropped (retryable) from an EXTERNAL cancel of
@@ -430,6 +457,8 @@ class TelegramAdapter(BaseAdapter):
                 self.connect(timeout=min(timeout, budget)),
                 timeout=budget,
             )
+            # Fresh client on a verified connection — clear the suspect flag.
+            self._connection_suspect = False
         except Exception:
             # Failed reconnect: clear the note so the health job does not
             # chase a stale "reconnect pending" signal forever.
