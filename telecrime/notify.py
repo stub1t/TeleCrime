@@ -460,6 +460,16 @@ class TelegramNotifier:
             for domain, count in top:
                 lines.append(f"• {_esc(_trunc(domain, 48))} — {_fmt_int(count)}")
 
+        sent = await self.send("\n".join(lines))
+        if not sent:
+            # Keep the accumulated digest: a failed send (transient blip,
+            # busy adapter) must not permanently lose the window's news —
+            # the next flusher tick retries it.
+            logger.info(
+                "Digest send failed — keeping %d archives of accumulated results for retry",
+                self._digest_archives,
+            )
+            return
         self._digest_archives = 0
         self._digest_new = 0
         self._digest_dups = 0
@@ -467,7 +477,6 @@ class TelegramNotifier:
         self._digest_last_archive = None
         self._digest_since = None
         self._last_status_sent = asyncio.get_event_loop().time()
-        await self.send("\n".join(lines))
         # Keep _reported_archives: a digest flush mid-run must not re-report
         # archives already counted once this run.
 
