@@ -736,9 +736,15 @@ class TelegramAdapter(BaseAdapter):
                     chunk_size=chunk_size,
                     file_size=size,
                 )
-                handle.seek(base_offset)
+                # Telethon advances the request offset by `stride` after
+                # every yielded chunk, so chunk k holds the bytes at
+                # base_offset + k*stride. Seeking once and writing
+                # sequentially would permute the file's 512K blocks.
+                offset = base_offset
                 async for chunk in it:
+                    handle.seek(offset)
                     handle.write(chunk)
+                    offset += stride
                     done[0] += len(chunk)
                     if progress_callback:
                         progress_callback(done[0], size)

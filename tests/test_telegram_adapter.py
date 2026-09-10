@@ -132,8 +132,9 @@ class _FakeIter:
         start = self._offset + self._i * self._stride
         end = min(start + self._chunk_size, self._total)
         self._i += 1
-        # Zero-filled chunk so every range can be verified independently.
-        return bytes(end - start)
+        # Position-dependent bytes so a mis-placed write is detectable: byte
+        # at absolute file offset p is (p % 256).
+        return bytes(p % 256 for p in range(start, end))
 
 
 class _FakeMedia:
@@ -164,7 +165,7 @@ class _FakeClient:
 async def test_parallel_download_writes_all_bytes(tmp_path):
     """Parallel stripers cover the file exactly once, with no gaps/overlaps."""
     adapter = _make_adapter()
-    size = 2 * 1024 * 1024 + 12345  # not a multiple of chunk size
+    size = 12 * 1024 * 1024 + 12345  # > stride (8 * 512K) and not a multiple
     n = 8
     client = _FakeClient(size)
     msg = _FakeMessage(size)
@@ -175,8 +176,11 @@ async def test_parallel_download_writes_all_bytes(tmp_path):
     with open(dest, "rb") as f:
         data = f.read()
     assert len(data) == size, f"expected {size} bytes, got {len(data)}"
-    # All bytes must be present (zero-filled), proving every stripe wrote.
-    assert data.count(b"\x00") == size
+    # Every stripe must be written at its true file offset — a sequential
+    # write per striper silently permutes 512K blocks (Telethon advances the
+    # request offset by `stride`, not by `chunk_size`).
+    expected = bytes(p % 256 for p in range(size))
+    assert data == expected, "parallel stripers wrote blocks at wrong offsets"
     # Only stripers whose range actually overlaps the file are requested.
     assert 0 < len(client.iter_calls) <= n
     for offset, stride, _limit, chunk_size, file_size in client.iter_calls:
@@ -341,9 +345,6 @@ async def test_ensure_connected_forces_reconnect_when_suspect(monkeypatch):
     otherwise every op burns its budget on a dead client (observed: 5h crawl
     with 'waiting for Telegram reconnect' note and zero recoveries)."""
     adapter = _make_adapter()
-
-    calls = {"connects": 0}
-    connect_ok = {"value": False}
 
     async def _ensure_ok(timeout=30, reason="t"):
         return None
