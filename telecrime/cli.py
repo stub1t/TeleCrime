@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from telecrime import __version__
-from telecrime.config import load_config, save_config
+from telecrime.config import load_config, mask_database_url, save_config
 from telecrime.database import ensure_runtime_schema, get_engine, get_session, init_db
 from telecrime.logging_utils import configure_logging
 from telecrime.utils.credential_dedup import soft_dedupe_credentials
@@ -397,7 +397,7 @@ def run(
         console.print("Or configure them in the config file")
         raise typer.Exit(1)
 
-    console.print(f"Database: {config.database_url}")
+    console.print(f"Database: {mask_database_url(config.database_url)}")
     console.print(f"Target extensions: {config.extraction.target_extensions}")
     console.print(f"Mode: {'sequential (one at a time)' if sequential else 'batch'}")
     if limit:
@@ -1941,7 +1941,14 @@ def process(
     if output:
         cmd.extend(["--output", str(output)])
 
-    console.print(f"[cyan]Running: {' '.join(cmd)}[/cyan]\n")
+    # The subprocess must receive the real URL; the echoed command masks the
+    # password so it doesn't leak into terminal scrollback/logs.
+    display_cmd = list(cmd)
+    if not config_path:
+        display_cmd[display_cmd.index("--database") + 1] = mask_database_url(
+            config.database_url
+        )
+    console.print(f"[cyan]Running: {' '.join(display_cmd)}[/cyan]\n")
 
     # Run the process_folder.py script
     result = subprocess.run(cmd, cwd=Path(__file__).parent.parent)

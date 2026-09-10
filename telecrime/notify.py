@@ -52,6 +52,18 @@ _SEND_TIMEOUT_SECONDS = 30
 _DIGEST_ARCHIVES_DEFAULT = 25
 _DIGEST_SECONDS_DEFAULT = 20 * 60
 
+# Watchlist rescan cadence (env-tunable: TELECRIME_NOTIFY_WATCHLIST_SECONDS).
+# Mirrors the scheduler's 15-minute watchlist job: each check runs an ILIKE
+# COUNT(*) scan over parsed_credentials with statement_timeout disabled, so
+# running it every 60s tick (and again on every digest flush) hammered the DB.
+_WATCHLIST_SECONDS_DEFAULT = 15 * 60
+
+# After a failed digest send, archive_parsed() must not retry the flush on
+# every archive: during a Telegram outage each attempt blocks the parse hot
+# path for tens of seconds. The background flusher still retries.
+# Env-tunable: TELECRIME_NOTIFY_DIGEST_RETRY_SECONDS.
+_DIGEST_RETRY_SECONDS_DEFAULT = 5 * 60
+
 _DIVIDER = "─" * 30
 
 
@@ -179,6 +191,25 @@ class TelegramNotifier:
         self._digest_domains: Counter[str] = Counter()
         self._digest_last_archive: str | None = None
         self._digest_since: float | None = None
+        # Earliest loop time at which archive_parsed() may auto-flush again
+        # after a failed send; None when there is no pending failure.
+        self._digest_retry_after: float | None = None
+        try:
+            self._watchlist_interval = max(
+                30,
+                int(os.environ.get("TELECRIME_NOTIFY_WATCHLIST_SECONDS", _WATCHLIST_SECONDS_DEFAULT)),
+            )
+        except ValueError:
+            self._watchlist_interval = _WATCHLIST_SECONDS_DEFAULT
+        try:
+            self._digest_retry_seconds = max(
+                1,
+                int(os.environ.get("TELECRIME_NOTIFY_DIGEST_RETRY_SECONDS", _DIGEST_RETRY_SECONDS_DEFAULT)),
+            )
+        except ValueError:
+            self._digest_retry_seconds = _DIGEST_RETRY_SECONDS_DEFAULT
+        # When the watchlist was last scanned (loop time) — see _check_watchlist.
+        self._last_watchlist_check: float | None = None
         # Archive names already reported this run — a re-parse of the same
         # job (after a wedge) must not double-count it in the digest.
         self._reported_archives: set[str] = set()
@@ -219,7 +250,8 @@ class TelegramNotifier:
             try:
                 now = asyncio.get_event_loop().time()
                 # Watchlist alerts must NOT wait for digest content: check
-                # them on every tick.
+                # them on every tick (_check_watchlist throttles the actual
+                # DB scan to the 15-minute watchlist cadence).
                 await self._check_watchlist()
                 if self._digest_since is not None:
                     elapsed = now - self._digest_since
@@ -286,14 +318,24 @@ class TelegramNotifier:
         await self.send("\n".join(lines))
 
     async def _check_watchlist(self) -> None:
-        """Fetch and send watchlist alerts (best-effort).
+        """Fetch and send watchlist alerts (best-effort, throttled).
 
-        Runs on every flusher tick independent of digest content — a
-        multi-hour single-file parse must not silence alerts. The window
-        advances only on a confirmed send.
+        Runs on the flusher tick and on digest flushes, but at most once per
+        `_watchlist_interval` (default 15 minutes, matching the scheduler's
+        watchlist job): each check runs ILIKE COUNT(*) scans over
+        parsed_credentials with statement_timeout disabled, so a per-minute
+        cadence was pure DB load for no extra alerts. The window advances only
+        on a confirmed send.
         """
         if self.watchlist_provider is None:
             return
+        now = asyncio.get_event_loop().time()
+        if (
+            self._last_watchlist_check is not None
+            and now - self._last_watchlist_check < self._watchlist_interval
+        ):
+            return
+        self._last_watchlist_check = now
         try:
             alerts = await asyncio.wait_for(
                 self.watchlist_provider(), timeout=45
@@ -411,6 +453,12 @@ class TelegramNotifier:
         now = asyncio.get_event_loop().time()
         if self._digest_since is None:
             self._digest_since = now
+        if self._digest_retry_after is not None and now < self._digest_retry_after:
+            # A recent send failed: keep accumulating and let the background
+            # flusher own the retry. Flushing from the parse hot path on every
+            # archive would block it for tens of seconds per archive during a
+            # Telegram outage.
+            return
         if (
             self._digest_archives >= self._digest_archives_cap
             or (now - self._digest_since) >= self._digest_seconds_cap
@@ -464,12 +512,18 @@ class TelegramNotifier:
         if not sent:
             # Keep the accumulated digest: a failed send (transient blip,
             # busy adapter) must not permanently lose the window's news —
-            # the next flusher tick retries it.
+            # the next flusher tick retries it. Back off before archive_parsed
+            # may try again so a down Telegram link doesn't block the parse
+            # hot path on every archive.
+            self._digest_retry_after = (
+                asyncio.get_event_loop().time() + self._digest_retry_seconds
+            )
             logger.info(
                 "Digest send failed — keeping %d archives of accumulated results for retry",
                 self._digest_archives,
             )
             return
+        self._digest_retry_after = None
         self._digest_archives = 0
         self._digest_new = 0
         self._digest_dups = 0

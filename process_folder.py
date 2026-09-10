@@ -24,7 +24,7 @@ from pathlib import Path
 # Add the project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from telecrime.config import load_config
+from telecrime.config import load_config, mask_database_url
 from telecrime.database import get_dialect_insert, get_engine, get_session_factory, init_db
 from telecrime.extractor.seven_zip import SevenZipExtractor
 from telecrime.models import ParsedCredential
@@ -206,10 +206,17 @@ async def process_archive(
                 txt_file_name = txt_file.name
                 txt_file_path = str(txt_file)
 
-                def flush_batch(items):
+                def flush_batch(items) -> bool:
+                    """Persist one batch of credentials.
+
+                    Returns False on a database error (after rolling the
+                    session back) so process_archive() can report the archive
+                    as failed instead of letting the caller mark it processed
+                    with its credentials never persisted.
+                    """
                     nonlocal file_found_count
                     if not items:
-                        return
+                        return True
 
                     rows_by_hash: dict[str, dict] = {}
                     for cred in items:
@@ -242,46 +249,72 @@ async def process_archive(
                             stats.stealer_counter[stealer_type] += 1
 
                     if not rows_by_hash:
-                        return
+                        return True
 
-                    insert = get_dialect_insert(session)
-                    stmt = (
-                        insert(ParsedCredential)
-                        .values(list(rows_by_hash.values()))
-                        .on_conflict_do_nothing(
-                            index_elements=[ParsedCredential.credential_hash]
+                    try:
+                        insert = get_dialect_insert(session)
+                        stmt = (
+                            insert(ParsedCredential)
+                            .values(list(rows_by_hash.values()))
+                            .on_conflict_do_nothing(
+                                index_elements=[ParsedCredential.credential_hash]
+                            )
+                            .returning(ParsedCredential.credential_hash)
                         )
-                        .returning(ParsedCredential.credential_hash)
-                    )
-                    inserted_hashes = {row[0] for row in session.execute(stmt)}
+                        inserted_hashes = {row[0] for row in session.execute(stmt)}
 
-                    new_count = len(inserted_hashes)
-                    stats.credentials_found += new_count
-                    stats.credentials_new += new_count
-                    stats.credentials_duplicate += len(rows_by_hash) - new_count
-                    file_found_count += new_count
-                    seen_in_file.update(rows_by_hash.keys())
+                        new_count = len(inserted_hashes)
+                        stats.credentials_found += new_count
+                        stats.credentials_new += new_count
+                        stats.credentials_duplicate += len(rows_by_hash) - new_count
+                        file_found_count += new_count
+                        seen_in_file.update(rows_by_hash.keys())
 
-                    if csv_writer is not None:
-                        for h in inserted_hashes:
-                            row = rows_by_hash[h]
-                            csv_writer.writerow({
-                                **{k: row[k] for k in (
-                                    "url", "domain", "username", "password",
-                                    "application", "profile", "source_archive", "stealer_type",
-                                )},
-                                "source_file": txt_file_name,
-                            })
+                        if csv_writer is not None:
+                            for h in inserted_hashes:
+                                row = rows_by_hash[h]
+                                csv_writer.writerow({
+                                    **{k: row[k] for k in (
+                                        "url", "domain", "username", "password",
+                                        "application", "profile", "source_archive", "stealer_type",
+                                    )},
+                                    "source_file": txt_file_name,
+                                })
 
-                    session.commit()
-                    session.expire_all()
+                        session.commit()
+                        session.expire_all()
+                    except Exception as db_exc:
+                        # Without the rollback every later statement on this
+                        # session raises PendingRollbackError (also swallowed)
+                        # and the unpersisted credentials would be lost when
+                        # the archive is marked processed.
+                        session.rollback()
+                        logger.error(
+                            "    Database error saving credentials from %s: %s",
+                            txt_file.name,
+                            db_exc,
+                        )
+                        return False
+                    return True
 
+                batch_ok = True
                 for cred in iter_credentials_file(txt_file):
                     batch.append(cred)
                     if len(batch) >= batch_size:
-                        flush_batch(batch)
+                        if not flush_batch(batch):
+                            batch_ok = False
+                            break
                         batch = []
-                flush_batch(batch)
+                if batch_ok and not flush_batch(batch):
+                    batch_ok = False
+
+                if not batch_ok:
+                    stats.archives_failed += 1
+                    logger.error(
+                        "  Database write failed for %s — not marking it processed",
+                        archive.name,
+                    )
+                    return False
 
                 if file_found_count:
                     logger.info(
@@ -291,6 +324,10 @@ async def process_archive(
                     )
 
             except Exception as e:
+                # Reset the transaction so one poisoned session can't make
+                # every later statement fail (and be swallowed) while the
+                # archive is still reported as processed.
+                session.rollback()
                 logger.error("    Error parsing %s: %s", txt_file.name, e)
 
         stats.archives_processed += 1
@@ -383,7 +420,7 @@ async def process_folder(
     stats.archives_found = len(archives)
 
     logger.info("Found %d archive files in %s", len(archives), folder)
-    logger.info("Database: %s", config.database_url)
+    logger.info("Database: %s", mask_database_url(config.database_url))
 
     processed_marker = config.data_dir / f".processed_{folder.name}.txt"
     processed_marker.parent.mkdir(parents=True, exist_ok=True)

@@ -28,6 +28,17 @@ def get_default_data_dir() -> Path:
     return Path(__file__).parent.parent / "data"
 
 
+def mask_database_url(database_url: str) -> str:
+    """Render a database URL with the password hidden for logs/display."""
+    try:
+        from sqlalchemy.engine import make_url
+
+        return make_url(database_url).render_as_string(hide_password=True)
+    except Exception:
+        # Never echo a URL we could not parse — it may hold a password.
+        return "***"
+
+
 @dataclass
 class TelegramConfig:
     """Telegram API configuration."""
@@ -180,6 +191,12 @@ def _apply_config_dict(config: Config, data: ConfigDict) -> None:
             config.telegram.phone = tg["phone"]
         if "aux_session_name" in tg:
             config.telegram.aux_session_name = tg["aux_session_name"]
+        # Legacy location for download sessions (save_config now writes them
+        # under [download]); honoured unless [download] overrides below.
+        if "download_session_names" in tg:
+            config.telegram.download_session_names = [
+                s.strip() for s in tg["download_session_names"] if s.strip()
+            ]
 
     if "extraction" in data:
         ext = data["extraction"]
@@ -200,6 +217,10 @@ def _apply_config_dict(config: Config, data: ConfigDict) -> None:
             config.download.max_retries = dl["max_retries"]
         if "retry_delay_seconds" in dl:
             config.download.retry_delay_seconds = dl["retry_delay_seconds"]
+        if "parallel_chunks" in dl:
+            config.download.parallel_chunks = dl["parallel_chunks"]
+        if "parallel_min_bytes" in dl:
+            config.download.parallel_min_bytes = dl["parallel_min_bytes"]
         if "download_session_names" in dl:
             config.telegram.download_session_names = [
                 s.strip() for s in dl["download_session_names"] if s.strip()
@@ -281,7 +302,6 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             "session_name": config.telegram.session_name,
             "phone": config.telegram.phone,
             "aux_session_name": config.telegram.aux_session_name,
-            "download_session_names": config.telegram.download_session_names,
         },
         "extraction": {
             "target_extensions": config.extraction.target_extensions,
@@ -292,8 +312,10 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         },
         "download": {
             "max_retries": config.download.max_retries,
+            "retry_delay_seconds": config.download.retry_delay_seconds,
             "parallel_chunks": config.download.parallel_chunks,
             "parallel_min_bytes": config.download.parallel_min_bytes,
+            "download_session_names": config.telegram.download_session_names,
         },
     }
 

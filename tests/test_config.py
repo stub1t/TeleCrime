@@ -15,6 +15,8 @@ from telecrime.config import (
     get_default_config_path,
     get_default_data_dir,
     load_config,
+    mask_database_url,
+    save_config,
 )
 
 
@@ -292,3 +294,61 @@ target_extensions = [".epub", ".mobi"]
         monkeypatch.delenv("TELECRIME_DATABASE_URL", raising=False)
         with pytest.raises(RuntimeError, match="database_url"):
             load_config(tmp_path / "missing.toml")
+
+
+class TestConfigRoundTrip:
+    """load_config(save_config(config)) must preserve every setting."""
+
+    def test_round_trip_preserves_download_config(self, tmp_path, monkeypatch):
+        for var in (
+            "TELECRIME_DATABASE_URL",
+            "TELECRIME_DATA_DIR",
+            "TELECRIME_PARALLEL_CHUNKS",
+            "TELECRIME_PARALLEL_MIN_BYTES",
+            "TELECRIME_DOWNLOAD_SESSIONS",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        config = Config(
+            database_url="postgresql://user:secret@db:5432/telecrime",
+            data_dir=tmp_path / "data",
+            download=DownloadConfig(
+                max_retries=7,
+                retry_delay_seconds=42,
+                parallel_chunks=3,
+                parallel_min_bytes=123456,
+            ),
+        )
+        config.telegram.download_session_names = ["dl2", "dl3"]
+        path = tmp_path / "config.toml"
+
+        save_config(config, path)
+        loaded = load_config(path)
+
+        assert loaded.download == config.download
+        assert loaded.telegram.download_session_names == ["dl2", "dl3"]
+
+    def test_load_legacy_telegram_download_session_names(self, tmp_path, monkeypatch):
+        """Configs written before the move to [download] still load."""
+        monkeypatch.delenv("TELECRIME_DOWNLOAD_SESSIONS", raising=False)
+        path = tmp_path / "config.toml"
+        path.write_text("""
+database_url = "postgresql://user:secret@db:5432/telecrime"
+
+[telegram]
+download_session_names = ["legacy1", "legacy2"]
+""")
+
+        loaded = load_config(path)
+
+        assert loaded.telegram.download_session_names == ["legacy1", "legacy2"]
+
+
+class TestMaskDatabaseUrl:
+    def test_password_is_masked(self):
+        masked = mask_database_url("postgresql://user:secret@db:5432/telecrime")
+        assert masked == "postgresql://user:***@db:5432/telecrime"
+        assert "secret" not in masked
+
+    def test_unparseable_url_is_fully_masked(self):
+        assert mask_database_url("not a url") == "***"

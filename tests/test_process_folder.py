@@ -1,5 +1,6 @@
 """Tests for process_folder.py helpers and standalone import behavior."""
 
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,3 +152,172 @@ async def test_process_archive_uses_domain_hash_dedup(tmp_path, pg_engine, monke
     )
     assert stats.credentials_new == 1
     assert stats.credentials_duplicate == 1
+
+
+class _FailingSession:
+    """Session whose execute() always raises, tracking rollbacks."""
+
+    def __init__(self):
+        self.rollbacks = 0
+        self.commits = 0
+
+    def execute(self, statement):
+        raise RuntimeError("connection lost")
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def commit(self):
+        self.commits += 1
+
+    def expire_all(self):
+        pass
+
+
+def _cred(username: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        url="https://a.example/login",
+        domain="example.com",
+        username=username,
+        password="secret",
+        email_domain=None,
+        application="Chrome",
+        profile="Default",
+    )
+
+
+class _FakeExtractor:
+    def __init__(self, extracted_file: Path):
+        self._extracted_file = extracted_file
+
+    async def find_matching_files(self, archive_path, extensions, password=None):
+        return [self._extracted_file]
+
+    async def extract(self, archive_path, target_dir, target_extensions, password=None):
+        return SimpleNamespace(
+            needs_password=False,
+            success=True,
+            error_message=None,
+            extracted_files=[self._extracted_file],
+        )
+
+
+@pytest.mark.asyncio
+async def test_flush_batch_db_error_fails_archive_without_marking(tmp_path, monkeypatch):
+    """A DB error while persisting a batch must roll the session back and make
+    process_archive return False, so the caller does not mark the archive as
+    processed and its credentials are retried later."""
+    archive = tmp_path / "sample.zip"
+    archive.touch()
+    output_dir = tmp_path / "extract"
+    output_dir.mkdir()
+    extracted_file = output_dir / "Passwords.txt"
+    extracted_file.write_text("dummy")
+
+    monkeypatch.setattr("process_folder.iter_credentials_file", lambda path: iter([_cred("alice")]))
+    monkeypatch.setattr("process_folder.detect_stealer_type", lambda filenames: "redline")
+
+    session = _FailingSession()
+    stats = ProcessingStats()
+    success = await process_archive(
+        archive,
+        _FakeExtractor(extracted_file),
+        output_dir,
+        session,
+        stats,
+        delete_after=False,
+    )
+
+    assert success is False
+    assert stats.archives_failed == 1
+    assert stats.archives_processed == 0
+    assert session.rollbacks == 1
+    assert archive.exists()  # unpersisted data must never be deleted
+
+
+@pytest.mark.asyncio
+async def test_process_archive_rolls_back_on_parse_error(tmp_path, monkeypatch):
+    """A parse error must roll the session back so later statements don't all
+    fail with PendingRollbackError."""
+    archive = tmp_path / "sample.zip"
+    archive.touch()
+    output_dir = tmp_path / "extract"
+    output_dir.mkdir()
+    extracted_file = output_dir / "Passwords.txt"
+    extracted_file.write_text("dummy")
+
+    def _boom(path):
+        raise ValueError("bad encoding")
+
+    monkeypatch.setattr("process_folder.iter_credentials_file", _boom)
+    monkeypatch.setattr("process_folder.detect_stealer_type", lambda filenames: "redline")
+
+    session = MagicMock()
+    stats = ProcessingStats()
+    success = await process_archive(
+        archive,
+        _FakeExtractor(extracted_file),
+        output_dir,
+        session,
+        stats,
+        delete_after=False,
+    )
+
+    assert success is True  # parse errors keep the previous "try other files" path
+    session.rollback.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_folder_masks_database_password_in_logs(tmp_path, test_config, monkeypatch, caplog):
+    """The startup log must not leak the database password."""
+    import process_folder as process_folder_module
+
+    source = tmp_path / "archives"
+    source.mkdir()
+    test_config.database_url = "postgresql://user:supersecret@db:5432/telecrime"
+
+    monkeypatch.setattr(process_folder_module, "load_config", lambda _path: test_config)
+    monkeypatch.setattr(process_folder_module, "get_engine", lambda _url: MagicMock())
+    monkeypatch.setattr(process_folder_module, "init_db", lambda _engine: None)
+    monkeypatch.setattr(
+        process_folder_module,
+        "get_session_factory",
+        lambda _engine: lambda: MagicMock(),
+    )
+    monkeypatch.setattr(process_folder_module, "find_archives", lambda _folder: [])
+
+    with caplog.at_level(logging.INFO):
+        await process_folder(source, config_path=tmp_path / "config.toml")
+
+    assert "supersecret" not in caplog.text
+    assert "postgresql://user:***@db:5432/telecrime" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_process_folder_does_not_mark_failed_archive(tmp_path, test_config, monkeypatch):
+    """A failed process_archive() must not be written to the resume marker, so
+    its never-persisted credentials are retried on the next run."""
+    import process_folder as process_folder_module
+
+    source = tmp_path / "archives"
+    source.mkdir()
+    (source / "sample.zip").touch()
+    session = MagicMock()
+
+    monkeypatch.setattr(process_folder_module, "load_config", lambda _path: test_config)
+    monkeypatch.setattr(process_folder_module, "get_engine", lambda _url: MagicMock())
+    monkeypatch.setattr(process_folder_module, "init_db", lambda _engine: None)
+    monkeypatch.setattr(
+        process_folder_module, "get_session_factory", lambda _engine: lambda: session
+    )
+
+    async def _fail(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(process_folder_module, "process_archive", _fail)
+
+    stats = await process_folder(source, config_path=tmp_path / "config.toml")
+
+    marker = test_config.data_dir / f".processed_{source.name}.txt"
+    assert marker.read_text() == ""
+    assert stats.archives_processed == 0

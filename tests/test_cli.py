@@ -408,6 +408,24 @@ class TestCliRun:
         assert result.exit_code == 75  # EX_TEMPFAIL — not an error, just busy
         assert "already active" in result.stdout.lower()
 
+    def test_run_masks_database_password(self):
+        """The run banner must never echo the database password."""
+        import asyncio
+
+        with patch("telecrime.cli.get_config_and_engine") as mock_get:
+            mock_config = MagicMock()
+            mock_config.telegram.api_id = 12345
+            mock_config.telegram.api_hash = "test"
+            mock_config.database_url = "postgresql://user:supersecret@db:5432/telecrime"
+            mock_config.extraction.target_extensions = [".txt"]
+            mock_get.return_value = (mock_config, MagicMock())
+
+            with patch.object(asyncio, "run", return_value=None):
+                result = runner.invoke(app, ["run", "--dry-run"])
+
+        assert "supersecret" not in result.stdout
+        assert "postgresql://user:***@db:5432/telecrime" in result.stdout
+
 
 class TestCliProcess:
     """Tests for process command."""
@@ -450,7 +468,11 @@ class TestCliProcess:
         assert result.exit_code == 0
         command = mock_run.call_args.args[0]
         assert "--database" in command
+        # The subprocess gets the real URL...
         assert "postgresql://telecrime:telecrime@localhost:5432/telecrime" in command
+        # ...but the echoed command masks the password.
+        assert "postgresql://telecrime:***@localhost:5432/telecrime" in result.stdout
+        assert "telecrime:telecrime@" not in result.stdout
 
 
 class TestCliFts:

@@ -472,3 +472,74 @@ async def test_flusher_loop_sends_status_only_when_no_digest(monkeypatch):
     # the digest — assert both contents are present regardless of order.
     assert any("Watchlist hits" in t for t in texts)
     assert any("Progress digest" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_check_watchlist_throttled_inside_interval():
+    """The watchlist provider is not called twice inside the throttle window;
+    it runs again once the interval has elapsed (timestamp = fake clock)."""
+    import asyncio
+
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock()
+    n = TelegramNotifier(client=client, enabled=True)
+    n._watchlist_interval = 900
+
+    calls = 0
+
+    async def _wl():
+        nonlocal calls
+        calls += 1
+        return []
+
+    n.watchlist_provider = _wl
+
+    # First ever check is due immediately.
+    await n._check_watchlist()
+    assert calls == 1
+
+    # Same clock instant: second call (flusher tick or digest flush) is
+    # throttled and must not hit the provider / DB.
+    await n._check_watchlist()
+    await n._check_watchlist()
+    assert calls == 1
+
+    # Fast-forward the fake clock past the interval: due again.
+    n._last_watchlist_check = asyncio.get_event_loop().time() - n._watchlist_interval - 1
+    await n._check_watchlist()
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_digest_flush_is_rate_limited():
+    """A failed digest send keeps the accumulated results but must not retry
+    from archive_parsed() on every archive (that blocked the parse hot path
+    for tens of seconds during a Telegram outage). The retry resumes after
+    the backoff elapses."""
+    import asyncio
+
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock(side_effect=RuntimeError("telegram down"))
+    n = TelegramNotifier(client=client, enabled=True)
+    n._digest_seconds_cap = 30
+    n._digest_since = asyncio.get_event_loop().time() - 60
+
+    await n.archive_parsed("a.zip", 10, 0, 1)
+    assert client.send_message.await_count == 1  # first flush attempt
+
+    await n.archive_parsed("b.zip", 10, 0, 1)
+    await n.archive_parsed("c.zip", 10, 0, 1)
+    # Inside the backoff window: results accumulate, no second send attempt.
+    assert client.send_message.await_count == 1
+    assert n._digest_archives == 3
+    assert n._digest_new == 30
+
+    # Backoff elapsed: the next archive retries the flush (no data lost).
+    n._digest_retry_after = asyncio.get_event_loop().time() - 1
+    await n.archive_parsed("d.zip", 10, 0, 1)
+    assert client.send_message.await_count == 2
+    assert n._digest_archives == 4
