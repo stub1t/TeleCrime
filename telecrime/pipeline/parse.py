@@ -583,15 +583,67 @@ class ParseStage(PipelineStage):
         total_duplicates = 0
         try:
             for job in jobs:
-                creds_found, dups_found = await self._parse_job_outputs(
-                    ctx, job, ctx.has_soft_hash_column
-                )
-                total_credentials += creds_found
-                total_duplicates += dups_found
-                ctx.credentials_parsed += creds_found
-                ctx.duplicates_skipped += dups_found
-                if job.group_id is not None:
-                    ctx.parse_failed_group_ids.discard(job.group_id)
+                job_id = job.id
+                try:
+                    creds_found, dups_found = await self._parse_job_outputs(
+                        ctx, job, ctx.has_soft_hash_column
+                    )
+                    total_credentials += creds_found
+                    total_duplicates += dups_found
+                    ctx.credentials_parsed += creds_found
+                    ctx.duplicates_skipped += dups_found
+                    if job.group_id is not None:
+                        ctx.parse_failed_group_ids.discard(job.group_id)
+                except Exception as e:
+                    # Same failure semantics as ParseStage.run: without this,
+                    # an exception mid-file left partial rows committed, the
+                    # next run's per-file pre-skip skipped the file, and
+                    # finalize deleted the un-parsed remainder (data loss).
+                    try:
+                        ctx.session.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        _apply_pg_bulk_settings(ctx.session)
+                    except Exception as settings_error:
+                        logger.warning(
+                            "Could not restore parse DB settings: %s",
+                            settings_error,
+                        )
+                    logger.error(
+                        "Error parsing job %d (group %s): %s", job_id, group_id, e
+                    )
+                    ctx.errors.append(f"Parse error for job {job_id}: {e}")
+                    # The un-parsed remainder is only on disk — tell finalize
+                    # to leave the group EXTRACTED so the next run re-parses it
+                    # instead of reclaiming the files.
+                    ctx.parse_failed_group_ids.add(group_id)
+                    # Delete the job's already-inserted rows so the next run
+                    # re-parses the whole job cleanly (ON CONFLICT dedups).
+                    try:
+                        removed = cast(
+                            CursorResult,
+                            ctx.session.execute(
+                                delete(ParsedCredential).where(
+                                    ParsedCredential.extraction_job_id == job_id
+                                )
+                            ),
+                        ).rowcount
+                        ctx.session.commit()
+                        logger.info(
+                            "Removed %d partial rows for failed job %d — will re-parse next run",
+                            removed or 0,
+                            job_id,
+                        )
+                    except Exception as del_err:
+                        logger.warning(
+                            "Could not clean partial rows for job %d: %s",
+                            job_id, del_err,
+                        )
+                        try:
+                            ctx.session.rollback()
+                        except Exception:
+                            pass
         finally:
             _reset_pg_bulk_settings(ctx.session)
 

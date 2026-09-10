@@ -35,6 +35,10 @@ from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
 # the PASSWORD_NEEDED→PENDING reset (each run counts one attempt).
 _EXTRACTION_MAX_ATTEMPTS = 3
 
+# Max READY groups selected per main-loop pass. Bounds the per-pass task set;
+# remaining READY groups are drained by the post-download sweep / next pass.
+_READY_GROUP_BATCH = 128
+
 if TYPE_CHECKING:
     from telecrime.notify import TelegramNotifier
     from telecrime.pipeline.display import PipelineDisplay
@@ -87,11 +91,6 @@ class PipelineContext:
     # the unparsed remainder is only recoverable from disk and is re-parsed on
     # the next run.
     parse_failed_group_ids: set[int] = field(default_factory=set)
-
-    async def notify(self, message: str):
-        """Send a notification if notifier is available."""
-        if self.notifier:
-            await self.notifier.send(message)
 
 
 class PipelineStage:
@@ -169,9 +168,16 @@ class Pipeline:
                 free_disk_gb = None
                 try:
                     import shutil as _shutil
-                    free_disk_gb = _shutil.disk_usage(
-                        str(self.config.downloads_dir)
-                    ).free / (1024 ** 3)
+                    # A wedged data drive puts statvfs in D-state and would
+                    # freeze the whole event loop (downloads, heartbeat,
+                    # notifications) — bound it and run it off-loop.
+                    usage = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _shutil.disk_usage, str(self.config.downloads_dir)
+                        ),
+                        timeout=10,
+                    )
+                    free_disk_gb = usage.free / (1024 ** 3)
                 except Exception:
                     pass
                 await notifier.pipeline_start(
@@ -1306,6 +1312,12 @@ async def run_sequential_pipeline(
                             func.min(_download_priority(FileAttachment.filename)).asc(),
                             func.min(ArchiveGroup.updated_at).asc(),
                         )
+                        # Bound the batch: the query used to return every READY
+                        # group and asyncio.gather materialized one task per id
+                        # (O(backlog) coroutines/sessions) while only
+                        # parallel_groups run concurrently. The post-download
+                        # sweep and the next loop iteration drain the rest.
+                        .limit(_READY_GROUP_BATCH)
                     )
                     .scalars()
                     .all()
@@ -1680,6 +1692,7 @@ async def run_sequential_pipeline(
                             func.min(_download_priority(FileAttachment.filename)).asc(),
                             func.min(ArchiveGroup.updated_at).asc(),
                         )
+                        .limit(_READY_GROUP_BATCH)
                     )
                     .scalars()
                     .all()

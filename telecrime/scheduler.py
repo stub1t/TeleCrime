@@ -684,10 +684,17 @@ def _check_pipeline_health(config) -> PipelineHealth:
     # across Docker container namespaces (e.g. pipeline triggered from web container).
     if pid is not None and not _pid_is_alive(pid) and not lock_held:
         reasons.append(f"pipeline subprocess pid {pid} disappeared")
-    elif pid is not None and _pid_is_alive(pid) and not _pid_is_pipeline_process(pid):
+    elif (
+        pid is not None
+        and _pid_is_alive(pid)
+        and not _pid_is_pipeline_process(pid)
+        and not lock_held
+    ):
         # Stale pid file pointing at a recycled/unrelated process — the real
         # pipeline is gone; the watchdog must flag it for restart, not believe
-        # the imposter keeps the run alive.
+        # the imposter keeps the run alive. Skip when the lock is held: the
+        # exclusive flock proves a live pipeline exists (possibly in another
+        # container's PID namespace, where our pid lookup is meaningless).
         reasons.append(f"pipeline pid {pid} is not a telecrime process (stale pid file)")
     if bool(progress.get("running")) and updated_age is not None and updated_age > stale_threshold:
         reasons.append(f"progress heartbeat stale for {int(updated_age)}s")
@@ -759,7 +766,7 @@ def _check_pipeline_health(config) -> PipelineHealth:
     )
 
 
-def _run_pipeline_health_job(config, engine) -> str:
+def _run_pipeline_health_job(config, engine, on_recovered=None) -> str:
     health = _check_pipeline_health(config)
     if health.healthy:
         return health.result()
@@ -767,6 +774,14 @@ def _run_pipeline_health_job(config, engine) -> str:
     result = _recover_stuck_pipeline(config, engine, "; ".join(health.reasons))
     if health.disk_status:
         result = f"{result}; {health.disk_status}"
+    # A killed stale run is NOT rescheduled by the scheduler (interval trigger
+    # only fires again after the full interval). Without an explicit rerun the
+    # worker sat idle for up to 4h after a health recovery.
+    if on_recovered is not None and not _pipeline_lock_is_held(config.data_dir):
+        try:
+            on_recovered()
+        except Exception:
+            logger.exception("Failed to schedule pipeline rerun after health recovery")
     return result
 
 
@@ -1757,7 +1772,11 @@ class TelecrimeWorker:
         if self._any_job_running():
             return False
         pid = _read_pipeline_pid()
-        if pid is not None and _pid_is_alive(pid):
+        # Only a pid that actually IS the pipeline subprocess may block exit.
+        # After a web-container restart the shared pid file can name an
+        # unrelated live process in this namespace; trusting it made SIGTERM
+        # shutdown hang until Docker's grace period SIGKILLed the worker.
+        if pid is not None and _pid_is_alive(pid) and _pid_is_pipeline_process(pid):
             return False
         if _pipeline_lock_is_held(self.config.data_dir):
             return False
@@ -1860,14 +1879,18 @@ class TelecrimeWorker:
                     self._refresh_next_run(name)
                     return
 
-            _update_job(name, running=True, last_run=datetime.now(UTC).isoformat())
             try:
+                # Inside the try: a status-file write failure here used to
+                # skip the finally below and leak both locks permanently.
+                _update_job(name, running=True, last_run=datetime.now(UTC).isoformat())
                 if name == "pipeline":
                     result = _run_pipeline_job(self.config, self.engine)
                 elif name == "pipeline_watchdog":
                     result = self._run_pipeline_watchdog_job()
                 elif name == "pipeline_health":
-                    result = _run_pipeline_health_job(self.config, self.engine)
+                    result = _run_pipeline_health_job(
+                        self.config, self.engine, on_recovered=self.run_now
+                    )
                 elif name == "vacuum":
                     result = _run_vacuum_job(self.engine)
                 elif name == "channel_join":
@@ -2055,11 +2078,37 @@ class TelecrimeWorker:
             self._scheduler.shutdown(wait=False)
 
     def run_now(self, job_name: str) -> bool:
-        """Trigger a job to run immediately. Returns False if job not found."""
+        """Trigger a job to run immediately. Returns False if job not found.
+
+        Waits out a still-finishing previous instance: APScheduler's
+        max_instances=1 silently drops a submit made while the old instance is
+        registered, then advances next_run_time by the full interval — so the
+        watchdog's recovery rerun never actually happened (pipeline stayed down
+        up to 4h). The per-job lock is released in the job wrapper's finally
+        just before the executor retires the future, so acquiring it is the
+        signal that the old instance is finishing.
+        """
         if self._scheduler is None:
             return False
         job = self._scheduler.get_job(job_name)
         if job is None:
             return False
+        lock = self._locks.get(job_name)
+        if lock is not None:
+            deadline = time.monotonic() + 30.0
+            while not lock.acquire(blocking=False):
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "run_now(%s): previous instance still running after 30s — "
+                        "not rescheduling",
+                        job_name,
+                    )
+                    return False
+                time.sleep(0.5)
+            lock.release()
+            # The executor marks the finished future done just after the job
+            # body returns; give it a beat so the submit clears the
+            # max_instances check instead of being dropped.
+            time.sleep(1.0)
         job.modify(next_run_time=datetime.now(UTC))
         return True
