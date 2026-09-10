@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypeVar
 
 from telethon import TelegramClient
 from telethon.errors import (
@@ -39,6 +40,8 @@ from telecrime.config import Config
 from telecrime.pipeline.progress import patch_progress, read_progress
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 def _configure_session_sqlite(session_path: Path, client=None) -> None:
@@ -498,10 +501,10 @@ class TelegramAdapter(BaseAdapter):
 
     async def _bounded_aiter(
         self,
-        it,
+        it: AsyncIterator[_T],
         operation: str,
         stall_seconds: int,
-    ) -> AsyncIterator[object]:
+    ) -> AsyncIterator[_T]:
         """Async-iterate with a per-item stall bound.
 
         Telethon's RequestIter can hang forever on a half-open socket (server
