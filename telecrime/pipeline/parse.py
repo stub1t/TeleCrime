@@ -1273,16 +1273,24 @@ class ParseStage(PipelineStage):
             # "Credential COPY chunk failed ... retrying" storm. Cleaning here
             # keeps the pending list near-empty so inserts stay fast. Best-
             # effort: a failed clean is a performance issue, not correctness.
+            # IMPORTANT: run it inside its OWN savepoint — an error here (e.g.
+            # the index doesn't exist on a fresh/test DB) would otherwise abort
+            # the ENTIRE outer transaction, discarding the just-committed chunk.
             try:
-                cursor = ctx.session.connection().connection.cursor()
+                drain_sp = ctx.session.begin_nested()
                 try:
-                    cursor.execute(
-                        "SELECT gin_clean_pending_list('ix_pc_username_trgm'), "
-                        "gin_clean_pending_list('ix_pc_domain_trgm')"
-                    )
-                    cursor.fetchall()
-                finally:
-                    cursor.close()
+                    cursor = ctx.session.connection().connection.cursor()
+                    try:
+                        cursor.execute(
+                            "SELECT gin_clean_pending_list('ix_pc_username_trgm'), "
+                            "gin_clean_pending_list('ix_pc_domain_trgm')"
+                        )
+                        cursor.fetchall()
+                    finally:
+                        cursor.close()
+                    drain_sp.commit()
+                except Exception:
+                    drain_sp.rollback()
             except Exception:
                 pass
             return [

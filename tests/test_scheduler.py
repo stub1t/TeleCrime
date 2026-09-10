@@ -613,6 +613,7 @@ def test_collect_watchlist_alerts_only_returns_new_matches(pg_engine):
     from telecrime.database import get_session
     from telecrime.models.credential import ParsedCredential
     from telecrime.models.watchlist import WatchlistItem
+    from telecrime.scheduler import _advance_watchlist_alerts
 
     watermarked_at = datetime.now(UTC) - timedelta(hours=2)
 
@@ -658,6 +659,17 @@ def test_collect_watchlist_alerts_only_returns_new_matches(pg_engine):
     assert alerts[0]["hits"][0]["username"] == "bob"
     assert alerts[0]["hits"][0]["password"] == "secret"
 
+    # The alerted window must NOT advance at collection time — it advances
+    # only after a confirmed Telegram send (_advance_watchlist_alerts), so a
+    # transient send failure re-alerts the same hits next interval instead of
+    # dropping them.
+    with get_session(pg_engine) as session:
+        item = session.query(WatchlistItem).one()
+        assert item.last_alerted_count == 1
+        assert item.last_alerted_at.replace(tzinfo=UTC) == watermarked_at
+
+    # After a confirmed send, the window advances to the collection time.
+    _advance_watchlist_alerts(pg_engine, alerts)
     with get_session(pg_engine) as session:
         item = session.query(WatchlistItem).one()
         assert item.last_alerted_count == 2
