@@ -233,14 +233,24 @@ _HAS_HASH64: bool | None = None  # resolved lazily against the live schema
 
 
 def _has_hash64_index(engine) -> bool:
-    """True when ix_pc_hash64 (compact dedup index) exists on parsed_credentials."""
+    """True when a *valid* ix_pc_hash64 (compact dedup index) exists.
+
+    pg_indexes lists indexes left invalid by an interrupted CREATE INDEX
+    CONCURRENTLY, but the planner ignores them. Treating an invalid index as
+    present made every dedup INSERT fall back to a per-row full index scan of
+    parsed_credentials (minutes per 50K chunk instead of milliseconds).
+    """
     global _HAS_HASH64
     if _HAS_HASH64 is not None:
         return _HAS_HASH64
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text("SELECT 1 FROM pg_indexes WHERE tablename='parsed_credentials' AND indexname='ix_pc_hash64'")
+                text(
+                    "SELECT 1 FROM pg_index i "
+                    "JOIN pg_class c ON c.oid = i.indexrelid "
+                    "WHERE c.relname = 'ix_pc_hash64' AND i.indisvalid"
+                )
             ).fetchone()
         _HAS_HASH64 = row is not None
     except Exception:
@@ -249,12 +259,12 @@ def _has_hash64_index(engine) -> bool:
 
 
 def _ensure_hash64_index(engine) -> None:
-    """Create ix_pc_hash64 (compact dedup index) if missing, without blocking.
+    """Create (or repair) ix_pc_hash64, the compact dedup index.
 
-    The index is referenced by the two-stage dedup INSERT but was never
-    created by any migration; without it every COPY chunk falls back to a
-    left(credential_hash, 32) anti-join that seq-scans the whole table and
-    times out. CONCURRENTLY needs autocommit, so a fresh connection is used.
+    Without a *valid* index every COPY chunk falls back to a per-row scan of
+    the full credential_hash index and can time out. Repairs an invalid
+    leftover from an interrupted build as well as a missing index.
+    CONCURRENTLY needs autocommit, so a fresh connection is used.
     """
     if engine.dialect.name != "postgresql":
         return
@@ -263,6 +273,10 @@ def _ensure_hash64_index(engine) -> None:
     global _HAS_HASH64
     try:
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            # An invalid leftover from an interrupted CONCURRENTLY build still
+            # satisfies CREATE INDEX IF NOT EXISTS, so it must be dropped first
+            # or the repair silently no-ops and the dedup INSERT stays slow.
+            conn.execute(text("DROP INDEX CONCURRENTLY IF EXISTS ix_pc_hash64"))
             conn.execute(
                 text(
                     "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_pc_hash64 "
