@@ -91,19 +91,16 @@ def is_system_info_file(filename: str) -> bool:
 
 def detect_stealer_type(
     file_list: list[str],
-    content_sample: str | None = None,
     sysinfo_stealer: str | None = None,
 ) -> str | None:
-    """Try to detect the stealer type from file structure, content, or sysinfo self-id.
+    """Try to detect the stealer type from file structure or sysinfo self-id.
 
     Detection priority (highest to lowest):
     1. sysinfo_stealer  — stealer self-identifies in SystemInfo.txt (most reliable)
     2. File signatures  — unique filenames only produced by one family
-    3. Content keywords — ASCII art / strings in credential files
 
     Args:
         file_list: List of files in the archive
-        content_sample: Optional sample of file content for signature detection
         sysinfo_stealer: Optional stealer name extracted from SystemInfo.txt
 
     Returns:
@@ -156,35 +153,5 @@ def detect_stealer_type(
     # Pandora
     if any("pandora" in n for n in file_names):
         return "pandora"
-
-    # Priority 3: Content keyword signatures
-    if content_sample:
-        content_lower = content_sample.lower()
-        if "redline" in content_lower:
-            return "redline"
-        if "raccoon" in content_lower:
-            return "raccoon"
-        if "vidar" in content_lower:
-            return "vidar"
-        if "lumma" in content_lower or "lummac2" in content_lower:
-            return "lumma"
-        if "stealc" in content_lower:
-            return "stealc"
-        if "meta stealer" in content_lower or ("meta" in content_lower and "stealer" in content_lower):
-            return "meta"
-        if "aurora stealer" in content_lower or "aurora log" in content_lower:
-            return "aurora"
-        if "mystic stealer" in content_lower or "mysticstealer" in content_lower:
-            return "mystic"
-        if "doenerium" in content_lower:
-            return "doenerium"
-        if "cryptbot" in content_lower:
-            return "cryptbot"
-        if "cinoshi" in content_lower:
-            return "cinoshi"
-        if "titan stealer" in content_lower:
-            return "titan"
-        if "pandora stealer" in content_lower:
-            return "pandora"
 
     return None

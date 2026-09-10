@@ -473,8 +473,7 @@ class ExtractStage(PipelineStage):
             # Corruption and unsupported formats won't improve on retry.
             # KILLED (signal/OOM death) and TIMEOUT are transient — never
             # terminal, so the archive survives for a retry.
-            _killed = getattr(result, "error_code", "") == "KILLED"
-            terminal = result.error_code in _recoverable_errors and not _killed
+            terminal = result.error_code in _recoverable_errors
             job.status = ExtractionStatus.FAILED_TERMINAL if terminal else ExtractionStatus.FAILED
             job.last_error_code = result.error_code
             job.last_error_message = result.error_message

@@ -25,16 +25,6 @@ ARCHIVE_EXTENSIONS = {
     ".bz2": "bzip2",
     ".xz": "xz",
     ".lzma": "lzma",
-    # Split archive patterns
-    ".z01": "zip",
-    ".z02": "zip",
-    ".001": "7z",
-    ".002": "7z",
-    ".r00": "rar",
-    ".r01": "rar",
-    ".part1.rar": "rar",
-    ".part01.rar": "rar",
-    ".part001.rar": "rar",
 }
 
 # MIME types that indicate archives
@@ -132,8 +122,6 @@ class DiscoverStage(PipelineStage):
         # credential-gate expansion are permanently stranded (discover only
         # scans archive_type IS NULL). Reset any tombstoned file that NOW
         # passes the gate so it is re-classified and picked up.
-        from telecrime.stealer.patterns import is_credential_file
-
         _tombstoned = ctx.session.execute(
             select(FileAttachment).where(
                 FileAttachment.is_archive_candidate == False,
@@ -255,11 +243,5 @@ class DiscoverStage(PipelineStage):
                     return True, "unknown", None
                 return False, None, None
             return True, "unknown", None
-
-        # Size heuristic: large files without extension might be archives
-        # But be more conservative - only if it's reasonably sized (not huge media files)
-        if attachment.size and 1 * 1024 * 1024 < attachment.size < 500 * 1024 * 1024:  # 1MB-500MB
-            if mime_type == "application/octet-stream":
-                return True, "unknown", None
 
         return False, None, None

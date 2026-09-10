@@ -156,12 +156,6 @@ class TestPatterns:
         """Detect stealer family from file signatures."""
         assert detect_stealer_type(files) == expected
 
-    def test_detect_stealer_from_content(self):
-        """Test detection from content signatures."""
-        files = ["Passwords.txt"]
-        content = "=== REDLINE STEALER ==="
-        assert detect_stealer_type(files, content) == "redline"
-
 
 class TestCredentialParser:
     """Tests for credential parsing (production streaming path)."""
@@ -418,19 +412,6 @@ class TestExpandedStealerDetection:
     )
     def test_detect_stealer_by_files(self, files, expected):
         assert detect_stealer_type(files) == expected
-
-    # Content-based signatures
-    @pytest.mark.parametrize(
-        "content, expected",
-        [
-            ("Aurora Stealer v1.0", "aurora"),
-            ("MysticStealer build 2024", "mystic"),
-            ("Doenerium Grabber", "doenerium"),
-            ("titan stealer panel", "titan"),
-        ],
-    )
-    def test_detect_stealer_from_content(self, content, expected):
-        assert detect_stealer_type(["Passwords.txt"], content_sample=content) == expected
 
     # SystemInfo self-identification (highest priority)
     def test_sysinfo_overrides_file_signature(self):

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -161,6 +162,7 @@ def _extract_answer(stream: str) -> str:
 
 
 async def main() -> None:
+    _load_env()
     parser = argparse.ArgumentParser(description="Telegram ↔ opencode bridge")
     parser.add_argument("--prefix", default="!oc ", help="Command prefix (default '!oc ')")
     parser.add_argument("--timeout-min", type=int, default=60, help="opencode run timeout")
@@ -172,7 +174,6 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    _load_env()
     sys.path.insert(0, str(REPO_DIR))
 
     from telecrime.adapters.telegram import TelegramAdapter
@@ -185,15 +186,11 @@ async def main() -> None:
     state_path = data_dir / "tg_bridge_state.json"
     await _ensure_session_copy(session_path, live_path)
 
-    adapter = TelegramAdapter(config)
-    adapter.config.telegram.session_name = session_path.stem
     # Point the adapter at the bridge copy.
-    import dataclasses
-
     bridge_config = dataclasses.replace(
-        adapter.config,
+        config,
         telegram=dataclasses.replace(
-            adapter.config.telegram, session_name=session_path.stem
+            config.telegram, session_name=session_path.stem
         ),
     )
     adapter = TelegramAdapter(bridge_config)

@@ -54,11 +54,8 @@ def get_cached_engine(database_url: str):
 
     The web process creates 4 engines (app + 3 background workers); without
     caching that is up to 60 pooled connections against PG's default
-    max_connections=100. SQLite URLs are never cached (in-memory test DBs
-    must stay isolated).
+    max_connections=100.
     """
-    if database_url.startswith("sqlite:"):
-        return get_engine(database_url)
     return get_engine(database_url)
 
 

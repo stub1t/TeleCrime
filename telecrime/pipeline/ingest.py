@@ -29,14 +29,12 @@ class IngestStage(PipelineStage):
         "telegram premium",
     ]
 
-    def __init__(self, message_limit: int | None = None, priority_only: bool = False):
+    def __init__(self, priority_only: bool = False):
         """Initialize ingest stage.
 
         Args:
-            message_limit: Max messages to fetch per conversation (None = all)
             priority_only: If True, only ingest PRIORITY_USERNAMES channels (fast re-check)
         """
-        self.message_limit = message_limit
         self.priority_only = priority_only
 
     async def run(self, ctx: PipelineContext) -> bool:
@@ -95,11 +93,15 @@ class IngestStage(PipelineStage):
 
             for conv_info in conversations:
                 try:
-                    await self._process_conversation(ctx, conv_info)
-                    ctx.conversations_processed += 1
+                    messages, files_found = await self._process_conversation(
+                        ctx, conv_info
+                    )
                     # Commit after each conversation so we don't hold a long
                     # transaction open across multiple Telegram API calls.
                     ctx.session.commit()
+                    ctx.conversations_processed += 1
+                    ctx.messages_processed += messages
+                    ctx.files_discovered += files_found
                 except asyncio.CancelledError:
                     # MUST propagate: a reingest timeout (wait_for) cancels
                     # this task — swallowing it leaves a zombie task racing
@@ -140,27 +142,30 @@ class IngestStage(PipelineStage):
 
     async def _process_conversation(
         self, ctx: PipelineContext, conv_info: ConversationInfo
-    ) -> None:
-        """Process a single conversation."""
+    ) -> tuple[int, int]:
+        """Process a single conversation.
+
+        Returns:
+            Tuple of (messages iterated, files newly inserted).
+        """
         conv = self._upsert_conversation(ctx, conv_info)
 
         if not conv.is_accessible:
             logger.debug("Skipping inaccessible conversation: %s", conv.title)
-            return
+            return 0, 0
 
         # Fetch messages incrementally from last checkpoint
         min_id = conv.last_ingested_message_id
         message_count = 0
+        files_found = 0
         last_message_platform_id: int | None = None
 
         async for msg_info, files in ctx.adapter.iter_messages(
             conv_info.platform_id,
             min_id=min_id,
-            limit=self.message_limit,
         ):
-            await self._process_message(ctx, conv, msg_info, files)
+            files_found += await self._process_message(ctx, conv, msg_info, files)
             message_count += 1
-            ctx.messages_processed += 1
             last_message_platform_id = msg_info.platform_id
 
             # Update checkpoint periodically
@@ -179,6 +184,7 @@ class IngestStage(PipelineStage):
             message_count,
             conv.title,
         )
+        return message_count, files_found
 
     async def _process_message(
         self,
@@ -186,19 +192,24 @@ class IngestStage(PipelineStage):
         conv: Conversation,
         msg_info: MessageInfo,
         files: list[FileInfo],
-    ) -> None:
-        """Process a single message and its attachments."""
+    ) -> int:
+        """Process a single message and its attachments.
+
+        Returns:
+            Number of file attachments inserted (0 for duplicate messages).
+        """
         msg_id = self._insert_message(ctx, conv, msg_info)
         if msg_id is None:
-            return
+            return 0
 
-        self._insert_attachments(ctx, msg_id, files)
+        files_inserted = self._insert_attachments(ctx, msg_id, files)
 
         logger.debug(
             "Processed message %d with %d files",
             msg_info.platform_id,
             len(files),
         )
+        return files_inserted
 
     def _upsert_conversation(
         self,
@@ -273,10 +284,10 @@ class IngestStage(PipelineStage):
         ctx: PipelineContext,
         message_id: int,
         files: list[FileInfo],
-    ) -> None:
+    ) -> int:
         """Insert all attachments for a newly inserted message."""
         if not files:
-            return
+            return 0
 
         rows = [
             {
@@ -291,4 +302,4 @@ class IngestStage(PipelineStage):
             for file_info in files
         ]
         ctx.session.execute(get_dialect_insert(ctx.session)(FileAttachment).values(rows))
-        ctx.files_discovered += len(rows)
+        return len(rows)
