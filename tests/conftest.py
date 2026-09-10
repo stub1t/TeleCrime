@@ -23,6 +23,29 @@ from telecrime.models import Base
 PG_URL = os.environ.get("TELECRIME_TEST_DATABASE_URL", "")
 
 
+def _assert_safe_test_database(url: str) -> None:
+    """Refuse to run destructive fixtures against a non-test database.
+
+    ``pg_engine`` executes ``DROP SCHEMA public CASCADE``. On 2026-09-10 a
+    pytest run with ``TELECRIME_TEST_DATABASE_URL`` pointed at the production
+    database wiped the live dataset. Only databases whose name contains
+    "test" (e.g. CI's ``telecrime_test``) are accepted; set
+    ``TELECRIME_ALLOW_DESTRUCTIVE_TESTS=1`` to override deliberately.
+    """
+    from sqlalchemy.engine import make_url
+
+    db_name = (make_url(url).database or "").lower()
+    if "test" in db_name:
+        return
+    if os.environ.get("TELECRIME_ALLOW_DESTRUCTIVE_TESTS") == "1":
+        return
+    raise RuntimeError(
+        f"Refusing to DROP SCHEMA public in database {db_name!r}. "
+        "TELECRIME_TEST_DATABASE_URL must point at a dedicated test database "
+        "whose name contains 'test' (e.g. telecrime_test)."
+    )
+
+
 @pytest.fixture()
 def pg_engine():
     """PostgreSQL engine, reset before each test (skipped if no PG URL set).
@@ -33,6 +56,7 @@ def pg_engine():
     """
     if not PG_URL:
         pytest.skip("TELECRIME_TEST_DATABASE_URL not set — PG-only test skipped")
+    _assert_safe_test_database(PG_URL)
     engine = create_engine(PG_URL, pool_pre_ping=True)
 
     admin = create_engine(PG_URL, isolation_level="AUTOCOMMIT")

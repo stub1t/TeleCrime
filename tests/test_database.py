@@ -183,3 +183,36 @@ class TestDatabaseIntegration:
         pg_session.commit()
         assert pg_session.query(Message).filter_by(platform_id=200).first() is None
         assert pg_session.query(FileAttachment).filter_by(platform_file_id="file456").first() is None
+
+
+class TestDestructiveTestDatabaseGuard:
+    """Regression: pytest must never drop the production schema again.
+
+    On 2026-09-10 ``pytest tests/`` ran with TELECRIME_TEST_DATABASE_URL set to
+    the production database; the pg_engine fixture's DROP SCHEMA public CASCADE
+    wiped the live dataset.
+    """
+
+    def test_refuses_production_database(self):
+        from tests.conftest import _assert_safe_test_database
+
+        with pytest.raises(RuntimeError, match="Refusing to DROP SCHEMA"):
+            _assert_safe_test_database(
+                "postgresql://telecrime:telecrime@localhost:5432/telecrime"
+            )
+
+    def test_allows_test_databases(self):
+        from tests.conftest import _assert_safe_test_database
+
+        _assert_safe_test_database(
+            "postgresql://telecrime:telecrime@localhost:5432/telecrime_test"
+        )
+        _assert_safe_test_database("postgresql://telecrime:telecrime@localhost:5432/testdb")
+
+    def test_override_allows_production_database(self, monkeypatch):
+        from tests.conftest import _assert_safe_test_database
+
+        monkeypatch.setenv("TELECRIME_ALLOW_DESTRUCTIVE_TESTS", "1")
+        _assert_safe_test_database(
+            "postgresql://telecrime:telecrime@localhost:5432/telecrime"
+        )
