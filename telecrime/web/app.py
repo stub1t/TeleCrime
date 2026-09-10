@@ -531,12 +531,18 @@ def _credential_ids_via_fts(
         # the candidate fetch, so a pool trimmed to `limit` may contain zero
         # rows that pass the filter. Fetch 5× the target so filtered searches
         # still return `limit` matches (mirrors the search route's page_size*5).
+        #
+        # The helper already slices its pool, so pass the *whole* prefix we need
+        # (offset + fetch window) and let the SQL below apply OFFSET exactly
+        # once. Passing `offset` here too would skip page-1 candidates twice.
+        # The pool itself is bounded by the helper's per-column LIMIT 500, so a
+        # request larger than that returns at most the available pool rather
+        # than being truncated by this slice.
         fetch_limit = max(limit * 5, 50)
         candidate_ids = _pg_bounded_candidate_ids(
             session,
             terms=terms,
-            limit=fetch_limit,
-            offset=offset,
+            limit=offset + fetch_limit,
             timeout_ms=2500,
         )
         if not candidate_ids:
@@ -1303,14 +1309,21 @@ def _check_watchlist(engine, *, incremental_only: bool = False) -> None:
                     if incremental_only:
                         if item.last_checked_at is None:
                             continue
-                        delta = _watchlist_count(
-                            conn, item.query, item.match_type, since=item.last_checked_at,
-                        )
-                        item.new_count = int(item.new_count or 0) + delta
-                        item.last_known_count = int(item.last_known_count or 0) + delta
+                        if item.last_known_count is None or item.last_known_count < 0:
+                            # Unseeded baseline (initial count timed out): seed
+                            # with a full count WITHOUT alerting on history.
+                            count = _watchlist_count(conn, item.query, item.match_type)
+                            item.last_known_count = count
+                            item.new_count = 0
+                        else:
+                            delta = _watchlist_count(
+                                conn, item.query, item.match_type, since=item.last_checked_at,
+                            )
+                            item.new_count = int(item.new_count or 0) + delta
+                            item.last_known_count = int(item.last_known_count or 0) + delta
                     else:
                         count = _watchlist_count(conn, item.query, item.match_type)
-                        if item.last_known_count is None:
+                        if item.last_known_count is None or item.last_known_count < 0:
                             # Sentinel from a timed-out initial count: seed the
                             # baseline WITHOUT alerting on every historical
                             # match.
@@ -1404,7 +1417,11 @@ def _witem_dict(item) -> dict:
         "match_type": item.match_type,
         "enabled": 1 if item.enabled else 0,
         "last_checked_at": item.last_checked_at.isoformat() if item.last_checked_at else None,
-        "last_known_count": item.last_known_count,
+        "last_known_count": (
+            None
+            if item.last_known_count is None or item.last_known_count < 0
+            else item.last_known_count
+        ),
         "new_count": item.new_count,
         "last_viewed_at": item.last_viewed_at.isoformat() if item.last_viewed_at else None,
         "created_at": item.created_at.isoformat() if item.created_at else None,
@@ -2229,6 +2246,40 @@ def _build_jobs_rows(statuses, job_defs=None, *, prefer_status_interval=True) ->
     return rows
 
 
+def _normalize_password_scope(scope: str) -> PasswordScope | None:
+    """Parse a scope query param as a PasswordScope.
+
+    Accepts both the enum value ("conversation") and the legacy repr form
+    ("PasswordScope.CONVERSATION") that an older template rendered. Returns
+    None for an empty or unrecognized value.
+    """
+    if not scope:
+        return None
+    try:
+        return PasswordScope(scope.rsplit(".", 1)[-1].strip().lower())
+    except ValueError:
+        return None
+
+
+def _claim_cred_counts_refresh(cache: dict, ttl: float) -> bool:
+    """Single-flight claim for the background credential-count refresh.
+
+    Returns True exactly once per TTL window, marking the refresh in-flight
+    and stamping the cache fresh so concurrent HTMX polls can't spawn
+    duplicate COUNT/JOIN threads (a refresh may run for up to 120s). The
+    caller must clear ``cache["refreshing"]`` when the refresh finishes.
+    """
+    with cache["lock"]:
+        if cache["refreshing"]:
+            return False
+        now = time.monotonic()
+        if now - cache["ts"] <= ttl:
+            return False
+        cache["refreshing"] = True
+        cache["ts"] = now
+        return True
+
+
 def create_app(database_url: str | None = None) -> FastAPI:
     """Create FastAPI app bound to the Telecrime database."""
     engine = get_engine(database_url)
@@ -2411,9 +2462,14 @@ def create_app(database_url: str | None = None) -> FastAPI:
     _ops_cache: dict = {"ts": 0.0, "html": None}
     _ops_cache_lock = threading.Lock()
     # Background cache for the slow credential-count JOIN (229M+ rows).
-    # Refreshed in a daemon thread so it never blocks a request.
-    _cred_counts_cache: dict = {"ts": 0.0, "data": {}, "lock": None}
-    _cred_counts_cache["lock"] = threading.Lock()
+    # Refreshed in a daemon thread so it never blocks a request. The
+    # "refreshing" flag and stamp claim make the spawn single-flight.
+    _cred_counts_cache: dict = {
+        "ts": 0.0,
+        "data": {},
+        "refreshing": False,
+        "lock": threading.Lock(),
+    }
 
     def _refresh_cred_counts_bg(group_ids: list[int]) -> None:
         """Run the slow COUNT JOIN in a daemon thread; update _cred_counts_cache."""
@@ -2430,9 +2486,11 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 result = dict(rows)
         except Exception:
             result = {}
-        with _cred_counts_cache["lock"]:
-            _cred_counts_cache["data"] = result
-            _cred_counts_cache["ts"] = time.monotonic()
+        finally:
+            with _cred_counts_cache["lock"]:
+                _cred_counts_cache["data"] = result
+                _cred_counts_cache["ts"] = time.monotonic()
+                _cred_counts_cache["refreshing"] = False
 
     @app.get("/api/home/ops-fragment", response_class=HTMLResponse)
     def home_ops_fragment(request: Request):
@@ -2522,10 +2580,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 # that were cleaned before the denormalized column was added.
                 with _cred_counts_cache["lock"]:
                     cred_counts = _cred_counts_cache["data"]
-                    counts_age = now - _cred_counts_cache["ts"]
                 needs_refresh = any(r.credential_count == 0 for r in recent_groups)
                 counts_refresh_ttl = 90 if not is_running else 300
-                if needs_refresh and not is_running and counts_age > counts_refresh_ttl:
+                if (
+                    needs_refresh
+                    and not is_running
+                    and _claim_cred_counts_refresh(_cred_counts_cache, counts_refresh_ttl)
+                ):
                     t = threading.Thread(
                         target=_refresh_cred_counts_bg,
                         args=(group_ids,),
@@ -2664,11 +2725,26 @@ def create_app(database_url: str | None = None) -> FastAPI:
             job = session.get(ExtractionJob, job_id)
             if not job:
                 return JSONResponse({"error": "Not found"}, status_code=404)
-            # Insert password candidate scoped to the job's conversation
+            # ExtractionJob has no source_conversation_id column; the source
+            # conversation is reachable through the group → part → artifact →
+            # attachment → message chain (same as _triage_payload).
+            conversation_id = None
+            if job.group and job.group.parts:
+                part = job.group.parts[0]
+                if part.artifact and part.artifact.attachment:
+                    message = part.artifact.attachment.message
+                    if message:
+                        conversation_id = message.conversation_id
+            # Insert password candidate scoped to the job's conversation when
+            # resolvable, otherwise fall back to a global candidate.
             candidate = PasswordCandidate(
                 value=password,
-                scope=PasswordScope.CONVERSATION if job.source_conversation_id else PasswordScope.GLOBAL,
-                conversation_id=job.source_conversation_id,
+                scope=(
+                    PasswordScope.CONVERSATION
+                    if conversation_id is not None
+                    else PasswordScope.GLOBAL
+                ),
+                conversation_id=conversation_id,
                 extraction_method="manual",
                 context_text=f"Added manually from triage for job {job_id}",
                 confidence=0.95,
@@ -2785,7 +2861,6 @@ def create_app(database_url: str | None = None) -> FastAPI:
         results = SearchResults([], [], [], [], [], [], [])
         total_credentials = None
         facets_enabled = facets
-        decorated_facets: dict[str, list[dict[str, str | int]]] = {}
         saved_searches: list[dict[str, str]] = []
         fts_used = False
         has_more = False
@@ -3192,7 +3267,6 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 "result_counts": result_counts,
                 "last_id": last_id,
                 "channel_map": channel_map,
-                "facets": decorated_facets,
                 "active_filters": active_filters,
                 "saved_searches": saved_searches,
                 "regex": regex,
@@ -4644,9 +4718,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     return _watchlist_count(conn, query, match_type)
                 except Exception:
                     # Query too expensive for the 30s budget — accept the item
-                    # with an UNKNOWN count. None is stored as a sentinel so
-                    # the background worker seeds the baseline WITHOUT firing
-                    # every historical match as a new alert.
+                    # with an UNKNOWN count. The route stores -1 as the sentinel
+                    # so the background worker seeds the baseline WITHOUT
+                    # firing every historical match as a new alert.
                     return None
 
         try:
@@ -4661,7 +4735,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 label=label,
                 query=query,
                 match_type=match_type,
-                last_known_count=count,
+                # -1 = unknown baseline (initial count timed out). The model
+                # column is NOT NULL with default 0, so an explicit None would
+                # be stored as 0 and the seed branch would never fire.
+                last_known_count=-1 if count is None else count,
                 new_count=0,
             ))
             session.commit()
@@ -5104,8 +5181,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
         with get_session(engine) as session:
             q = session.query(PasswordCandidate)
 
-            if scope:
-                q = q.filter(PasswordCandidate.scope == scope)
+            scope_value = _normalize_password_scope(scope)
+            if scope_value is not None:
+                q = q.filter(PasswordCandidate.scope == scope_value)
             if method:
                 q = q.filter(PasswordCandidate.extraction_method == method)
 
@@ -5150,7 +5228,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     "page": page,
                     "pages": pages,
                     "limit": limit,
-                    "scope": scope,
+                    "scope": scope_value.value if scope_value is not None else "",
                     "method": method,
                     "sort": sort,
                     "scopes": sorted(scopes),
@@ -5173,10 +5251,11 @@ def create_app(database_url: str | None = None) -> FastAPI:
     ):
         def row_iter():
             yield "id,value,scope,extraction_method,confidence,times_succeeded,times_failed,context_text,created_at\n"
+            scope_value = _normalize_password_scope(scope)
             with get_session(engine) as session:
                 q = session.query(PasswordCandidate)
-                if scope:
-                    q = q.filter(PasswordCandidate.scope == scope)
+                if scope_value is not None:
+                    q = q.filter(PasswordCandidate.scope == scope_value)
                 if method:
                     q = q.filter(PasswordCandidate.extraction_method == method)
                 if sort == "success":

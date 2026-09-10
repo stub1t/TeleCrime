@@ -2,31 +2,46 @@
 
 import asyncio
 import json
+import threading
+import time
 from datetime import UTC, datetime
 from typing import Any, cast
+from urllib.parse import urlencode
 
-from telecrime.database import get_session
+from starlette.requests import Request
+
+from telecrime.database import get_engine, get_session, init_db
 from telecrime.models import (
     ArchiveGroup,
+    ArchiveGroupPart,
     Conversation,
     DownloadArtifact,
     ExtractionJob,
     FileAttachment,
     Message,
     ParsedCredential,
+    PasswordCandidate,
 )
 from telecrime.models.watchlist import WatchlistItem
-from telecrime.states import DownloadStatus, ExtractionStatus
+from telecrime.states import (
+    DownloadStatus,
+    ExtractionStatus,
+    GroupStatus,
+    PasswordScope,
+)
 from telecrime.web.app import (
     _check_watchlist,
+    _claim_cred_counts_refresh,
     _credential_ids_via_fts,
     _ensure_search_infra,
     _message_ids_via_fts,
+    _normalize_password_scope,
     _pipeline_running_for_heavy_web_work,
     _preferred_table_estimate,
     _search_for_export,
     _stats_cache_path,
     _triage_payload,
+    _witem_dict,
     create_app,
 )
 
@@ -506,3 +521,361 @@ def test_errors_json_count_tolerates_malformed():
     assert _errors_json_count("not json") == 0
     assert _errors_json_count('{"a": 1}') == 0
     assert _errors_json_count('["one", "two"]') == 2
+
+
+def _web_request(
+    *, method: str = "GET", form: dict[str, str] | None = None
+) -> Request:
+    """Minimal ASGI request; `form` makes request.form() parsable."""
+    body = urlencode(form or {}).encode()
+    pending = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive():
+        return pending.pop(0) if pending else {"type": "http.disconnect"}
+
+    headers = (
+        [(b"content-type", b"application/x-www-form-urlencoded")] if form is not None else []
+    )
+    return Request(
+        {
+            "type": "http",
+            "method": method,
+            "path": "/",
+            "query_string": b"",
+            "headers": headers,
+        },
+        receive,
+    )
+
+
+def _route(app, path: str, method: str | None = None):
+    routes = [r for r in app.routes if getattr(r, "path", None) == path]
+    if method is not None:
+        routes = [
+            r for r in routes if method in (getattr(r, "methods", None) or set())
+        ]
+    return cast(Any, routes[0])
+
+
+def _sqlite_app(tmp_path):
+    """create_app bound to a file-backed SQLite DB, returning (app, engine)."""
+    url = f"sqlite:///{tmp_path / 'webtest.db'}"
+    seed_engine = get_engine(url)
+    init_db(seed_engine)
+    return create_app(url), seed_engine
+
+
+def test_triage_add_password_scopes_candidate_to_source_conversation(tmp_path):
+    """FIX 1: the route must not touch job.source_conversation_id (no such column)
+    and must scope the candidate via the group chain."""
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        conv = Conversation(platform_id=1, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=10,
+            platform_timestamp=datetime.now(UTC),
+            text="archive password",
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id, platform_file_id="file1", filename="sample.zip"
+        )
+        session.add(attachment)
+        session.flush()
+        artifact = DownloadArtifact(
+            attachment_id=attachment.id, status=DownloadStatus.COMPLETED
+        )
+        session.add(artifact)
+        session.flush()
+        group = ArchiveGroup(
+            fingerprint="pw-chain",
+            base_name="sample.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+        )
+        session.add(group)
+        session.flush()
+        session.add(
+            ArchiveGroupPart(group_id=group.id, artifact_id=artifact.id, part_index=0)
+        )
+        job = ExtractionJob(
+            group_id=group.id,
+            status=ExtractionStatus.PASSWORD_NEEDED,
+            target_extensions=".txt",
+        )
+        session.add(job)
+        session.flush()
+        job_id = job.id
+        conversation_id = conv.id
+
+    response = asyncio.run(
+        _route(app, "/triage/add-password/{job_id}").endpoint(
+            job_id=job_id,
+            request=_web_request(method="POST", form={"password": "hunter2"}),
+        )
+    )
+    assert response.status_code == 200
+
+    with get_session(seed_engine) as session:
+        candidate = session.query(PasswordCandidate).one()
+        assert candidate.value == "hunter2"
+        assert candidate.scope == PasswordScope.CONVERSATION
+        assert candidate.conversation_id == conversation_id
+        assert session.get(ExtractionJob, job_id).status == ExtractionStatus.PENDING
+        assert session.get(ArchiveGroup, group.id).status == GroupStatus.READY
+
+
+def test_triage_add_password_falls_back_to_global_without_chain(tmp_path):
+    """FIX 1: a job whose group has no parts yields a GLOBAL candidate."""
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        group = ArchiveGroup(
+            fingerprint="pw-orphan",
+            base_name=None,
+            expected_part_count=1,
+            detected_part_count=0,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(
+            group_id=group.id,
+            status=ExtractionStatus.FAILED_TERMINAL,
+            target_extensions=".txt",
+        )
+        session.add(job)
+        session.flush()
+        job_id = job.id
+
+    response = asyncio.run(
+        _route(app, "/triage/add-password/{job_id}").endpoint(
+            job_id=job_id,
+            request=_web_request(method="POST", form={"password": "fallback-pw"}),
+        )
+    )
+    assert response.status_code == 200
+
+    with get_session(seed_engine) as session:
+        candidate = session.query(PasswordCandidate).one()
+        assert candidate.scope == PasswordScope.GLOBAL
+        assert candidate.conversation_id is None
+
+
+def test_credential_fts_pagination_page_two_returns_next_distinct_rows(pg_session):
+    """FIX 2: offset must be applied exactly once; page 2 is not skipped."""
+    from telecrime.fts import ensure_fts
+
+    ensure_fts(pg_session.bind)
+    pg_session.add_all(
+        [
+            ParsedCredential(
+                url=f"https://site{i}.example/login",
+                domain=f"site{i}.example",
+                username=f"pagecheck{i}",
+                password=f"pw{i}",
+                credential_hash=ParsedCredential.compute_hash(
+                    f"site{i}.example", f"pagecheck{i}", f"pw{i}"
+                ),
+            )
+            for i in range(6)
+        ]
+    )
+    pg_session.commit()
+
+    page_size = 3
+    page1 = _credential_ids_via_fts(
+        pg_session,
+        terms="pagecheck",
+        filters={},
+        exclude_conversation_ids=set(),
+        limit=page_size,
+        offset=0,
+    )
+    page2 = _credential_ids_via_fts(
+        pg_session,
+        terms="pagecheck",
+        filters={},
+        exclude_conversation_ids=set(),
+        limit=page_size,
+        offset=page_size,
+    )
+
+    all_ids = [
+        row[0] for row in pg_session.query(ParsedCredential.id).order_by(ParsedCredential.id.desc())
+    ]
+    assert page1 == all_ids[:page_size]
+    assert page2 == all_ids[page_size : page_size * 2]
+    assert set(page1).isdisjoint(page2)
+
+
+def test_watchlist_unknown_baseline_seeds_without_alerting(pg_engine):
+    """FIX 3: -1 sentinel must seed the baseline instead of alerting history."""
+    with get_session(pg_engine) as session:
+        session.add(
+            WatchlistItem(
+                label="unknown",
+                query="seedcheck",
+                match_type="any",
+                enabled=True,
+                last_known_count=-1,
+                new_count=0,
+            )
+        )
+        session.add_all(
+            [
+                ParsedCredential(
+                    url=f"https://seed{i}.example/login",
+                    domain=f"seed{i}.example",
+                    username=f"seedcheck{i}",
+                    password="pw",
+                    credential_hash=ParsedCredential.compute_hash(
+                        f"seed{i}.example", f"seedcheck{i}", "pw"
+                    ),
+                )
+                for i in range(2)
+            ]
+        )
+
+    _check_watchlist(pg_engine)
+
+    with get_session(pg_engine) as session:
+        item = session.query(WatchlistItem).one()
+        assert item.new_count == 0
+        assert item.last_known_count == 2
+        assert item.last_checked_at is not None
+
+
+def test_watchlist_unknown_baseline_seeds_in_incremental_mode(pg_engine):
+    """FIX 3: incremental checks treat -1 as unseeded, never as a baseline."""
+    checked_at = datetime(2026, 4, 26, 7, 0, tzinfo=UTC)
+    with get_session(pg_engine) as session:
+        session.add(
+            WatchlistItem(
+                label="unknown",
+                query="incrseed",
+                match_type="any",
+                enabled=True,
+                last_checked_at=checked_at,
+                last_known_count=-1,
+                new_count=0,
+            )
+        )
+        session.add_all(
+            [
+                ParsedCredential(
+                    url=f"https://incr{i}.example/login",
+                    domain=f"incr{i}.example",
+                    username=f"incrseed{i}",
+                    password="pw",
+                    created_at=datetime(2026, 4, 26, 6, 30, tzinfo=UTC),
+                    credential_hash=ParsedCredential.compute_hash(
+                        f"incr{i}.example", f"incrseed{i}", "pw"
+                    ),
+                )
+                for i in range(2)
+            ]
+        )
+
+    _check_watchlist(pg_engine, incremental_only=True)
+
+    with get_session(pg_engine) as session:
+        item = session.query(WatchlistItem).one()
+        assert item.new_count == 0
+        assert item.last_known_count == 2
+
+
+def test_watchlist_add_stores_unknown_sentinel_when_count_fails(pg_engine, monkeypatch):
+    """FIX 3: explicit None would be stored as 0; the route stores -1 instead."""
+    from telecrime.web import app as web_app
+
+    app = create_app(pg_engine.url.render_as_string(hide_password=False))
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("count too slow")
+
+    monkeypatch.setattr(web_app, "_watchlist_count", _boom)
+
+    response = asyncio.run(
+        _route(app, "/api/watchlist", "POST").endpoint(
+            request=_web_request(method="POST", form={"query": "unknown-count"})
+        )
+    )
+    assert response.status_code == 200
+
+    with get_session(pg_engine) as session:
+        item = session.query(WatchlistItem).one()
+        assert item.last_known_count == -1
+        assert _witem_dict(item)["last_known_count"] is None
+
+
+def test_normalize_password_scope_accepts_value_and_repr():
+    """FIX 4: templates used to render `PasswordScope.CONVERSATION`."""
+    assert _normalize_password_scope("conversation") == PasswordScope.CONVERSATION
+    assert (
+        _normalize_password_scope("PasswordScope.CONVERSATION")
+        == PasswordScope.CONVERSATION
+    )
+    assert _normalize_password_scope("  Conversation  ") == PasswordScope.CONVERSATION
+    assert _normalize_password_scope("") is None
+    assert _normalize_password_scope("bogus") is None
+
+
+def test_passwords_scope_filter_matches_enum_value(tmp_path):
+    """FIX 4: /passwords must filter by scope and highlight the selection."""
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        session.add_all(
+            [
+                PasswordCandidate(
+                    value="convo-pw",
+                    scope=PasswordScope.CONVERSATION,
+                    extraction_method="manual",
+                    confidence=0.9,
+                ),
+                PasswordCandidate(
+                    value="global-pw",
+                    scope=PasswordScope.GLOBAL,
+                    extraction_method="manual",
+                    confidence=0.8,
+                ),
+            ]
+        )
+
+    route = _route(app, "/passwords")
+    for raw in ("conversation", "PasswordScope.CONVERSATION"):
+        response = route.endpoint(
+            request=_web_request(),
+            scope=raw,
+            method="",
+            sort="success",
+            page=1,
+            limit=50,
+        )
+        assert response.status_code == 200
+        assert response.context["scope"] == "conversation"
+        assert [c.value for c in response.context["candidates"]] == ["convo-pw"]
+
+    body = bytes(response.body).decode()
+    assert '<option value="conversation"' in body
+    assert "PasswordScope.CONVERSATION" not in body
+
+
+def test_claim_cred_counts_refresh_is_single_flight():
+    """FIX 6: concurrent stale polls may start at most one refresh."""
+    cache: dict = {"ts": 0.0, "data": {}, "refreshing": False, "lock": threading.Lock()}
+    assert _claim_cred_counts_refresh(cache, 90) is True
+    assert cache["refreshing"] is True
+    assert _claim_cred_counts_refresh(cache, 90) is False  # refresh in flight
+    assert _claim_cred_counts_refresh(cache, 90) is False
+
+    with cache["lock"]:  # refresh finished and stamped fresh
+        cache["refreshing"] = False
+        cache["ts"] = time.monotonic()
+    assert _claim_cred_counts_refresh(cache, 90) is False
+
+    with cache["lock"]:  # stale again later
+        cache["ts"] = 0.0
+    assert _claim_cred_counts_refresh(cache, 90) is True
