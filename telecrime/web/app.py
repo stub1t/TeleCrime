@@ -3427,7 +3427,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 return JSONResponse(_decorate_facets(facet_counts, terms, filters))
 
             for facet_key, col_name in facet_columns.items():
-                if app.state.fts_enabled and not False:
+                if app.state.fts_enabled:
                     try:
                         rows = session.execute(
                             text(

@@ -47,21 +47,6 @@ class Credential:
             except Exception:
                 pass
 
-    def to_dict(self) -> dict[str, object]:
-        """Convert to dictionary."""
-        return {
-            "url": self.url,
-            "username": self.username,
-            "password": self.password,
-            "domain": self.domain,
-            "email_domain": self.email_domain,
-            "application": self.application,
-            "profile": self.profile,
-            "source_file": self.source_file,
-            "line_number": self.line_number,
-        }
-
-
 @dataclass
 class SystemInfo:
     """System information extracted from stealer logs."""
@@ -81,22 +66,3 @@ class SystemInfo:
     log_date: datetime | None = None
     # Stealer self-identification from SystemInfo.txt (highest-confidence detection)
     stealer_name: str | None = None
-
-    def to_dict(self) -> dict[str, object]:
-        """Convert to dictionary."""
-        return {
-            "hostname": self.hostname,
-            "username": self.username,
-            "ip_address": self.ip_address,
-            "country": self.country,
-            "hwid": self.hwid,
-            "os": self.os,
-            "cpu": self.cpu,
-            "gpu": self.gpu,
-            "ram": self.ram,
-            "timezone": self.timezone,
-            "language": self.language,
-            "screen_size": self.screen_size,
-            "log_date": self.log_date.isoformat() if self.log_date else None,
-            "stealer_name": self.stealer_name,
-        }

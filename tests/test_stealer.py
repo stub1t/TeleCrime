@@ -45,20 +45,6 @@ class TestCredentialModel:
         cred = Credential(url="example.com/path", username="user", password="pass")
         assert cred.domain == "example.com"
 
-    def test_to_dict(self):
-        """Test conversion to dictionary."""
-        cred = Credential(
-            url="https://example.com",
-            username="user",
-            password="pass",
-            application="Chrome",
-        )
-        d = cred.to_dict()
-        assert d["url"] == "https://example.com"
-        assert d["username"] == "user"
-        assert d["application"] == "Chrome"
-
-
 class TestCredentialHash:
     """Tests for ParsedCredential.compute_hash."""
 

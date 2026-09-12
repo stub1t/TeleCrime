@@ -105,12 +105,6 @@ class PipelineDisplay:
             self._live = None
         self._restore_loggers()
 
-    def __enter__(self) -> "PipelineDisplay":
-        return self.start()
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        self.stop()
-
     def _suppress_loggers(self) -> None:
         """Set telecrime loggers to WARNING while display is active."""
         for name in [
