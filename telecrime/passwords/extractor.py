@@ -4,7 +4,7 @@ import os
 import re
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from telecrime.models import Conversation, Message, PasswordCandidate
@@ -92,6 +92,43 @@ def extract_inline_passwords(text: str) -> list[tuple[str, float]]:
     return results
 
 
+def _nearby_messages(session: Session, message: Message, nearby_count: int) -> list[Message]:
+    """Return the up to ``nearby_count * 2`` messages nearest to ``message``.
+
+    Two bounded scans on the (conversation_id, platform_id) unique index
+    replace the old global ``ORDER BY abs(platform_id - :pid)`` sort, which
+    could not use the index and sorted every message in the conversation.
+    Fetching ``nearby_count * 2`` per side before the Python sort/limit keeps
+    the same resulting set as the old query.
+    """
+    if nearby_count <= 0:
+        return []
+    limit = nearby_count * 2
+    lower = session.execute(
+        select(Message)
+        .where(
+            Message.conversation_id == message.conversation_id,
+            Message.platform_id < message.platform_id,
+        )
+        .order_by(Message.platform_id.desc())
+        .limit(limit)
+    ).scalars().all()
+    upper = session.execute(
+        select(Message)
+        .where(
+            Message.conversation_id == message.conversation_id,
+            Message.platform_id > message.platform_id,
+        )
+        .order_by(Message.platform_id.asc())
+        .limit(limit)
+    ).scalars().all()
+    nearby = sorted(
+        list(lower) + list(upper),
+        key=lambda candidate: abs(candidate.platform_id - message.platform_id),
+    )
+    return nearby[: nearby_count * 2]
+
+
 async def extract_passwords_from_context(
     session: Session,
     message: Message,
@@ -121,6 +158,25 @@ async def extract_passwords_from_context(
     candidates: list[PasswordCandidate] = []
     seen_values: set[str] = set()
 
+    # Reuse existing candidates instead of inserting a fresh row for the same
+    # (conversation, value, scope) on every archive: without this, never-tried
+    # rows accumulate forever and _get_password_candidates scans them all.
+    existing_keys: set[tuple[str, PasswordScope]] = {
+        (value, scope)
+        for value, scope in session.execute(
+            select(PasswordCandidate.value, PasswordCandidate.scope).where(
+                PasswordCandidate.conversation_id == message.conversation_id
+            )
+        ).all()
+    }
+
+    def is_new(value: str, scope: PasswordScope) -> bool:
+        key = (value, scope)
+        if key in existing_keys:
+            return False
+        existing_keys.add(key)
+        return True
+
     # 0. Get channel username as highest priority password
     conversation = session.execute(
         select(Conversation).where(Conversation.id == message.conversation_id)
@@ -144,6 +200,8 @@ async def extract_passwords_from_context(
             if normalized in seen_values:
                 continue
             if not _is_valid_password(normalized):
+                continue
+            if not is_new(normalized, PasswordScope.MESSAGE):
                 continue
             seen_values.add(normalized)
             candidate = PasswordCandidate(
@@ -169,6 +227,8 @@ async def extract_passwords_from_context(
             continue
         if not _is_valid_password(normalized):
             continue
+        if not is_new(normalized, PasswordScope.MESSAGE):
+            continue
         seen_values.add(normalized)
         candidate = PasswordCandidate(
             value=normalized,
@@ -191,6 +251,8 @@ async def extract_passwords_from_context(
                 continue
             if not _is_valid_password(normalized):
                 continue
+            if not is_new(normalized, PasswordScope.MESSAGE):
+                continue
             seen_values.add(normalized)
             candidate = PasswordCandidate(
                 value=normalized,
@@ -212,6 +274,8 @@ async def extract_passwords_from_context(
                 continue
             if not _is_valid_password(normalized):
                 continue
+            if not is_new(normalized, PasswordScope.MESSAGE):
+                continue
             seen_values.add(normalized)
             candidate = PasswordCandidate(
                 value=normalized,
@@ -226,18 +290,7 @@ async def extract_passwords_from_context(
             candidates.append(candidate)
 
     # 3. Extract from nearby messages
-    nearby = session.execute(
-        select(Message)
-        .where(
-            Message.conversation_id == message.conversation_id,
-            Message.platform_id != message.platform_id,
-        )
-        .order_by(
-            # Get messages close to this one by platform_id
-            func.abs(Message.platform_id - message.platform_id)
-        )
-        .limit(nearby_count * 2)  # Get both before and after
-    ).scalars().all()
+    nearby = _nearby_messages(session, message, nearby_count)
 
     for nearby_msg in nearby:
         text = nearby_msg.caption or nearby_msg.text or ""
@@ -248,6 +301,8 @@ async def extract_passwords_from_context(
             if normalized in seen_values:
                 continue
             if not _is_valid_password(normalized):
+                continue
+            if not is_new(normalized, PasswordScope.NEARBY):
                 continue
             seen_values.add(normalized)
             # Lower confidence for nearby messages
@@ -281,6 +336,8 @@ async def extract_passwords_from_context(
             continue
         if not _is_valid_password(normalized):
             continue
+        if not is_new(normalized, PasswordScope.LEARNED):
+            continue
         seen_values.add(normalized)
         # Create a new candidate referencing the learned one
         candidate = PasswordCandidate(
@@ -310,6 +367,8 @@ async def extract_passwords_from_context(
             continue
         # Avoid weak alpha-only file passwords unless long enough
         if normalized.isalpha() and len(normalized) < 8:
+            continue
+        if not is_new(normalized, PasswordScope.GLOBAL):
             continue
         seen_values.add(normalized)
         candidate = PasswordCandidate(

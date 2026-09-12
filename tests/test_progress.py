@@ -37,6 +37,47 @@ def test_progress_path_uses_configured_data_dir(tmp_path, monkeypatch):
     assert _progress_path() == data_dir / "pipeline_progress.json"
 
 
+def test_failed_stage_not_promoted_to_completed(tmp_path, monkeypatch):
+    """Regression: stage_error() left _current_stage set, so the next
+    stage_start() promoted the FAILED stage into stages_completed —
+    reporting it as both failed and completed."""
+    monkeypatch.setenv("TELECRIME_PROGRESS_FILE", str(tmp_path / "p.json"))
+    w = PipelineProgressWriter()
+    try:
+        w.stage_start("extract")
+        w.stage_error("extract")
+
+        assert w._current_stage is None
+        w.stage_start("parse")
+
+        assert "extract" in w._stages_failed
+        assert "extract" not in w._stages_completed
+        assert w._current_stage == "parse"
+    finally:
+        try:
+            w.finish()
+        except Exception:
+            pass
+
+
+def test_stage_start_does_not_promote_failed_stage(tmp_path, monkeypatch):
+    """Defense in depth: a stage already recorded as failed is never appended
+    to stages_completed when a new stage starts."""
+    monkeypatch.setenv("TELECRIME_PROGRESS_FILE", str(tmp_path / "p.json"))
+    w = PipelineProgressWriter()
+    try:
+        w._current_stage = "extract"
+        w._stages_failed.append("extract")
+        w.stage_start("parse")
+
+        assert "extract" not in w._stages_completed
+    finally:
+        try:
+            w.finish()
+        except Exception:
+            pass
+
+
 def test_heartbeat_marks_progress_for_ingest_stage(tmp_path, monkeypatch):
     """Regression: heartbeat must update last_progress_at for stages other
     than extract/parse, so the watchdog doesn't kill a long ingest/discover."""

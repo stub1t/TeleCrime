@@ -27,13 +27,16 @@ from telecrime.models import (
     Message,
     PipelineRun,
 )
+from telecrime.pipeline.constants import EXTRACTION_MAX_ATTEMPTS
 from telecrime.pipeline.lock import pipeline_run_lock
 from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
 
 # Maximum extraction attempts per group before startup recovery gives up and
 # marks the group FAILED_TERMINAL. Bounds both the FAILED→READY retry loop and
 # the PASSWORD_NEEDED→PENDING reset (each run counts one attempt).
-_EXTRACTION_MAX_ATTEMPTS = 3
+# The shared value lives in constants.py (finalize uses it too); keep the
+# historical private alias for existing imports/tests.
+_EXTRACTION_MAX_ATTEMPTS = EXTRACTION_MAX_ATTEMPTS
 
 # Max READY groups selected per main-loop pass. Bounds the per-pass task set;
 # remaining READY groups are drained by the post-download sweep / next pass.

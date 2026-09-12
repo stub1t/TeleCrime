@@ -563,10 +563,21 @@ _COMBO_EDGE_LINES = [
     "https://example.com:user@example.com:secret123 | HTTPS://T.ME/X YOU CAN BUY DM @X",
     "https://x.com:u:p\x00withnul",
     "https://x.com:user:secret123 | https://t.me/SampleCloud You can buy dm @SampleCloud",
+    "https://www.roblox.com/login AXefep:ihateleah",
+    "https://github.com/login octocat hunter2",
+    "https://example.com/portal octocat hunter2",
     "some random text",
     "---",
     "https://example.com",
 ]
+
+
+def _space_space_fmt(h, u, p):
+    """Space/space row with a whitespace-free password (the parser requires
+    single tokens there, so whitespace would turn the row into prose junk and
+    skew the combo-classification ratio of the synthetic corpus)."""
+    token = "".join(p.split()) or "pw"
+    return f"https://{h} {u} {token}"
 
 
 def _random_combo_lines(seed, n):
@@ -588,6 +599,8 @@ def _random_combo_lines(seed, n):
         lambda h, u, p: f"http://{h};{u};{p}",
         lambda h, u, p: f"https://{h}:8080:{u}:{p}",
         lambda h, u, p: f"https://{h}/a/b?c=1:{u}:{p}",
+        lambda h, u, p: f"https://{h} {u}:{p}",
+        _space_space_fmt,
     ]
     out = []
     for _ in range(n):
@@ -627,6 +640,9 @@ class TestComboFastPath:
         assert _classify_combo_head([]) is False
         assert _classify_combo_head(["https://a.com:u:p", "", "  "]) is True
         assert _classify_combo_head(["https://a.com:u:p", "", "---"]) is False
+        # Space-separated combo rows count as combo too.
+        assert _classify_combo_head(["https://a.com/login u:p"]) is True
+        assert _classify_combo_head(["https://a.com/login user pass"]) is True
         # Bare-URL junk rows look labeled ("https" : "//x.com") but can never
         # seed a block credential — they must not veto the fast path.
         assert _classify_combo_head(
@@ -653,7 +669,7 @@ class TestComboFastPath:
 
         slow = list(_iter_credentials_from_lines_slow(iter(_COMBO_EDGE_LINES), None))
         fast = list(_iter_combo_lines(iter(_COMBO_EDGE_LINES), None))
-        assert len(slow) == 21
+        assert len(slow) == 24
         assert slow == fast
 
     @pytest.mark.parametrize("seed", [7, 42, 99, 2024])
@@ -735,3 +751,301 @@ Password: pass123
                 parse_credential_lines(iter(lines[start : start + 250]), src)
             )
         assert split == combined
+
+    def test_explicit_combo_decision_overrides_chunk_head(self):
+        """A chunk worker receives the true file-head decision; a later chunk
+        whose own head looks combo-only must still parse its labeled rows."""
+        from telecrime.stealer.parser import (
+            _COMBO_CLASS_CACHE,
+            _classify_combo_head,
+            parse_credential_lines,
+        )
+
+        src = "combo-fast-explicit-decision-1"
+        _COMBO_CLASS_CACHE.pop(src, None)
+        chunk = [f"https://site{i}.com:user{i}:pass{i}" for i in range(300)]
+        chunk += ["Host: https://late.example", "Login: late", "Password: latepw"]
+
+        # This chunk alone would classify as a pure combo file.
+        assert _classify_combo_head(chunk[:200]) is True
+
+        creds = list(parse_credential_lines(iter(chunk), src, combo_decision=False))
+        assert len(creds) == 301  # 300 combo rows + labeled "late"
+        assert any(c.username == "late" and c.password == "latepw" for c in creds)
+        # A passed decision must not seed (or mutate) the per-file cache.
+        assert src not in _COMBO_CLASS_CACHE
+
+        # The hybrid fast path now feeds non-combo lines through the labeled
+        # parser even without the explicit decision, so the labeled row is no
+        # longer dropped when a chunk misclassifies itself.
+        dropped = list(parse_credential_lines(iter(chunk), src))
+        assert len(dropped) == 301
+        assert any(c.username == "late" and c.password == "latepw" for c in dropped)
+        assert _COMBO_CLASS_CACHE.get(src) is True
+
+
+class TestSpaceSeparatedComboFormats:
+    """Round-14 fix 1: ``URL user:pass`` / ``URL user pass`` combo rows were
+    dropped by every parser path (real ULP samples: ~92k + ~1.7k lines)."""
+
+    def _stream(self, tmp_path, text):
+        f = tmp_path / "Passwords.txt"
+        f.write_text(text, encoding="utf-8")
+        return list(iter_credentials_file(f))
+
+    def test_real_sample_space_colon(self, tmp_path):
+        creds = self._stream(tmp_path, "https://www.roblox.com/login AXefep:ihateleah\n")
+        assert len(creds) == 1
+        assert creds[0].url == "https://www.roblox.com/login"
+        assert creds[0].username == "AXefep"
+        assert creds[0].password == "ihateleah"
+
+    def test_space_space(self, tmp_path):
+        creds = self._stream(tmp_path, "https://example.com/portal octocat hunter2\n")
+        assert len(creds) == 1
+        assert (creds[0].url, creds[0].username, creds[0].password) == (
+            "https://example.com/portal",
+            "octocat",
+            "hunter2",
+        )
+
+    def test_slow_path_space_formats(self):
+        from telecrime.stealer.parser import parse_credential_lines
+
+        creds = list(
+            parse_credential_lines(
+                iter(
+                    [
+                        "https://www.roblox.com/login AXefep:ihateleah",
+                        "https://example.com/portal octocat hunter2",
+                    ]
+                ),
+                "slow-space.txt",
+                combo_decision=False,
+            )
+        )
+        assert [(c.username, c.password) for c in creds] == [
+            ("AXefep", "ihateleah"),
+            ("octocat", "hunter2"),
+        ]
+
+    def test_prose_with_three_tokens_is_not_a_credential(self, tmp_path):
+        creds = self._stream(tmp_path, "https://example.com please reset password now\n")
+        assert creds == []
+
+    def test_space_colon_password_may_contain_spaces(self, tmp_path):
+        creds = self._stream(tmp_path, "https://example.com/login joe:my secret pass\n")
+        assert len(creds) == 1
+        assert (creds[0].username, creds[0].password) == ("joe", "my secret pass")
+
+
+class TestBackToBackLabeledBlocks:
+    """Round-14 fix 2: records with no blank/separator line merged into one
+    because ``fields[field_name]`` was overwritten without a new-block check."""
+
+    def _stream(self, tmp_path, text):
+        f = tmp_path / "Passwords.txt"
+        f.write_text(text, encoding="utf-8")
+        return list(iter_credentials_file(f))
+
+    def test_consecutive_url_username_password_blocks(self, tmp_path):
+        text = (
+            "URL: https://a.com\nUsername: u1\nPassword: p1\n"
+            "URL: https://b.com\nUsername: u2\nPassword: p2\n"
+            "URL: https://c.com\nUsername: u3\nPassword: p3\n"
+        )
+        creds = self._stream(tmp_path, text)
+        assert [(c.url, c.username, c.password) for c in creds] == [
+            ("https://a.com", "u1", "p1"),
+            ("https://b.com", "u2", "p2"),
+            ("https://c.com", "u3", "p3"),
+        ]
+
+    def test_consecutive_bracket_blocks(self, tmp_path):
+        text = (
+            '["Chrome" = "Default"]\nHost: https://a.com\nLogin: u1\nPassword: p1\n'
+            '["Firefox" = "Default"]\nHost: https://b.com\nLogin: u2\nPassword: p2\n'
+        )
+        creds = self._stream(tmp_path, text)
+        assert len(creds) == 2
+        assert [c.application for c in creds] == ["Chrome", "Firefox"]
+        assert [c.username for c in creds] == ["u1", "u2"]
+
+    def test_consecutive_soft_blocks(self, tmp_path):
+        text = (
+            "Soft: Chrome\nHost: https://a.com\nLogin: u1\nPassword: p1\n"
+            "Soft: Firefox\nHost: https://b.com\nLogin: u2\nPassword: p2\n"
+        )
+        creds = self._stream(tmp_path, text)
+        assert [c.password for c in creds] == ["p1", "p2"]
+
+
+class TestComboHybridLabeledFallback:
+    """Round-14 fix 3: labeled blocks after the first 200 lines were discarded
+    when the probe classified the file as combo-only."""
+
+    def test_late_labeled_block_after_combo_probe(self, tmp_path):
+        lines = [f"https://site{i}.com:user{i}:pass{i}" for i in range(250)]
+        lines += ["Host: https://late.example", "Login: late", "Password: latepw"]
+        f = tmp_path / "combo_list.txt"
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        creds = list(iter_credentials_file(f))
+        assert len(creds) == 251
+        assert any(c.username == "late" and c.password == "latepw" for c in creds)
+
+    def test_hybrid_matches_slow_on_mixed_file(self):
+        from telecrime.stealer.parser import (
+            _is_garbage_credential,
+            _iter_combo_lines,
+            _iter_credentials_from_lines_slow,
+        )
+
+        lines = [f"https://site{i}.com:user{i}:pass{i}" for i in range(250)]
+        lines += ["Host: https://late.example", "Login: late", "Password: latepw"]
+        slow = [
+            c
+            for c in _iter_credentials_from_lines_slow(iter(lines), "mixed.txt")
+            if not _is_garbage_credential(c.username, c.password)
+        ]
+        fast = list(_iter_combo_lines(iter(lines), "mixed.txt"))
+        assert fast == slow
+        assert len(fast) == 251
+
+
+class TestPasswordPromoCleaning:
+    """Round-14 fix 4: a password that is itself a t.me link was wiped."""
+
+    def _stream(self, tmp_path, text):
+        f = tmp_path / "Passwords.txt"
+        f.write_text(text, encoding="utf-8")
+        return list(iter_credentials_file(f))
+
+    def test_tme_password_kept_fast_path(self, tmp_path):
+        creds = self._stream(tmp_path, "https://site.com:alice:t.me/mypass\n")
+        assert len(creds) == 1
+        assert creds[0].username == "alice"
+        assert creds[0].password == "t.me/mypass"
+
+    def test_tme_password_with_scheme_kept_slow_path(self):
+        from telecrime.stealer.parser import parse_credential_lines
+
+        creds = list(
+            parse_credential_lines(
+                iter(["https://site.com:alice:https://t.me/mypass"]),
+                "slow-tme.txt",
+                combo_decision=False,
+            )
+        )
+        assert len(creds) == 1
+        assert creds[0].password == "https://t.me/mypass"
+
+    def test_promo_after_pipe_still_stripped_from_password(self, tmp_path):
+        creds = self._stream(
+            tmp_path,
+            "https://site.com:alice:secret123 | https://t.me/X You can buy dm @X\n",
+        )
+        assert len(creds) == 1
+        assert creds[0].password == "secret123"
+
+
+class TestNormalizeUrlAtSigns:
+    """Round-14 fix 5: an '@' in the path/query rewrote the host."""
+
+    def test_at_in_query_kept(self):
+        from telecrime.stealer.parser import _normalize_url
+
+        assert _normalize_url("https://example.com/reset?email=a@b.com") == (
+            "https://example.com/reset?email=a@b.com"
+        )
+
+    def test_at_in_path_kept(self):
+        from telecrime.stealer.parser import _normalize_url
+
+        assert _normalize_url("https://example.com/users/a@b") == (
+            "https://example.com/users/a@b"
+        )
+
+    def test_userinfo_still_stripped(self):
+        from telecrime.stealer.parser import _normalize_url
+
+        assert _normalize_url("https://user:pass@example.com/path?q=1") == (
+            "https://example.com/path?q=1"
+        )
+
+    def test_query_at_sign_keeps_domain(self, tmp_path):
+        f = tmp_path / "Passwords.txt"
+        f.write_text(
+            "URL: https://example.com/reset?email=a@b.com\nUsername: u\nPassword: p\n",
+            encoding="utf-8",
+        )
+        creds = list(iter_credentials_file(f))
+        assert len(creds) == 1
+        assert creds[0].url == "https://example.com/reset?email=a@b.com"
+        assert creds[0].domain == "example.com"
+
+
+class TestBomlessUtf16:
+    """Round-14 fix 6: BOM-less UTF-16 yielded zero credentials because utf-8
+    accepts NUL bytes, so the fallback chain never reached utf-16."""
+
+    @pytest.mark.parametrize("enc", ["utf-16-le", "utf-16-be"])
+    def test_bomless_utf16_decodes(self, tmp_path, enc):
+        f = tmp_path / "Passwords.txt"
+        f.write_bytes("https://example.com;alice;p@ss1\n".encode(enc))
+        creds = list(iter_credentials_file(f))
+        assert len(creds) == 1
+        assert (creds[0].url, creds[0].username, creds[0].password) == (
+            "https://example.com",
+            "alice",
+            "p@ss1",
+        )
+
+    def test_latin1_file_not_misdetected_as_utf16(self, tmp_path):
+        f = tmp_path / "Passwords.txt"
+        f.write_bytes(b"https://example.com;alice;p\xe9ss\n")
+        creds = list(iter_credentials_file(f))
+        assert len(creds) == 1
+        assert creds[0].password == "p\xe9ss"
+
+    def test_utf16_bom_still_decodes(self, tmp_path):
+        f = tmp_path / "Passwords.txt"
+        f.write_bytes("https://example.com;bob;p@ss2\n".encode("utf-16"))
+        creds = list(iter_credentials_file(f))
+        assert len(creds) == 1
+        assert creds[0].username == "bob"
+
+
+class TestDuplicateFilenameSuffixes:
+    """Round-14 fix 7: duplicate/copy suffixes hid real credential files."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Passwords (1).txt",
+            "Passwords(1).txt",
+            "Passwords_1.txt",
+            "passwords 1.txt",
+            "Passwords - Copy.txt",
+            "Passwords - Copy (2).txt",
+            "dump (1).txt",
+            "Login Data (1).txt",
+            "Login Data.txt",
+            "PASSWORDS (1).TXT",
+        ],
+    )
+    def test_duplicate_names_caught(self, name):
+        assert is_credential_file(name) is True, name
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "readme (1).txt",
+            "notes - Copy.txt",
+            "catalog 1.txt",
+            "analog (2).txt",
+            "dialog 1.txt",
+            "user_info (1).txt",
+        ],
+    )
+    def test_non_credentials_with_suffix_still_excluded(self, name):
+        assert is_credential_file(name) is False, name

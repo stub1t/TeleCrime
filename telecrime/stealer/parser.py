@@ -6,6 +6,7 @@ import re
 from collections.abc import Generator, Iterator
 from pathlib import Path
 from typing import TextIO
+from urllib.parse import urlsplit, urlunsplit
 
 from telecrime.stealer.models import Credential, SystemInfo
 
@@ -28,24 +29,42 @@ _PIPE_LINE_RE = re.compile(
 _SEMICOLON_LINE_RE = re.compile(
     r"^(?P<url>https?://[^\s;]+);(?P<username>[^;]+);(?P<password>.+)$"
 )
+# Space-separated combo rows (real ULP dumps): "https://host/login user:pass"
+# and "https://host/login user pass". The URL group stops at whitespace (plus
+# an optional numeric port), so the scheme can never be swallowed by the user
+# field; user and password are whitespace-free tokens for the space/space form
+# to keep prose ("https://host please reset") from parsing as a credential.
+_SPACE_COLON_LINE_RE = re.compile(
+    r"^(?P<url>https?://[^\s:]+(?::\d{1,5})?)[^\S\n]+"
+    r"(?P<username>[^\s:]+):(?P<password>.+)$"
+)
+_SPACE_SPACE_LINE_RE = re.compile(
+    r"^(?P<url>https?://[^\s:]+(?::\d{1,5})?)[^\S\n]+"
+    r"(?P<username>[^\s:]+)[^\S\n]+(?P<password>\S+)$"
+)
 # Combo fast path: one C-level finditer over whole text buffers instead of up
-# to three anchored regex matches per line. Branch order (colon, pipe,
-# semicolon) mirrors the per-line trio above and alternation is ordered, so
-# this matches exactly the lines/fields the slow path would. Group names are
-# prefixed per branch because a group name may not repeat across alternatives;
-# the branch-marker groups (colon/pipe/semi) identify which branch matched.
-# The per-line char classes are newline-hardened ([^\S\n]* instead of \s*,
-# [^:\n] etc.): greedy classes like [^:]+ would otherwise swallow the "\n"
-# between buffer lines and match across them, which the per-line slow path
-# (whose input is a single stripped line) can never do. Lockstep with the
-# per-line trio is asserted by the differential test.
+# to five anchored regex matches per line. Branch order (colon, pipe,
+# semicolon, space-colon, space-space) mirrors the per-line quintet above and
+# alternation is ordered, so this matches exactly the lines/fields the slow
+# path would. Group names are prefixed per branch because a group name may not
+# repeat across alternatives; the branch-marker groups (colon/pipe/semi/
+# spcolon/spaces) identify which branch matched. The per-line char classes are
+# newline-hardened ([^\S\n]* instead of \s*, [^:\n] etc.): greedy classes like
+# [^:]+ would otherwise swallow the "\n" between buffer lines and match across
+# them, which the per-line slow path (whose input is a single stripped line)
+# can never do. Lockstep with the per-line quintet is asserted by the
+# differential test.
 _COMBO_FAST_RE = re.compile(
     r"^(?P<colon>https?://[^\s:]+(?::\d{1,5})?):"
     r"(?P<colon_user>[^:\n]+):(?P<colon_pass>.+)$"
     r"|^(?P<pipe>https?://[^\s|]+)[^\S\n]*\|[^\S\n]*"
     r"(?P<pipe_user>[^|\n]+)[^\S\n]*\|[^\S\n]*(?P<pipe_pass>.+)$"
     r"|^(?P<semi>https?://[^\s;]+);"
-    r"(?P<semi_user>[^;\n]+);(?P<semi_pass>.+)$",
+    r"(?P<semi_user>[^;\n]+);(?P<semi_pass>.+)$"
+    r"|^(?P<spcolon>https?://[^\s:]+(?::\d{1,5})?)[^\S\n]+"
+    r"(?P<spcolon_user>[^\s:\n]+):(?P<spcolon_pass>.+)$"
+    r"|^(?P<spaces>https?://[^\s:]+(?::\d{1,5})?)[^\S\n]+"
+    r"(?P<spaces_user>[^\s:\n]+)[^\S\n]+(?P<spaces_pass>\S+)$",
     re.MULTILINE,
 )
 _LABELED_LINE_RE = re.compile(r"^([A-Za-z_]+)\s*[:=]\s*(.*)$")
@@ -58,6 +77,14 @@ _SEPARATOR_RE = re.compile(r"^(?:---+|===+|_{3,})\s*$")
 # NOT be truncated. Verified victims: "I want to buy stuff" → "I want".
 _PROMO_MARKERS_RE = re.compile(
     r"(?:^|\s*(?:┃|\|)\s*)(?:https?://)?t\.me/[^\s]+.*$"
+    r"|\s*(?:┃|\|)\s*(?:you\s+can\s+buy|to\s+buy|dm\s+@)[^\r\n]*$",
+    re.IGNORECASE,
+)
+# Password fields legitimately ARE Telegram links ("t.me/mypass"): the
+# start-of-string alternative of _PROMO_MARKERS_RE wiped them to "". Only
+# strip a t.me promo when it follows a separator for passwords.
+_PROMO_MARKERS_PASSWORD_RE = re.compile(
+    r"(?:\s*(?:┃|\|)\s*)(?:https?://)?t\.me/[^\s]+.*$"
     r"|\s*(?:┃|\|)\s*(?:you\s+can\s+buy|to\s+buy|dm\s+@)[^\r\n]*$",
     re.IGNORECASE,
 )
@@ -105,7 +132,9 @@ def _is_garbage_credential(username: str, password: str) -> bool:
     return False
 
 
-def _clean_credential_field(value: str | None, *, username: bool = False) -> str:
+def _clean_credential_field(
+    value: str | None, *, username: bool = False, password: bool = False
+) -> str:
     """Remove obvious marketplace boilerplate accidentally captured in credential fields."""
     if not value:
         return ""
@@ -116,7 +145,8 @@ def _clean_credential_field(value: str | None, *, username: bool = False) -> str
         cleaned = _BRACKET_PROMO_RE.sub("", cleaned).strip()
     # Single case-insensitive C-level scan; no lowercased copy allocated.
     if _PROMO_TRIGGER_RE.search(cleaned):
-        cleaned = _PROMO_MARKERS_RE.sub("", cleaned).strip()
+        marker_re = _PROMO_MARKERS_PASSWORD_RE if password else _PROMO_MARKERS_RE
+        cleaned = marker_re.sub("", cleaned).strip()
     return cleaned
 
 
@@ -136,7 +166,7 @@ def _make_credential(
     return Credential(
         url=_url or url.strip(),
         username=_clean_credential_field(username, username=True),
-        password=_clean_credential_field(password),
+        password=_clean_credential_field(password, password=True),
         application=_clean_credential_field(application) or None,
         profile=_clean_credential_field(profile) or None,
         source_file=source_file,
@@ -186,6 +216,27 @@ def _is_binary_file(file_path: Path) -> bool:
         return False
 
 
+def _detect_bomless_utf16(head: bytes) -> str | None:
+    """Detect BOM-less UTF-16 by its alternating-NUL byte pattern.
+
+    ASCII-dominant UTF-16 stores a NUL in every second byte — at odd offsets
+    for little-endian, at even offsets for big-endian. Single-byte encodings
+    never show that alternation, so this cannot misclassify latin-1/cp1252
+    data (which used to decode as NUL-riddled text and yield zero credentials).
+    """
+    sample = head[:4096]
+    pairs = len(sample[1::2])
+    if pairs < 2:
+        return None
+    even_nuls = sample[0::2].count(0)
+    odd_nuls = sample[1::2].count(0)
+    if odd_nuls >= pairs * 0.8 and even_nuls <= pairs * 0.2:
+        return "utf-16-le"
+    if even_nuls >= pairs * 0.8 and odd_nuls <= pairs * 0.2:
+        return "utf-16-be"
+    return None
+
+
 def _normalize_url(url: str | None) -> str | None:
     """Strip control characters and validate URL scheme; return None for non-HTTP values."""
     if not url:
@@ -195,11 +246,26 @@ def _normalize_url(url: str | None) -> str | None:
     if not url.startswith(("http://", "https://")):
         return None
     # Credentials embedded in the URL ("https://user:pass@example.com") must
-    # not leak into the domain column or the dedup hashes.
-    scheme, rest = url.split("://", 1)
-    if "@" in rest:
-        rest = rest.rsplit("@", 1)[1]
-        url = f"{scheme}://{rest}"
+    # not leak into the domain column or the dedup hashes — but an "@" in the
+    # path/query ("/reset?email=a@b.com") is data, not userinfo. urlsplit
+    # isolates the netloc so only its "@" is stripped (the old rsplit-on-rest
+    # rewrote the host to the query's domain). urlsplit is pure-Python and
+    # measurably expensive, so skip it when the authority holds no "@".
+    scheme_end = url.find("://") + 3
+    authority_end = len(url)
+    for sep in "/?#":
+        idx = url.find(sep, scheme_end)
+        if idx != -1 and idx < authority_end:
+            authority_end = idx
+    if "@" not in url[scheme_end:authority_end]:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if "@" in parts.netloc:
+        netloc = parts.netloc.rsplit("@", 1)[1]
+        url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
     return url
 
 
@@ -208,15 +274,29 @@ def _open_file(file_path: Path, encoding: str) -> TextIO:
     return open(file_path, encoding=encoding, errors="replace")
 
 
-def _parse_block_lines(block_lines: list[str]) -> tuple[dict[str, str], bool] | None:
-    """Parse a list of lines as a labeled block.
+def _parse_block_lines(block_lines: list[str]) -> list[tuple[dict[str, str], bool]]:
+    """Parse lines into one or more labeled blocks.
 
-    Returns (fields, has_labeled_field) or None if empty.
-    has_labeled_field indicates whether at least one labeled field was found.
+    Stealer logs normally separate records with blank lines, but some dumps
+    put them back-to-back. A labeled line that re-declares an already-populated
+    field starts a new record, as does a ``[...]`` header after a complete
+    URL+password block; without that, N consecutive records collapsed into the
+    last one (each ``fields[field_name]`` overwrote the previous record).
+
+    Returns a list of (fields, has_labeled_field) per block found.
     """
+    blocks: list[tuple[dict[str, str], bool]] = []
     fields: dict[str, str] = {}
     has_labeled = False
     pending_empty_field: str | None = None  # field name whose value was empty
+
+    def flush() -> None:
+        nonlocal fields, has_labeled, pending_empty_field
+        if fields:
+            blocks.append((fields, has_labeled))
+        fields = {}
+        has_labeled = False
+        pending_empty_field = None
 
     for line in block_lines:
         line_s = line.strip()
@@ -224,9 +304,11 @@ def _parse_block_lines(block_lines: list[str]) -> tuple[dict[str, str], bool] | 
             pending_empty_field = None
             continue
 
-        # Bracket header
+        # Bracket header. After a complete record it starts a new one.
         bm = _BRACKET_LINE_RE.match(line_s)
         if bm:
+            if _get_field(fields, URL_FIELDS) and _get_field(fields, PASSWORD_FIELDS):
+                flush()
             fields["application"] = bm.group("app").strip()
             fields["profile"] = bm.group("profile").strip()
             has_labeled = True
@@ -238,6 +320,9 @@ def _parse_block_lines(block_lines: list[str]) -> tuple[dict[str, str], bool] | 
         if lm:
             field_name = lm.group(1).lower().strip()
             field_value = lm.group(2).strip()
+            # Same field twice = the previous back-to-back record ended here.
+            if fields.get(field_name):
+                flush()
             fields[field_name] = field_value
             has_labeled = True
             # Track fields with empty values — next non-labeled line may be the value
@@ -252,9 +337,8 @@ def _parse_block_lines(block_lines: list[str]) -> tuple[dict[str, str], bool] | 
 
         pending_empty_field = None
 
-    if not fields:
-        return None
-    return fields, has_labeled
+    flush()
+    return blocks
 
 
 def _credential_from_fields(
@@ -289,12 +373,10 @@ def _iter_credentials_from_lines_slow(
     block_lines: list[str] = []
 
     def flush_block() -> Generator[Credential, None, None]:
-        """Yield credential from accumulated block_lines if valid."""
+        """Yield credentials from accumulated block_lines if valid."""
         if not block_lines:
             return
-        result = _parse_block_lines(block_lines)
-        if result is not None:
-            fields, has_labeled = result
+        for fields, has_labeled in _parse_block_lines(block_lines):
             if has_labeled:
                 cred = _credential_from_fields(fields, source_file)
                 if cred is not None:
@@ -310,11 +392,12 @@ def _iter_credentials_from_lines_slow(
             yield from flush_block()
             continue
 
-        # Combo-format lines (colon/pipe/semicolon-separated) always start with
-        # a URL scheme.  Labeled-block lines start with field names like "URL:",
-        # "Host:", "Login:".  Using startswith as a fast discriminator avoids
-        # running all three combo regexes on every labeled line — which is the
-        # common case in stealer-log files where each labeled block has 4-8 lines.
+        # Combo-format lines (colon/pipe/semicolon/space-separated) always
+        # start with a URL scheme.  Labeled-block lines start with field names
+        # like "URL:", "Host:", "Login:".  Using startswith as a fast
+        # discriminator avoids running all combo regexes on every labeled line —
+        # which is the common case in stealer-log files where each labeled
+        # block has 4-8 lines.
         if stripped.startswith(("http://", "https://")):
             # Check for inline colon-separated credential
             cm = _COLON_LINE_RE.match(stripped)
@@ -352,6 +435,30 @@ def _iter_credentials_from_lines_slow(
                 )
                 continue
 
+            # Check for space-separated "URL user:pass" credential
+            scm = _SPACE_COLON_LINE_RE.match(stripped)
+            if scm:
+                yield from flush_block()
+                yield _make_credential(
+                    url=scm.group("url").strip(),
+                    username=scm.group("username").strip(),
+                    password=scm.group("password").strip(),
+                    source_file=source_file,
+                )
+                continue
+
+            # Check for space-separated "URL user pass" credential
+            ssm = _SPACE_SPACE_LINE_RE.match(stripped)
+            if ssm:
+                yield from flush_block()
+                yield _make_credential(
+                    url=ssm.group("url").strip(),
+                    username=ssm.group("username").strip(),
+                    password=ssm.group("password").strip(),
+                    source_file=source_file,
+                )
+                continue
+
         # Accumulate into current block (labeled / bracket header, or a URL
         # line that didn't match any combo pattern)
         block_lines.append(line)
@@ -363,9 +470,9 @@ def _iter_credentials_from_lines_slow(
 def _classify_combo_head(head: list[str]) -> bool:
     """Return True when the first lines look like a combo-only file.
 
-    Combo/ULP files are line-independent ``url:user:pass`` rows (colon, pipe
-    or semicolon). Any labeled/bracket header in the probe window means the
-    file may use block semantics (a credential can then span several lines),
+    Combo/ULP files are line-independent ``url<sep>user<sep>pass`` rows (colon,
+    pipe, semicolon or whitespace). Any labeled/bracket header in the probe
+    window may use block semantics (a credential can then span several lines),
     which the fast path cannot reproduce — veto it. Otherwise ≥90% of the
     non-blank lines must match a single-line combo pattern.
     """
@@ -382,6 +489,8 @@ def _classify_combo_head(head: list[str]) -> bool:
             _COLON_LINE_RE.match(line)
             or _PIPE_LINE_RE.match(line)
             or _SEMICOLON_LINE_RE.match(line)
+            or _SPACE_COLON_LINE_RE.match(line)
+            or _SPACE_SPACE_LINE_RE.match(line)
         ):
             matched += 1
             continue
@@ -398,91 +507,147 @@ def _classify_combo_head(head: list[str]) -> bool:
     return examined > 0 and matched * 10 >= examined * 9
 
 
-def _scan_combo_buffer(
-    text: str, source_file: str | None
-) -> Generator[Credential, None, None]:
-    """Yield credentials from one whole-buffer combo scan."""
+def _combo_credential(
+    m: re.Match[str], source_file: str | None
+) -> Credential:
+    """Build a Credential from one _COMBO_FAST_RE match (any branch)."""
     make = _make_credential
-    for m in _COMBO_FAST_RE.finditer(text):
-        if m.group("colon") is not None:
-            yield make(
-                url=m.group("colon"),
-                username=m.group("colon_user"),
-                password=m.group("colon_pass"),
-                source_file=source_file,
-            )
-        elif m.group("pipe") is not None:
-            yield make(
-                url=m.group("pipe"),
-                username=m.group("pipe_user"),
-                password=m.group("pipe_pass"),
-                source_file=source_file,
-            )
-        else:
-            yield make(
-                url=m.group("semi"),
-                username=m.group("semi_user"),
-                password=m.group("semi_pass"),
-                source_file=source_file,
-            )
+    if m.group("colon") is not None:
+        return make(
+            url=m.group("colon"),
+            username=m.group("colon_user"),
+            password=m.group("colon_pass"),
+            source_file=source_file,
+        )
+    if m.group("pipe") is not None:
+        return make(
+            url=m.group("pipe"),
+            username=m.group("pipe_user"),
+            password=m.group("pipe_pass"),
+            source_file=source_file,
+        )
+    if m.group("semi") is not None:
+        return make(
+            url=m.group("semi"),
+            username=m.group("semi_user"),
+            password=m.group("semi_pass"),
+            source_file=source_file,
+        )
+    if m.group("spcolon") is not None:
+        return make(
+            url=m.group("spcolon"),
+            username=m.group("spcolon_user"),
+            password=m.group("spcolon_pass"),
+            source_file=source_file,
+        )
+    return make(
+        url=m.group("spaces"),
+        username=m.group("spaces_user"),
+        password=m.group("spaces_pass"),
+        source_file=source_file,
+    )
 
 
 def _iter_combo_lines(
     lines: Iterator[str],
     source_file: str | None,
 ) -> Generator[Credential, None, None]:
-    """Combo fast path: batch lines into ~8 MB buffers and scan each with one
-    C-level finditer instead of up to three regex matches per line.
+    """Combo fast path with a labeled-block fallback (hybrid).
 
-    Combo lines are line-independent — a credential never spans two lines — so
-    cutting the buffer at a line boundary cannot lose or truncate a row. Lines
-    are stripped exactly like the general path strips them before matching.
+    Combo lines are line-independent, so each ~8 MB buffer is scanned with one
+    C-level finditer instead of up to five regex matches per line. Lines the
+    scan does not match are fed through the same labeled-block state machine as
+    the slow path, so a file classified combo-only from its head but containing
+    ``Host/Login/Password`` blocks further down can no longer drop them.
     """
     buf: list[str] = []
     buf_size = 0
+    block_lines: list[str] = []
+
+    def flush_block() -> Generator[Credential, None, None]:
+        if not block_lines:
+            return
+        for fields, has_labeled in _parse_block_lines(block_lines):
+            if has_labeled:
+                cred = _credential_from_fields(fields, source_file)
+                if cred is not None:
+                    yield cred
+        block_lines.clear()
+
+    def handle_gap_line(line: str) -> Generator[Credential, None, None]:
+        stripped = line.strip()
+        if not stripped or _SEPARATOR_RE.match(stripped):
+            yield from flush_block()
+        else:
+            block_lines.append(line)
+
+    def scan_buffer(text: str) -> Generator[Credential, None, None]:
+        pos = 0
+        consumed = 0
+        for m in _COMBO_FAST_RE.finditer(text):
+            if m.start() > pos:
+                # Newlines in the gap are one full line each (matches are
+                # anchored at line starts), so this counts the non-combo lines
+                # to hand to the labeled parser without splitting the buffer.
+                gap_lines = text.count("\n", pos, m.start())
+                for i in range(consumed, consumed + gap_lines):
+                    yield from handle_gap_line(buf[i])
+                consumed += gap_lines
+            if block_lines:
+                yield from flush_block()
+            yield _combo_credential(m, source_file)
+            consumed += 1
+            pos = m.end() + 1
+        for i in range(consumed, len(buf)):
+            yield from handle_gap_line(buf[i])
+
     for raw in lines:
-        line = raw.strip()
-        if not line:
-            continue
+        line = raw.rstrip("\n").rstrip("\r").strip()
         buf.append(line)
-        buf_size += len(line)
+        buf_size += len(line) + 1
         if buf_size >= _COMBO_SCAN_BYTES:
-            yield from _scan_combo_buffer("\n".join(buf), source_file)
+            yield from scan_buffer("\n".join(buf))
             buf = []
             buf_size = 0
     if buf:
-        yield from _scan_combo_buffer("\n".join(buf), source_file)
+        yield from scan_buffer("\n".join(buf))
+    # A trailing labeled block still owns block_lines here.
+    yield from flush_block()
 
 
 def _iter_credentials_from_lines(
     lines: Iterator[str],
     source_file: str | None,
+    combo_decision: bool | None = None,
 ) -> Generator[Credential, None, None]:
     """Stream credentials from an iterator of lines.
 
-    Strategy is picked once per file (cached by source_file for the parallel
-    chunk workers, which parse one file across many calls): combo-only files
-    take the whole-buffer fast path, everything else the general path below.
-    The probe only reads the first _COMBO_CLASSIFY_LINES lines, so labeled
-    blocks appearing later in a probed-combo file are the accepted trade-off
-    for skipping the per-line regex work on the dominant ULP class.
+    Strategy is picked once per file: combo-only files take the whole-buffer
+    fast path, everything else the general path below. `combo_decision` lets
+    the parallel path pass a classification derived from the true file head,
+    so a worker parsing a mid-file chunk can never re-classify from that
+    chunk's head (a combo-dominant chunk of a labeled file would otherwise
+    take the fast path and drop its labeled credentials). When it is None the
+    decision comes from the per-file cache or, on a miss, from the first
+    _COMBO_CLASSIFY_LINES lines of `lines` — never more.
     """
     it = iter(lines)
     head: list[str] = []
-    decision: bool | None = None
-    if source_file is not None:
-        decision = _COMBO_CLASS_CACHE.get(source_file)
+    decision = combo_decision
     if decision is None:
-        for _ in range(_COMBO_CLASSIFY_LINES):
-            try:
-                head.append(next(it))
-            except StopIteration:
-                break
-        decision = _classify_combo_head(head)
         if source_file is not None:
-            if len(_COMBO_CLASS_CACHE) >= _COMBO_CACHE_MAX:
-                _COMBO_CLASS_CACHE.clear()
-            _COMBO_CLASS_CACHE[source_file] = decision
+            decision = _COMBO_CLASS_CACHE.get(source_file)
+        if decision is None:
+            for _ in range(_COMBO_CLASSIFY_LINES):
+                try:
+                    head.append(next(it))
+                except StopIteration:
+                    break
+            decision = _classify_combo_head(head)
+            if source_file is not None:
+                if len(_COMBO_CLASS_CACHE) >= _COMBO_CACHE_MAX:
+                    _COMBO_CLASS_CACHE.clear()
+                _COMBO_CLASS_CACHE[source_file] = decision
     rest = itertools.chain(head, it)
     if decision:
         yield from _iter_combo_lines(rest, source_file)
@@ -515,15 +680,21 @@ def _open_credential_file(file_path: Path, encoding: str) -> TextIO | None:
 
     # Explicit BOM handling: a UTF-16 BOM picks the encoding without the
     # fallback chain (which must never guess utf-16 for non-BOM files).
+    # BOM-less UTF-16 is detected by its alternating-NUL pattern before the
+    # chain: utf-8 accepts NUL bytes, so the chain used to "succeed" on it and
+    # hand the parser NUL-riddled lines (zero credentials).
     try:
         with open(file_path, "rb") as raw:
-            head = raw.read(4)
+            head = raw.read(4096)
     except OSError:
         head = b""
     if head.startswith(b"\xff\xfe"):
         return _open_file(file_path, "utf-16")
     if head.startswith(b"\xfe\xff"):
         return _open_file(file_path, "utf-16-be")
+    bomless_utf16 = _detect_bomless_utf16(head)
+    if bomless_utf16 is not None:
+        return _open_file(file_path, bomless_utf16)
 
     enc_chain = _detect_encoding(encoding)
     for enc in enc_chain:
@@ -566,6 +737,7 @@ def iter_credentials_file(
 def parse_credential_lines(
     lines: Iterator[str],
     source_file: str | None = None,
+    combo_decision: bool | None = None,
 ) -> Generator[Credential, None, None]:
     """Parse credentials from an iterator of lines, filtering garbage.
 
@@ -576,8 +748,13 @@ def parse_credential_lines(
     Args:
         lines: Iterator of raw lines (without trailing newlines).
         source_file: Source file name/path for tracking.
+        combo_decision: Optional pre-computed combo classification for the
+            source file (from its true head). Chunk workers must pass this so
+            a chunk's own head cannot misclassify the file.
     """
-    for cred in _iter_credentials_from_lines(lines, source_file):
+    for cred in _iter_credentials_from_lines(
+        lines, source_file, combo_decision=combo_decision
+    ):
         if not _is_garbage_credential(cred.username, cred.password):
             yield cred
 

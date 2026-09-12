@@ -16,11 +16,13 @@ from telecrime.models import (
     ArchiveGroupPart,
     Conversation,
     DownloadArtifact,
+    ExtractedOutput,
     ExtractionJob,
     FileAttachment,
     Message,
     ParsedCredential,
     PasswordCandidate,
+    TelegramChannel,
 )
 from telecrime.models.watchlist import WatchlistItem
 from telecrime.states import (
@@ -395,6 +397,138 @@ def test_search_export_soft_dedupes_equivalent_credentials(pg_engine):
         )
 
     assert len(results.credentials) == 1
+
+
+def _seed_filter_only_rows(session):
+    """Seed one unrelated conversation chain plus two credentials."""
+    conv = Conversation(platform_id=1, conversation_type="channel", title="unrelated")
+    session.add(conv)
+    session.flush()
+    msg = Message(
+        conversation_id=conv.id,
+        platform_id=100,
+        platform_timestamp=datetime.now(UTC),
+        text="completely unrelated message",
+    )
+    session.add(msg)
+    session.flush()
+    attachment = FileAttachment(
+        message_id=msg.id, platform_file_id="unrelated-file", filename="unrelated.zip"
+    )
+    session.add(attachment)
+    session.flush()
+    artifact = DownloadArtifact(attachment_id=attachment.id, status=DownloadStatus.PENDING)
+    group = ArchiveGroup(
+        fingerprint="filter-only-search",
+        base_name="unrelated.zip",
+        expected_part_count=1,
+        detected_part_count=1,
+    )
+    session.add_all([artifact, group])
+    session.flush()
+    job = ExtractionJob(
+        group_id=group.id, status=ExtractionStatus.PENDING, target_extensions=".txt"
+    )
+    session.add(job)
+    session.flush()
+    session.add(
+        ExtractedOutput(
+            job_id=job.id,
+            output_path="/tmp/unrelated/output.txt",
+            output_filename="unrelated-output.txt",
+            output_hash="0" * 64,
+        )
+    )
+    session.add(
+        TelegramChannel(
+            platform_id=999, source="test", username="unrelatedchan", title="Unrelated"
+        )
+    )
+    session.add_all(
+        [
+            ParsedCredential(
+                url="https://example.com/login",
+                domain="example.com",
+                username="alice",
+                password="secret",
+                credential_hash=ParsedCredential.compute_hash("example.com", "alice", "secret"),
+            ),
+            ParsedCredential(
+                url="https://other.test/login",
+                domain="other.test",
+                username="bob",
+                password="secret",
+                credential_hash=ParsedCredential.compute_hash("other.test", "bob", "secret"),
+            ),
+        ]
+    )
+    session.flush()
+
+
+def test_filter_only_export_skips_unrelated_rows(session):
+    """A domain: filter with no free text must not run "%%" sub-searches."""
+    _seed_filter_only_rows(session)
+
+    results = _search_for_export(
+        session,
+        "",
+        {"domain": ["example.com"]},
+        False,
+        True,
+        set(),
+        set(),
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+    )
+
+    assert [c.username for c in results.credentials] == ["alice"]
+    assert results.messages == []
+    assert results.attachments == []
+    assert results.archives == []
+    assert results.extracted == []
+    assert results.conversations == []
+    assert results.channels == []
+
+
+def test_filter_only_search_does_not_render_unrelated_rows(tmp_path):
+    """The HTML search has the same %% bug for the non-credential sections."""
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        _seed_filter_only_rows(session)
+
+    response = _route(app, "/search").endpoint(
+        request=_web_request(),
+        q="domain:example.com",
+        limit=50,
+        limit_messages=10,
+        limit_attachments=10,
+        limit_archives=10,
+        limit_extracted=10,
+        limit_conversations=10,
+        limit_channels=10,
+        page=1,
+        page_size=50,
+        after_id=0,
+        regex=False,
+        facets=False,
+        no_markdown=False,
+        source_conv=0,
+    )
+
+    assert response.status_code == 200
+    results = response.context["results"]
+    assert [c.username for c in results.credentials] == ["alice"]
+    assert results.messages == []
+    assert results.attachments == []
+    assert results.archives == []
+    assert results.extracted == []
+    assert results.conversations == []
+    assert results.channels == []
 
 
 def test_export_json_supports_no_markdown(pg_engine):
@@ -861,6 +995,118 @@ def test_passwords_scope_filter_matches_enum_value(tmp_path):
     body = bytes(response.body).decode()
     assert '<option value="conversation"' in body
     assert "PasswordScope.CONVERSATION" not in body
+
+
+def test_conversations_list_counts_only_page_and_orders(tmp_path, monkeypatch):
+    """Conversations are paged first, then counted for just the page ids."""
+    from telecrime.web import app as web_app
+
+    monkeypatch.setattr(web_app, "_pg_fast_count_estimates", lambda *args: {})
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        for idx, cred_count in enumerate([1, 3, 0]):
+            conv = Conversation(
+                platform_id=idx + 1, conversation_type="channel", title=f"conv{idx}"
+            )
+            session.add(conv)
+            session.flush()
+            for msg_idx in range(2):
+                session.add(
+                    Message(
+                        conversation_id=conv.id,
+                        platform_id=idx * 100 + msg_idx,
+                        platform_timestamp=datetime.now(UTC),
+                        text="hello",
+                    )
+                )
+            for cred_idx in range(cred_count):
+                session.add(
+                    ParsedCredential(
+                        url=f"https://conv{idx}.example/login",
+                        domain=f"conv{idx}.example",
+                        username=f"user{cred_idx}",
+                        password="pw",
+                        source_conversation_id=conv.id,
+                        credential_hash=ParsedCredential.compute_hash(
+                            f"conv{idx}.example", f"user{cred_idx}", "pw"
+                        ),
+                    )
+                )
+
+    response = _route(app, "/conversations").endpoint(
+        request=_web_request(), page=1, limit=50
+    )
+
+    assert response.status_code == 200
+    conversations = response.context["conversations"]
+    assert [row["cred_count"] for row in conversations] == [3, 1, 0]
+    assert [row["msg_count"] for row in conversations] == [2, 2, 2]
+    assert response.context["stats"]["total_convs"] == 3
+
+
+def test_conversation_detail_caps_cred_count(tmp_path, monkeypatch):
+    """The exact COUNT(*) is replaced by a LIMIT-capped count that renders as
+    "N+" once the cap is reached."""
+    from telecrime.web import app as web_app
+
+    monkeypatch.setattr(web_app, "_COUNT_CAP", 3)
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        conv = Conversation(platform_id=1, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        conv_id = conv.id
+        for idx in range(4):
+            session.add(
+                ParsedCredential(
+                    url=f"https://cap{idx}.example/login",
+                    domain=f"cap{idx}.example",
+                    username=f"user{idx}",
+                    password="pw",
+                    source_conversation_id=conv.id,
+                    credential_hash=ParsedCredential.compute_hash(
+                        f"cap{idx}.example", f"user{idx}", "pw"
+                    ),
+                )
+            )
+
+    response = _route(app, "/conversation/{conversation_id}").endpoint(
+        request=_web_request(), conversation_id=conv_id, msg_limit=50
+    )
+
+    assert response.status_code == 200
+    assert response.context["cred_count"] == "2+"
+    assert len(response.context["recent_creds"]) == 4
+
+
+def test_home_exclusions_use_fast_estimates(tmp_path, monkeypatch):
+    """With TELECRIME_EXCLUDE_NAMES set, big-table tiles must come from the
+    reltuples estimates instead of real COUNT(*) scans."""
+    from telecrime.web import app as web_app
+
+    monkeypatch.setenv("TELECRIME_EXCLUDE_NAMES", "hidden")
+    monkeypatch.setattr(
+        web_app,
+        "_pg_fast_count_estimates",
+        lambda *tables: {"messages": 111, "parsed_credentials": 222},
+    )
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        session.add(Conversation(platform_id=1, conversation_type="channel", title="Hidden"))
+        session.add(Conversation(platform_id=2, conversation_type="channel", title="Visible"))
+        session.add(
+            TelegramChannel(platform_id=3, source="test", username="hidden", title="Hidden")
+        )
+        session.add(TelegramChannel(platform_id=4, source="test", username="shown", title="Shown"))
+
+    response = _route(app, "/").endpoint(request=_web_request())
+
+    assert response.status_code == 200
+    stats = response.context["stats"]
+    assert stats["messages"] == 111
+    assert stats["credentials"] == 222
+    assert stats["conversations"] == 1
+    assert stats["channels"] == 1
 
 
 def test_claim_cred_counts_refresh_is_single_flight():

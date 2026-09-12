@@ -53,7 +53,13 @@ class EnrichStage(PipelineStage):
                     continue
 
                 if message.forwarded_from_id:
-                    await self._resolve_origin(ctx, message)
+                    resolved = await self._resolve_origin(ctx, message)
+                    if not resolved:
+                        # Transient failure (network timeout, FloodWait, DB
+                        # error): leave is_processed=False so the next run
+                        # retries. is_processed is never reset, so marking it
+                        # here would skip this origin forever.
+                        continue
 
                 message.is_processed = True
 
@@ -67,11 +73,18 @@ class EnrichStage(PipelineStage):
             logger.info("No forwarded messages to process")
         return True
 
-    async def _resolve_origin(self, ctx: PipelineContext, message: Message) -> None:
-        """Resolve the origin conversation of a forwarded message."""
+    async def _resolve_origin(self, ctx: PipelineContext, message: Message) -> bool:
+        """Resolve the origin conversation of a forwarded message.
+
+        Returns True when the message is done being enriched (origin resolved,
+        already known, or confirmed unresolvable) and False on a transient
+        failure (network timeout, FloodWait, DB error, ...).  The caller must
+        only set ``message.is_processed = True`` on True: is_processed is never
+        reset, so a transient failure marked processed skips this origin forever.
+        """
         forwarded_from_id = message.forwarded_from_id
         if forwarded_from_id is None:
-            return
+            return True
 
         # Check if we already have this conversation
         existing_conv = ctx.session.execute(
@@ -84,21 +97,23 @@ class EnrichStage(PipelineStage):
                     "Origin conversation %s already accessible",
                     existing_conv.title or forwarded_from_id,
                 )
-                return
+                return True
             elif existing_conv.join_attempted and not existing_conv.join_succeeded:
                 logger.debug(
                     "Previously failed to join %s, skipping",
                     existing_conv.title or forwarded_from_id,
                 )
-                return
+                return True
 
         # Try to resolve the source conversation
         try:
             conv_info = await ctx.adapter.resolve_forwarded_source(forwarded_from_id)
 
             if conv_info is None:
+                # The adapter reports the source as unresolvable (deleted,
+                # private, ...) — permanent, so do not retry next run.
                 logger.debug("Could not resolve forwarded source: %d", forwarded_from_id)
-                return
+                return True
 
             # Create or update conversation record
             if existing_conv is None:
@@ -122,8 +137,11 @@ class EnrichStage(PipelineStage):
             if not conv_info.is_member and not existing_conv.join_attempted:
                 await self._attempt_join(ctx, existing_conv, conv_info.username)
 
+            return True
+
         except Exception as e:
             logger.warning("Failed to resolve forwarded source %d: %s", forwarded_from_id, e)
+            return False
 
     async def _attempt_join(
         self,

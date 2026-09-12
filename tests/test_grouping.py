@@ -33,7 +33,11 @@ class TestExtractBaseAndPart:
             ("archive.001", "archive", 1, None),
             ("large_file.003", "large_file", 3, None),
             ("archive_vol1.zip", "archive", 1, None),
-            ("data-volume-2.rar", "data-volume-2", None, None),
+            ("archive_vol1.rar", "archive", 1, None),
+            ("archive_vol2.7z", "archive", 2, None),
+            # Volume pattern must win over the bare `^(.+?)\.rar$` match;
+            # previously the whole name was treated as the base.
+            ("data-volume-2.rar", "data", 2, None),
             ("archive_1of3.zip", "archive", 1, 3),
             ("data-2of5.rar", "data", 2, 5),
             ("ARCHIVE.PART1.RAR", "ARCHIVE", 1, None),
@@ -75,11 +79,12 @@ class TestExtractBaseAndPart:
 class TestGroupByPattern:
     """Tests for group_by_pattern function."""
 
-    def _make_attachment(self, filename, attachment_id=None):
+    def _make_attachment(self, filename, attachment_id=None, message_id=None):
         """Create a mock FileAttachment."""
         mock = MagicMock()
         mock.filename = filename
         mock.id = attachment_id or id(mock)
+        mock.message_id = message_id
         mock.detected_base_name = None
         mock.detected_part_number = None
         return mock
@@ -153,6 +158,112 @@ class TestGroupByPattern:
         """Test grouping with no attachments."""
         results = group_by_pattern([])
         assert results == []
+
+    def test_same_base_part_sets_in_different_messages_stay_separate(self):
+        """Two messages each carrying part1/part2 are independent archives."""
+        attachments = [
+            self._make_attachment("Archive.part1.rar", 1, message_id=101),
+            self._make_attachment("Archive.part2.rar", 2, message_id=101),
+            self._make_attachment("Archive.part1.rar", 3, message_id=202),
+            self._make_attachment("Archive.part2.rar", 4, message_id=202),
+        ]
+        results = group_by_pattern(attachments)
+
+        multi_part = [r for r in results if len(r.attachments) > 1]
+        assert len(multi_part) == 2
+        for group in multi_part:
+            assert len(group.attachments) == 2
+            assert group.expected_parts == 2
+            assert len({a.message_id for a in group.attachments}) == 1
+            assert sorted(group.part_numbers.values()) == [1, 2]
+
+    def test_disjoint_parts_from_different_messages_merge(self):
+        """Part 1 and part 2 delivered in different messages form one set."""
+        attachments = [
+            self._make_attachment("book.part1.rar", 1, message_id=7),
+            self._make_attachment("book.part2.rar", 2, message_id=8),
+        ]
+        results = group_by_pattern(attachments)
+
+        assert len(results) == 1
+        assert len(results[0].attachments) == 2
+        assert results[0].expected_parts == 2
+        assert sorted(results[0].part_numbers.values()) == [1, 2]
+
+    def test_final_volume_joins_zip_series(self):
+        """The bare .zip final volume must join its .z01/.z02 series."""
+        attachments = [
+            self._make_attachment("file.z01", 1),
+            self._make_attachment("file.z02", 2),
+            self._make_attachment("file.zip", 3),
+        ]
+        results = group_by_pattern(attachments)
+
+        assert len(results) == 1
+        assert {a.filename for a in results[0].attachments} == {
+            "file.z01",
+            "file.z02",
+            "file.zip",
+        }
+        assert results[0].expected_parts == 3
+
+    def test_bare_7z_stays_independent_of_7z_series(self):
+        """A complete .7z must not be absorbed into a .7z.001/.002 series."""
+        attachments = [
+            self._make_attachment("file.7z.001", 1),
+            self._make_attachment("file.7z.002", 2),
+            self._make_attachment("file.7z", 3),
+        ]
+        results = group_by_pattern(attachments)
+
+        assert len(results) == 2
+        series = next(r for r in results if len(r.attachments) > 1)
+        assert {a.filename for a in series.attachments} == {
+            "file.7z.001",
+            "file.7z.002",
+        }
+        assert series.expected_parts == 2
+        lone = next(r for r in results if len(r.attachments) == 1)
+        assert lone.attachments[0].filename == "file.7z"
+        assert lone.expected_parts == 1
+
+    def test_bare_zip_not_absorbed_by_7z_series(self):
+        """{logs.7z.001, logs.7z.002, logs.zip} stays as two groups."""
+        attachments = [
+            self._make_attachment("logs.7z.001", 1),
+            self._make_attachment("logs.7z.002", 2),
+            self._make_attachment("logs.zip", 3),
+        ]
+        results = group_by_pattern(attachments)
+
+        assert len(results) == 2
+        series = next(r for r in results if len(r.attachments) > 1)
+        assert {a.filename for a in series.attachments} == {
+            "logs.7z.001",
+            "logs.7z.002",
+        }
+        assert series.expected_parts == 2
+        lone = next(r for r in results if len(r.attachments) == 1)
+        assert lone.attachments[0].filename == "logs.zip"
+        assert lone.expected_parts == 1
+
+    def test_bare_zip_not_absorbed_by_zip_dot_series(self):
+        """A .zip.001/.002 split must not absorb a complete logs.zip."""
+        attachments = [
+            self._make_attachment("logs.zip.001", 1),
+            self._make_attachment("logs.zip.002", 2),
+            self._make_attachment("logs.zip", 3),
+        ]
+        results = group_by_pattern(attachments)
+
+        assert len(results) == 2
+        series = next(r for r in results if len(r.attachments) > 1)
+        assert {a.filename for a in series.attachments} == {
+            "logs.zip.001",
+            "logs.zip.002",
+        }
+        lone = next(r for r in results if len(r.attachments) == 1)
+        assert lone.attachments[0].filename == "logs.zip"
 
     def test_confusable_filenames_group_together(self):
         attachments = [

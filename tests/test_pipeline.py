@@ -11,6 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import select
 
+from telecrime.extractor.interface import ExtractionResult
+from telecrime.extractor.seven_zip import SevenZipExtractor
+from telecrime.extractor.unrar import UnrarExtractor
 from telecrime.models import PipelineRun
 from telecrime.pipeline.acquire import AcquireStage
 from telecrime.pipeline.discover import DiscoverStage
@@ -662,6 +665,360 @@ class TestExtractStageDirect:
         # password learned meanwhile) can retry them instead of stranding
         # them in EXTRACTING.
         assert group.status in (GroupStatus.READY, GroupStatus.FAILED)
+
+
+class TestExtractStageNestedBatching:
+    """Regression: nested archives beyond the batch cap must all be extracted."""
+
+    @pytest.mark.asyncio
+    async def test_nested_archives_beyond_batch_cap_are_all_extracted(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """Cap must only bound batch size, never drop the tail.
+
+        Previously `nested_archives[:_max_nested]` silently discarded archives
+        501+, the caller marked the group EXTRACTED, and finalize deleted the
+        source archives — permanent data loss for the unprocessed tail.
+        """
+        stage = ExtractStage()
+        monkeypatch.setattr(stage, "_MAX_NESTED_ARCHIVES", 2)
+
+        output_dir = tmp_path / "extracted" / "group_1"
+        output_dir.mkdir(parents=True)
+        for i in range(5):
+            (output_dir / f"victim_{i}.zip").write_bytes(b"PK\x03\x04")
+
+        extractor = MagicMock()
+
+        async def _extract(archive, dest, **kwargs):
+            out = dest / (archive.stem + ".txt")
+            out.write_text("https://example.com;user;pass\n", encoding="utf-8")
+            return SimpleNamespace(
+                success=True, extracted_files=[out], requires_password=False
+            )
+
+        extractor.extract = AsyncMock(side_effect=_extract)
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        outcome = await stage._try_nested_extraction(output_dir, ["txt"], extractor, [], ctx)
+
+        assert len(outcome.txt_files) == 5, "all nested archives must be extracted, not just the first batch"
+        assert extractor.extract.await_count == 5
+        assert outcome.failures == []
+
+
+class TestExtractStageNestedExtractorSelection:
+    """Nested archives must be extracted by an extractor that supports them."""
+
+    @pytest.mark.asyncio
+    async def test_nested_zip_uses_seven_zip_when_outer_selected_unrar(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """A RAR5 outer archive switches the run to unrar, but unrar cannot
+        open nested zip members (UNSUPPORTED_FORMAT). Those members were
+        silently skipped, the group marked EXTRACTED and all sources deleted.
+        """
+        stage = ExtractStage()
+        output_dir = tmp_path / "extracted" / "group_1"
+        output_dir.mkdir(parents=True)
+        (output_dir / "victims.zip").write_bytes(b"PK\x03\x04")
+
+        calls: list[str] = []
+
+        async def _fake_extract(self, archive, dest, **kwargs):
+            calls.append(type(self).__name__)
+            out = dest / (archive.stem + ".txt")
+            out.write_text("https://example.com;user;pass\n", encoding="utf-8")
+            return ExtractionResult(success=True, extracted_files=[out])
+
+        monkeypatch.setattr(SevenZipExtractor, "extract", _fake_extract)
+        monkeypatch.setattr(UnrarExtractor, "extract", _fake_extract)
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        outcome = await stage._try_nested_extraction(
+            output_dir, ["txt"], UnrarExtractor(), [], ctx
+        )
+
+        assert len(outcome.txt_files) == 1
+        assert outcome.failures == []
+        assert calls == ["SevenZipExtractor"], "nested .zip must not go to unrar"
+
+
+class TestExtractStageNestedFailureRetryable:
+    """Nested failures must not be hidden while finalize deletes the sources."""
+
+    @pytest.mark.asyncio
+    async def test_try_nested_extraction_reports_wrong_password_failure(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """One recovered txt + one wrong-password nested archive must report
+        the password failure instead of returning only the successes."""
+        stage = ExtractStage()
+        output_dir = tmp_path / "extracted" / "group_1"
+        output_dir.mkdir(parents=True)
+        (output_dir / "good.zip").write_bytes(b"PK\x03\x04")
+        (output_dir / "locked.zip").write_bytes(b"PK\x03\x04")
+
+        async def _fake_extract(self, archive, dest, **kwargs):
+            if archive.name == "locked.zip":
+                return ExtractionResult(
+                    success=False,
+                    error_code="WRONG_PASSWORD",
+                    error_message="Wrong password",
+                    wrong_password=True,
+                )
+            out = dest / (archive.stem + ".txt")
+            out.write_text("https://example.com;user;pass\n", encoding="utf-8")
+            return ExtractionResult(success=True, extracted_files=[out])
+
+        monkeypatch.setattr(SevenZipExtractor, "extract", _fake_extract)
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        outcome = await stage._try_nested_extraction(
+            output_dir, ["txt"], SevenZipExtractor(), [], ctx
+        )
+
+        assert len(outcome.txt_files) == 1, "the healthy nested archive is still recovered"
+        assert outcome.requires_password is True
+        assert outcome.retryable_failure is True
+        assert [p.name for p, _ in outcome.failures] == ["locked.zip"]
+
+    @pytest.mark.asyncio
+    async def test_group_stays_retryable_when_nested_failure(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """End-to-end: a group whose nested archives partly failed with a wrong
+        password must stay retryable, otherwise finalize deletes every nested
+        source archive while one member was never recovered."""
+        from sqlalchemy.orm import joinedload
+
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            ExtractedOutput,
+            ExtractionJob,
+            FileAttachment,
+            Message,
+        )
+
+        conv = Conversation(platform_id=399, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=2,
+            platform_timestamp=datetime.now(UTC),
+            text="nested dump",
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id,
+            platform_file_id="nested-outer",
+            filename="outer.zip",
+            archive_type="zip",
+        )
+        session.add(attachment)
+        session.flush()
+
+        dl_path = tmp_path / "downloads" / "outer.zip"
+        dl_path.parent.mkdir(parents=True, exist_ok=True)
+        dl_path.write_bytes(b"PK\x03\x04 outer")
+
+        artifact = DownloadArtifact(attachment_id=attachment.id, local_path=str(dl_path))
+        session.add(artifact)
+        session.flush()
+        group = ArchiveGroup(
+            fingerprint="nested-group",
+            base_name="outer.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.READY,
+        )
+        session.add(group)
+        session.flush()
+        session.add(ArchiveGroupPart(group_id=group.id, artifact_id=artifact.id, part_index=0))
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.PENDING)
+        session.add(job)
+        session.flush()
+        session.commit()
+
+        group = session.get(
+            ArchiveGroup,
+            group.id,
+            options=[
+                joinedload(ArchiveGroup.parts)
+                .joinedload(ArchiveGroupPart.artifact)
+                .joinedload(DownloadArtifact.attachment)
+            ],
+        )
+        job_id = job.id
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        stage = ExtractStage()
+        monkeypatch.setattr(stage, "_has_sufficient_disk", lambda _ctx: True)
+        monkeypatch.setattr(
+            stage, "_get_password_candidates", AsyncMock(return_value=[])
+        )
+
+        extractor = SevenZipExtractor()
+
+        async def _fake_extract(archive, dest, **kwargs):
+            dest.mkdir(parents=True, exist_ok=True)
+            if archive.name == "outer.zip":
+                (dest / "good.zip").write_bytes(b"PK\x03\x04")
+                (dest / "locked.zip").write_bytes(b"PK\x03\x04")
+                return ExtractionResult(
+                    success=True,
+                    extracted_files=[dest / "good.zip", dest / "locked.zip"],
+                )
+            if archive.name == "good.zip":
+                out = dest / "creds.txt"
+                out.write_text("https://example.com;user;pass\n", encoding="utf-8")
+                return ExtractionResult(success=True, extracted_files=[out])
+            return ExtractionResult(
+                success=False,
+                error_code="WRONG_PASSWORD",
+                error_message="Wrong password",
+                wrong_password=True,
+            )
+
+        extractor.list_contents = AsyncMock(return_value=["good.zip", "locked.zip"])
+        extractor.extract = AsyncMock(side_effect=_fake_extract)
+
+        result = await stage._extract_group(ctx, group, extractor)
+
+        assert result is False
+        assert session.get(ArchiveGroup, group.id).status == GroupStatus.READY
+        assert session.get(ExtractionJob, job_id).status == ExtractionStatus.PASSWORD_NEEDED
+        # Nothing is recorded for a group that will be retried (the hardlink /
+        # output rows would otherwise duplicate on the next attempt).
+        assert session.query(ExtractedOutput).filter_by(job_id=job_id).count() == 0
+
+
+class TestEnrichStageOriginRetry:
+    """Transient origin-resolution failures must not permanently skip messages."""
+
+    def _forwarded_message(self, session, *, forwarded_from_id: int):
+        from telecrime.models import Conversation, FileAttachment, Message
+
+        conv = Conversation(
+            platform_id=forwarded_from_id * 10, conversation_type="channel"
+        )
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=1,
+            platform_timestamp=datetime.now(UTC),
+            text="dump",
+            is_forwarded=True,
+            forwarded_from_id=forwarded_from_id,
+            is_processed=False,
+        )
+        session.add(msg)
+        session.flush()
+        session.add(
+            FileAttachment(
+                message_id=msg.id,
+                platform_file_id="f-origin",
+                filename="dump.zip",
+                is_archive_candidate=True,
+            )
+        )
+        session.commit()
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_leaves_message_unprocessed_then_retries(
+        self, session, test_config
+    ):
+        """A network failure must not set is_processed — the next run retries."""
+        from telecrime.adapters.base import ConversationInfo
+        from telecrime.models import Message
+        from telecrime.pipeline.enrich import EnrichStage
+
+        msg = self._forwarded_message(session, forwarded_from_id=4242)
+        adapter = MagicMock()
+        adapter.resolve_forwarded_source = AsyncMock(
+            side_effect=TimeoutError("network timeout")
+        )
+        ctx = PipelineContext(config=test_config, session=session, adapter=adapter)
+
+        await EnrichStage().run(ctx)
+
+        session.expire_all()
+        assert session.get(Message, msg.id).is_processed is False
+
+        # Next run: still eligible, resolves successfully, marks processed.
+        adapter.resolve_forwarded_source = AsyncMock(
+            return_value=ConversationInfo(
+                platform_id=4242,
+                access_hash=None,
+                title="origin",
+                username=None,
+                conversation_type="channel",
+                is_member=True,
+                is_accessible=True,
+            )
+        )
+        await EnrichStage().run(ctx)
+
+        session.expire_all()
+        assert session.get(Message, msg.id).is_processed is True
+
+    @pytest.mark.asyncio
+    async def test_permanent_unresolvable_marks_processed(self, session, test_config):
+        """None from the adapter is a permanent result — do not retry forever."""
+        from telecrime.models import Message
+        from telecrime.pipeline.enrich import EnrichStage
+
+        msg = self._forwarded_message(session, forwarded_from_id=4343)
+        adapter = MagicMock()
+        adapter.resolve_forwarded_source = AsyncMock(return_value=None)
+        ctx = PipelineContext(config=test_config, session=session, adapter=adapter)
+
+        await EnrichStage().run(ctx)
+
+        session.expire_all()
+        assert session.get(Message, msg.id).is_processed is True
+
+    @pytest.mark.asyncio
+    async def test_success_creates_conversation_and_marks_processed(
+        self, session, test_config
+    ):
+        from sqlalchemy import select
+
+        from telecrime.adapters.base import ConversationInfo
+        from telecrime.models import Conversation, Message
+        from telecrime.pipeline.enrich import EnrichStage
+
+        msg = self._forwarded_message(session, forwarded_from_id=4444)
+        adapter = MagicMock()
+        adapter.resolve_forwarded_source = AsyncMock(
+            return_value=ConversationInfo(
+                platform_id=4444,
+                access_hash=123,
+                title="origin",
+                username="originchan",
+                conversation_type="channel",
+                is_member=True,
+                is_accessible=True,
+            )
+        )
+        ctx = PipelineContext(config=test_config, session=session, adapter=adapter)
+
+        await EnrichStage().run(ctx)
+
+        session.expire_all()
+        assert session.get(Message, msg.id).is_processed is True
+        origin = session.execute(
+            select(Conversation).where(Conversation.platform_id == 4444)
+        ).scalar_one()
+        assert origin.title == "origin"
+        assert origin.is_accessible is True
 
 
 class TestPlanStage:
@@ -1717,7 +2074,7 @@ class TestParseParallelChunking:
             "https://site.com;bob;pw123",
             "https://pipe.com | carol | pw456",
         ]
-        worker_result = _parse_lines_chunk_worker((lines, "/tmp/x.txt"))
+        worker_result = _parse_lines_chunk_worker((lines, "/tmp/x.txt", False))
         sequential = [
             (c.url, c.username, c.password, c.application, c.profile)
             for c in parse_credential_lines(iter(lines), "/tmp/x.txt")
@@ -1737,7 +2094,7 @@ class TestParseParallelChunking:
 
         src = "/tmp/combo-fast-chunk.txt"
         lines = [f"https://site{i}.com;u{i};p{i}" for i in range(5000)]
-        worker_result = _parse_lines_chunk_worker((lines, src))
+        worker_result = _parse_lines_chunk_worker((lines, src, True))
         sequential = [
             (c.url, c.username, c.password, c.application, c.profile)
             for c in parse_credential_lines(iter(lines), src)
@@ -1760,6 +2117,86 @@ class TestParseParallelChunking:
         for start in range(0, 1000, 250):
             split.extend(parse_credential_lines(iter(lines[start : start + 250]), src))
         assert split == combined
+
+    def test_mixed_file_later_combo_chunk_keeps_labeled_creds(self):
+        """A later chunk of a mixed file whose own head is combo-dominant must
+        be parsed with the TRUE file-head decision, not re-classified from the
+        chunk — otherwise its labeled credentials are silently dropped."""
+        import itertools
+
+        from telecrime.pipeline.parse import (
+            _iter_line_chunks,
+            _parse_lines_chunk_worker,
+            _read_combo_probe,
+        )
+        from telecrime.stealer.parser import _classify_combo_head
+
+        src = "/tmp/mixed-late-combo.txt"
+        combo_a = [f"https://a{i}.com:user{i}:pass{i}" for i in range(100)]
+        combo_b = [f"https://b{i}.com:user{i}:pass{i}" for i in range(300)]
+        combo_c = [f"https://c{i}.com:user{i}:pass{i}" for i in range(100)]
+        head_block = [
+            "Soft: Chrome",
+            "Host: https://head.example",
+            "Login: head",
+            "Password: headpw",
+            "",
+        ]
+        late_block = [
+            "Host: https://late.example",
+            "Login: late",
+            "Password: latepw",
+        ]
+        lines = head_block + combo_a + [""] + combo_b + late_block + [""] + combo_c
+
+        fh = StringIO("\n".join(lines))
+        head, decision = _read_combo_probe(fh)
+        # The probe reads only the documented first-200-line window.
+        assert len(head) == 200
+        assert decision is False
+        chunks = list(_iter_line_chunks(itertools.chain(head, fh), chunk_lines=100))
+
+        # A later chunk's own probe window is combo-only: the old per-chunk
+        # classification would send it down the combo fast path.
+        later_combo_dominant = [
+            c for c in chunks[1:] if _classify_combo_head(c[:200]) is True
+        ]
+        late_chunk = next(
+            c for c in later_combo_dominant if any("late" in line for line in c)
+        )
+        late_creds = _parse_lines_chunk_worker((late_chunk, src, decision))
+        assert any(t[2] == "late" for t in late_creds)
+        assert len(late_creds) == 301  # 300 combo rows + labeled "late"
+
+        # Whole file (all chunks) parses nothing away: 500 combo rows + 2
+        # labeled credentials.
+        all_creds = []
+        for chunk in chunks:
+            all_creds.extend(_parse_lines_chunk_worker((chunk, src, decision)))
+        assert len(all_creds) == 502
+        assert {t[2] for t in all_creds} >= {"head", "late"}
+
+
+class TestParseInListBatching:
+    """_parse_job_outputs batches IN-list queries below PostgreSQL's 65,535
+    bind-parameter limit so large jobs cannot raise OperationalError."""
+
+    def test_iter_in_batches_splits_large_values(self):
+        from telecrime.pipeline.parse import _IN_QUERY_BATCH_SIZE, _iter_in_batches
+
+        values = [f"hash-{i}" for i in range(70_000)]
+        batches = list(_iter_in_batches(values))
+        assert len(batches) == 70
+        assert all(len(b) <= 65535 for b in batches)
+        assert all(len(b) <= _IN_QUERY_BATCH_SIZE for b in batches)
+        # Batches preserve order and cover every value exactly once.
+        assert [v for b in batches for v in b] == values
+
+    def test_iter_in_batches_empty_and_remainder(self):
+        from telecrime.pipeline.parse import _iter_in_batches
+
+        assert list(_iter_in_batches([])) == []
+        assert [len(b) for b in _iter_in_batches(["x"] * 2500)] == [1000, 1000, 500]
 
 
 class TestAcquireStaleCleanup:
@@ -2048,6 +2485,296 @@ class TestFinalizeStageCredentialCount:
         assert group.status.value == "cleaned"
 
 
+class TestFinalizeFirstSeenUpsert:
+    """first_seen_index writes must be atomic under concurrent finalize runs."""
+
+    def test_upsert_increments_existing_row_without_integrity_error(self, session):
+        """A concurrent run that already inserted the hash must be counted as a
+        duplicate instead of aborting finalize with an IntegrityError."""
+        from telecrime.models import ExtractedOutput, FirstSeenIndex
+        from telecrime.pipeline.finalize import FinalizeStage
+
+        session.add(
+            FirstSeenIndex(
+                content_hash="a" * 64,
+                content_type="extracted",
+                first_seen_timestamp=datetime(2024, 1, 1, tzinfo=UTC),
+                duplicate_count=0,
+            )
+        )
+        session.commit()
+
+        output = ExtractedOutput(
+            output_path="/tmp/dup.txt",
+            output_filename="dup.txt",
+            output_hash="a" * 64,
+        )
+        stage = FinalizeStage()
+        stage._upsert_first_seen(
+            session,
+            output=output,
+            msg=None,
+            first_seen_ts=datetime(2025, 1, 1, tzinfo=UTC),
+        )
+        session.commit()
+
+        row = session.query(FirstSeenIndex).filter_by(content_hash="a" * 64).one()
+        assert row.duplicate_count == 1
+
+    def test_upsert_same_hash_twice_in_one_run_increments(self, session):
+        """Repeated hashes in one group hit ON CONFLICT and count as dups."""
+        from telecrime.models import ExtractedOutput, FirstSeenIndex
+        from telecrime.pipeline.finalize import FinalizeStage
+
+        output = ExtractedOutput(
+            output_path="/tmp/new.txt",
+            output_filename="new.txt",
+            output_hash="b" * 64,
+        )
+        stage = FinalizeStage()
+        now = datetime.now(UTC)
+        stage._upsert_first_seen(session, output=output, msg=None, first_seen_ts=now)
+        stage._upsert_first_seen(session, output=output, msg=None, first_seen_ts=now)
+        session.commit()
+
+        row = session.query(FirstSeenIndex).filter_by(content_hash="b" * 64).one()
+        assert row.duplicate_count == 1
+
+    @pytest.mark.asyncio
+    async def test_record_first_seen_repeat_increments_existing_row(
+        self, session, test_config
+    ):
+        """A second finalize of the same group takes the atomic UPDATE branch."""
+        from telecrime.models import (
+            ArchiveGroup,
+            ExtractedOutput,
+            ExtractionJob,
+            FirstSeenIndex,
+        )
+        from telecrime.pipeline.finalize import FinalizeStage
+
+        group = ArchiveGroup(
+            fingerprint="first-seen-repeat",
+            base_name="repeat.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.EXTRACTED,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+        session.add(job)
+        session.flush()
+        session.add(
+            ExtractedOutput(
+                job_id=job.id,
+                output_path="/tmp/repeat.txt",
+                output_filename="repeat.txt",
+                output_hash="c" * 64,
+            )
+        )
+        session.commit()
+
+        stage = FinalizeStage()
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+
+        await stage._record_first_seen(ctx, group)
+        session.commit()
+        row = session.query(FirstSeenIndex).filter_by(content_hash="c" * 64).one()
+        assert row.duplicate_count == 0
+
+        await stage._record_first_seen(ctx, group)
+        session.commit()
+        session.expire_all()
+        row = session.query(FirstSeenIndex).filter_by(content_hash="c" * 64).one()
+        assert row.duplicate_count == 1
+
+    @pytest.mark.asyncio
+    async def test_record_first_seen_keeps_earliest_timestamp_for_repeats(
+        self, session, test_config
+    ):
+        """Out-of-order duplicate timestamps must not overwrite an earlier
+        first_seen refined during the same run."""
+        from telecrime.models import (
+            ArchiveGroup,
+            Conversation,
+            ExtractedOutput,
+            ExtractionJob,
+            FirstSeenIndex,
+            Message,
+        )
+        from telecrime.pipeline.finalize import FinalizeStage
+
+        session.add(
+            FirstSeenIndex(
+                content_hash="d" * 64,
+                content_type="extracted",
+                first_seen_timestamp=datetime(2024, 6, 1, tzinfo=UTC),
+                duplicate_count=0,
+            )
+        )
+        conv = Conversation(platform_id=7, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        early = Message(
+            conversation_id=conv.id,
+            platform_id=1,
+            platform_timestamp=datetime(2024, 1, 1, tzinfo=UTC),
+        )
+        late = Message(
+            conversation_id=conv.id,
+            platform_id=2,
+            platform_timestamp=datetime(2024, 5, 1, tzinfo=UTC),
+        )
+        session.add_all([early, late])
+        session.flush()
+
+        group = ArchiveGroup(
+            fingerprint="first-seen-earliest",
+            base_name="earliest.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.EXTRACTED,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+        session.add(job)
+        session.flush()
+        session.add_all(
+            [
+                # Explicit ids keep SQLite rowid order deterministic: the
+                # earlier timestamp is processed first.
+                ExtractedOutput(
+                    id=1,
+                    job_id=job.id,
+                    output_path="/tmp/early.txt",
+                    output_filename="early.txt",
+                    output_hash="d" * 64,
+                    source_conversation_id=conv.id,
+                    source_message_id=early.id,
+                ),
+                ExtractedOutput(
+                    id=2,
+                    job_id=job.id,
+                    output_path="/tmp/late.txt",
+                    output_filename="late.txt",
+                    output_hash="d" * 64,
+                    source_conversation_id=conv.id,
+                    source_message_id=late.id,
+                ),
+            ]
+        )
+        session.commit()
+
+        stage = FinalizeStage()
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        await stage._record_first_seen(ctx, group)
+        session.commit()
+        session.expire_all()
+        row = session.query(FirstSeenIndex).filter_by(content_hash="d" * 64).one()
+        assert row.duplicate_count == 2
+        assert row.first_seen_timestamp.replace(tzinfo=UTC) == datetime(2024, 1, 1, tzinfo=UTC)
+
+
+class TestFinalizeSweepOrphanedDownloads:
+    """The orphan sweep must batch local_path lookups across the directory."""
+
+    @pytest.mark.asyncio
+    async def test_sweep_batches_across_chunks_and_preserves_live_files(
+        self, session, test_config
+    ):
+        import os
+        import time as _time
+
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.pipeline.finalize import FinalizeStage
+        from telecrime.states import DownloadStatus
+
+        downloads = test_config.downloads_dir
+        orphan = downloads / "orphan.zip"
+        cleaned_file = downloads / "cleaned.zip"
+        live_file = downloads / "live.zip"
+        for path in (orphan, cleaned_file, live_file):
+            path.write_bytes(b"data")
+            old = _time.time() - 3600
+            os.utime(path, (old, old))
+
+        conv = Conversation(platform_id=1, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=1,
+            platform_timestamp=datetime.now(UTC),
+        )
+        session.add(msg)
+        session.flush()
+        att_live = FileAttachment(
+            message_id=msg.id, platform_file_id="f-sweep-live", filename="live.zip"
+        )
+        att_cleaned = FileAttachment(
+            message_id=msg.id, platform_file_id="f-sweep-cleaned", filename="cleaned.zip"
+        )
+        session.add_all([att_live, att_cleaned])
+        session.flush()
+        live_art = DownloadArtifact(
+            attachment_id=att_live.id,
+            local_path=str(live_file),
+            status=DownloadStatus.COMPLETED,
+        )
+        cleaned_art = DownloadArtifact(
+            attachment_id=att_cleaned.id,
+            local_path=str(cleaned_file),
+            status=DownloadStatus.COMPLETED,
+        )
+        live_group = ArchiveGroup(
+            fingerprint="sweep-live",
+            base_name="live.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.READY,
+        )
+        cleaned_group = ArchiveGroup(
+            fingerprint="sweep-cleaned",
+            base_name="cleaned.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.CLEANED,
+        )
+        session.add_all([live_art, cleaned_art, live_group, cleaned_group])
+        session.flush()
+        session.add_all(
+            [
+                ArchiveGroupPart(group_id=live_group.id, artifact_id=live_art.id, part_index=0),
+                ArchiveGroupPart(
+                    group_id=cleaned_group.id, artifact_id=cleaned_art.id, part_index=0
+                ),
+            ]
+        )
+        session.commit()
+
+        stage = FinalizeStage()
+        stage._BATCH_SIZE = 1  # force multiple candidate chunks
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        await stage._sweep_orphaned_downloads(ctx)
+        session.commit()
+
+        assert not orphan.exists()
+        assert not cleaned_file.exists()
+        assert live_file.exists()
+        session.expire_all()
+        assert session.get(DownloadArtifact, live_art.id).is_deleted is False
+        assert session.get(DownloadArtifact, cleaned_art.id).is_deleted is True
+
+
 class TestParseEarlyDupSkip:
     """Tests for the duplicate-heavy file early-exit heuristic."""
 
@@ -2140,6 +2867,88 @@ class TestFinalizeStageNoDeleteRetryable:
 
         assert ok is True
         assert cleaned.count(group.id) == 2  # archives + extracted files cleanup
+        assert session.get(ArchiveGroup, group.id).status == GroupStatus.CLEANED
+
+    @pytest.mark.asyncio
+    async def test_finalize_defers_terminal_group_with_pending_retry(
+        self, session, test_config, monkeypatch
+    ):
+        """A PENDING job below the shared attempts cap still needs the archive."""
+        from telecrime.models import ArchiveGroup, ExtractionJob
+        from telecrime.pipeline.constants import EXTRACTION_MAX_ATTEMPTS
+        from telecrime.pipeline.finalize import FinalizeStage
+        from telecrime.states import ExtractionStatus, GroupStatus
+
+        group = ArchiveGroup(
+            fingerprint="f-term-pending",
+            base_name="f-term-pending.rar",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.FAILED_TERMINAL,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(
+            group_id=group.id,
+            status=ExtractionStatus.PENDING,
+            attempts_count=EXTRACTION_MAX_ATTEMPTS - 1,
+        )
+        session.add(job)
+        session.flush()
+        session.commit()
+
+        stage = FinalizeStage()
+        cleaned = []
+        async def _fake_cleanup(ctx, group):
+            cleaned.append(group.id)
+        monkeypatch.setattr(stage, "_cleanup_archives", _fake_cleanup)
+        monkeypatch.setattr(stage, "_cleanup_extracted_files", _fake_cleanup)
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        await stage.run_group(ctx, group.id)
+
+        assert cleaned == [], "below-cap PENDING retry must keep the archive"
+        assert session.get(ArchiveGroup, group.id).status == GroupStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_finalize_cleans_terminal_group_at_pending_attempts_cap(
+        self, session, test_config, monkeypatch
+    ):
+        """A PENDING job already at the shared cap is genuinely terminal."""
+        from telecrime.models import ArchiveGroup, ExtractionJob
+        from telecrime.pipeline.constants import EXTRACTION_MAX_ATTEMPTS
+        from telecrime.pipeline.finalize import FinalizeStage
+        from telecrime.states import ExtractionStatus, GroupStatus
+
+        group = ArchiveGroup(
+            fingerprint="f-term-capped",
+            base_name="f-term-capped.rar",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.FAILED_TERMINAL,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(
+            group_id=group.id,
+            status=ExtractionStatus.PENDING,
+            attempts_count=EXTRACTION_MAX_ATTEMPTS,
+        )
+        session.add(job)
+        session.flush()
+        session.commit()
+
+        stage = FinalizeStage()
+        cleaned = []
+        async def _fake_cleanup(ctx, group):
+            cleaned.append(group.id)
+        monkeypatch.setattr(stage, "_cleanup_archives", _fake_cleanup)
+        monkeypatch.setattr(stage, "_cleanup_extracted_files", _fake_cleanup)
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        await stage.run_group(ctx, group.id)
+
+        assert cleaned.count(group.id) == 2
         assert session.get(ArchiveGroup, group.id).status == GroupStatus.CLEANED
 
 

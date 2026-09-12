@@ -751,7 +751,7 @@ def _search_for_export(
         except Exception:
             messages = []
 
-    if not messages:
+    if not messages and terms:
         messages = (
             session.query(Message)
             .filter(like_any(Message.text, Message.caption, Message.post_author))
@@ -762,62 +762,77 @@ def _search_for_export(
     if exclude_conversation_ids:
         messages = [m for m in messages if m.conversation_id not in exclude_conversation_ids]
 
-    attachments = (
-        session.query(FileAttachment)
-        .join(Message, Message.id == FileAttachment.message_id)
-        .filter(like_any(FileAttachment.filename, FileAttachment.mime_type))
-        .order_by(FileAttachment.created_at.desc())
-        .limit(limit_attachments)
-        .all()
-    )
-    if exclude_conversation_ids:
-        attachments = [
-            a for a in attachments if a.message.conversation_id not in exclude_conversation_ids
-        ]
-    archives = (
-        session.query(DownloadArtifact)
-        .join(FileAttachment, FileAttachment.id == DownloadArtifact.attachment_id)
-        .join(Message, Message.id == FileAttachment.message_id)
-        .filter(like_any(DownloadArtifact.local_path, DownloadArtifact.temp_path))
-        .order_by(DownloadArtifact.created_at.desc())
-        .limit(limit_archives)
-        .all()
-    )
-    if exclude_conversation_ids:
-        archives = [
-            a
-            for a in archives
-            if a.attachment.message.conversation_id not in exclude_conversation_ids
-        ]
-    extracted = (
-        session.query(ExtractedOutput)
-        .filter(like_any(ExtractedOutput.output_filename, ExtractedOutput.output_path))
-        .order_by(ExtractedOutput.created_at.desc())
-        .limit(limit_extracted)
-        .all()
-    )
-    if exclude_conversation_ids:
-        extracted = [
-            e for e in extracted if e.source_conversation_id not in exclude_conversation_ids
-        ]
-    conversations = (
-        session.query(Conversation)
-        .filter(like_any(Conversation.title, Conversation.username, Conversation.notes))
-        .order_by(Conversation.created_at.desc())
-        .limit(limit_conversations)
-        .all()
-    )
-    if exclude_conversation_ids:
-        conversations = [c for c in conversations if c.id not in exclude_conversation_ids]
-    channels = (
-        session.query(TelegramChannel)
-        .filter(like_any(TelegramChannel.username, TelegramChannel.title, TelegramChannel.notes))
-        .order_by(TelegramChannel.discovered_at.desc())
-        .limit(limit_channels)
-        .all()
-    )
-    if exclude_channel_ids:
-        channels = [c for c in channels if c.id not in exclude_channel_ids]
+    # The entities below have no structured filter beyond the free-text
+    # pattern: with no terms, `like_any` would degrade to "%%" and export
+    # unrelated rows.
+    attachments = []
+    if terms:
+        attachments = (
+            session.query(FileAttachment)
+            .join(Message, Message.id == FileAttachment.message_id)
+            .filter(like_any(FileAttachment.filename, FileAttachment.mime_type))
+            .order_by(FileAttachment.created_at.desc())
+            .limit(limit_attachments)
+            .all()
+        )
+        if exclude_conversation_ids:
+            attachments = [
+                a for a in attachments if a.message.conversation_id not in exclude_conversation_ids
+            ]
+    archives = []
+    if terms:
+        archives = (
+            session.query(DownloadArtifact)
+            .join(FileAttachment, FileAttachment.id == DownloadArtifact.attachment_id)
+            .join(Message, Message.id == FileAttachment.message_id)
+            .filter(like_any(DownloadArtifact.local_path, DownloadArtifact.temp_path))
+            .order_by(DownloadArtifact.created_at.desc())
+            .limit(limit_archives)
+            .all()
+        )
+        if exclude_conversation_ids:
+            archives = [
+                a
+                for a in archives
+                if a.attachment.message.conversation_id not in exclude_conversation_ids
+            ]
+    extracted = []
+    if terms:
+        extracted = (
+            session.query(ExtractedOutput)
+            .filter(like_any(ExtractedOutput.output_filename, ExtractedOutput.output_path))
+            .order_by(ExtractedOutput.created_at.desc())
+            .limit(limit_extracted)
+            .all()
+        )
+        if exclude_conversation_ids:
+            extracted = [
+                e for e in extracted if e.source_conversation_id not in exclude_conversation_ids
+            ]
+    conversations = []
+    if terms:
+        conversations = (
+            session.query(Conversation)
+            .filter(like_any(Conversation.title, Conversation.username, Conversation.notes))
+            .order_by(Conversation.created_at.desc())
+            .limit(limit_conversations)
+            .all()
+        )
+        if exclude_conversation_ids:
+            conversations = [c for c in conversations if c.id not in exclude_conversation_ids]
+    channels = []
+    if terms:
+        channels = (
+            session.query(TelegramChannel)
+            .filter(
+                like_any(TelegramChannel.username, TelegramChannel.title, TelegramChannel.notes)
+            )
+            .order_by(TelegramChannel.discovered_at.desc())
+            .limit(limit_channels)
+            .all()
+        )
+        if exclude_channel_ids:
+            channels = [c for c in channels if c.id not in exclude_channel_ids]
 
     if regex and terms:
         try:
@@ -2334,42 +2349,36 @@ def create_app(database_url: str | None = None) -> FastAPI:
             cached_stats = cached_home.get("stats") if cached_home else None
             stats = None
             if excluded_conversations or excluded_channels:
+                # Real COUNT(*) over messages/attachments/archives/jobs/outputs/
+                # credentials (100M-300M rows) is a seq scan on every request
+                # once TELECRIME_EXCLUDE_NAMES is set. Use the same instant
+                # pg_class estimates as the non-exclusion path; only the small
+                # conversations/archive_groups/channels tables keep exact counts.
+                try:
+                    estimates = _pg_fast_count_estimates(
+                        session,
+                        "messages",
+                        "file_attachments",
+                        "download_artifacts",
+                        "extraction_jobs",
+                        "extracted_outputs",
+                        "parsed_credentials",
+                    )
+                except Exception:
+                    estimates = {}
                 stats = {
                     "conversations": session.query(Conversation)
                     .filter(Conversation.id.notin_(excluded_conversations))
                     .count()
                     if excluded_conversations
                     else session.query(Conversation).count(),
-                    "messages": session.query(Message)
-                    .filter(Message.conversation_id.notin_(excluded_conversations))
-                    .count()
-                    if excluded_conversations
-                    else session.query(Message).count(),
-                    "attachments": session.query(FileAttachment)
-                    .join(Message, Message.id == FileAttachment.message_id)
-                    .filter(Message.conversation_id.notin_(excluded_conversations))
-                    .count()
-                    if excluded_conversations
-                    else session.query(FileAttachment).count(),
-                    "archives": session.query(DownloadArtifact)
-                    .join(FileAttachment, FileAttachment.id == DownloadArtifact.attachment_id)
-                    .join(Message, Message.id == FileAttachment.message_id)
-                    .filter(Message.conversation_id.notin_(excluded_conversations))
-                    .count()
-                    if excluded_conversations
-                    else session.query(DownloadArtifact).count(),
+                    "messages": estimates.get("messages", 0),
+                    "attachments": estimates.get("file_attachments", 0),
+                    "archives": estimates.get("download_artifacts", 0),
                     "archive_groups": session.query(ArchiveGroup).count(),
-                    "extractions": session.query(ExtractionJob).count(),
-                    "extracted_outputs": session.query(ExtractedOutput)
-                    .filter(ExtractedOutput.source_conversation_id.notin_(excluded_conversations))
-                    .count()
-                    if excluded_conversations
-                    else session.query(ExtractedOutput).count(),
-                    "credentials": session.query(ParsedCredential)
-                    .filter(ParsedCredential.source_conversation_id.notin_(excluded_conversations))
-                    .count()
-                    if excluded_conversations
-                    else session.query(ParsedCredential).count(),
+                    "extractions": estimates.get("extraction_jobs", 0),
+                    "extracted_outputs": estimates.get("extracted_outputs", 0),
+                    "credentials": estimates.get("parsed_credentials", 0),
                     "channels": session.query(TelegramChannel)
                     .filter(TelegramChannel.id.notin_(excluded_channels))
                     .count()
@@ -3043,7 +3052,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                                 )
                         except Exception:
                             pass
-                    if not message_results and not app.state.fts_enabled:
+                    if not message_results and not app.state.fts_enabled and terms:
                         message_query = session.query(Message).filter(
                             like_any(Message.text, Message.caption, Message.post_author)
                         )
@@ -3058,7 +3067,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                         )
 
                 attachment_results = []
-                if limit_attachments > 0:
+                if limit_attachments > 0 and terms:
                     attachment_query = (
                         session.query(FileAttachment)
                         .join(Message, Message.id == FileAttachment.message_id)
@@ -3075,7 +3084,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     )
 
                 archive_results = []
-                if limit_archives > 0:
+                if limit_archives > 0 and terms:
                     archive_query = (
                         session.query(DownloadArtifact)
                         .join(FileAttachment, FileAttachment.id == DownloadArtifact.attachment_id)
@@ -3093,7 +3102,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     )
 
                 extracted_results = []
-                if limit_extracted > 0:
+                if limit_extracted > 0 and terms:
                     extracted_query = session.query(ExtractedOutput).filter(
                         like_any(ExtractedOutput.output_filename, ExtractedOutput.output_path)
                     )
@@ -3108,7 +3117,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     )
 
                 conversation_results = []
-                if limit_conversations > 0:
+                if limit_conversations > 0 and terms:
                     conversation_query = session.query(Conversation).filter(
                         like_any(Conversation.title, Conversation.username, Conversation.notes)
                     )
@@ -3123,7 +3132,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     )
 
                 channel_results = []
-                if limit_channels > 0:
+                if limit_channels > 0 and terms:
                     channel_query = session.query(TelegramChannel).filter(
                         like_any(
                             TelegramChannel.username, TelegramChannel.title, TelegramChannel.notes
@@ -3429,6 +3438,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
             if not query:
                 return
             with get_session(engine) as session:
+                if session.get_bind().dialect.name == "postgresql":
+                    # The 8-column LIKE fallback has no usable index; bound it
+                    # so a broad query cannot scan parsed_credentials forever.
+                    session.execute(text("SET LOCAL statement_timeout = '30s'"))
                 excluded_conversations, _excluded_channels = _get_exclusions(session)
                 pattern = f"%{terms.lower()}%"
 
@@ -4910,6 +4923,11 @@ def create_app(database_url: str | None = None) -> FastAPI:
     @app.get("/credential/{credential_id}", response_class=HTMLResponse)
     def credential_detail(request: Request, credential_id: int):
         with get_session(engine) as session:
+            if session.get_bind().dialect.name == "postgresql":
+                # domain/source_archive lookups can seq-scan parsed_credentials
+                # (300M+ rows); degrade to no related list if they exceed the
+                # budget instead of blocking the request indefinitely.
+                session.execute(text("SET LOCAL statement_timeout = '12s'"))
             cred = session.get(ParsedCredential, credential_id)
             if not cred:
                 return HTMLResponse("<h1>Not found</h1>", status_code=404)
@@ -4919,30 +4937,40 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 conversation = session.get(Conversation, cred.source_conversation_id)
 
             related = []
-            if cred.domain:
-                related = (
-                    session.query(ParsedCredential)
-                    .filter(
-                        ParsedCredential.domain == cred.domain,
-                        ParsedCredential.id != cred.id,
+            try:
+                if cred.domain:
+                    related = (
+                        session.query(ParsedCredential)
+                        .filter(
+                            ParsedCredential.domain == cred.domain,
+                            ParsedCredential.id != cred.id,
+                        )
+                        .order_by(ParsedCredential.created_at.desc())
+                        .limit(10)
+                        .all()
                     )
-                    .order_by(ParsedCredential.created_at.desc())
-                    .limit(10)
-                    .all()
-                )
-            if len(related) < 10 and cred.source_archive:
-                existing_ids = {r.id for r in related} | {cred.id}
-                more = (
-                    session.query(ParsedCredential)
-                    .filter(
-                        ParsedCredential.source_archive == cred.source_archive,
-                        ParsedCredential.id.notin_(existing_ids),
+                if len(related) < 10 and cred.source_archive:
+                    existing_ids = {r.id for r in related} | {cred.id}
+                    more = (
+                        session.query(ParsedCredential)
+                        .filter(
+                            ParsedCredential.source_archive == cred.source_archive,
+                            ParsedCredential.id.notin_(existing_ids),
+                        )
+                        .order_by(ParsedCredential.created_at.desc())
+                        .limit(10 - len(related))
+                        .all()
                     )
-                    .order_by(ParsedCredential.created_at.desc())
-                    .limit(10 - len(related))
-                    .all()
+                    related.extend(more)
+            except SQLAlchemyError as exc:
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                logger.warning(
+                    "credential %s related lookup timed out: %s", credential_id, exc
                 )
-                related.extend(more)
+                related = []
 
             return templates.TemplateResponse(
                 "credential.html",
@@ -4961,6 +4989,11 @@ def create_app(database_url: str | None = None) -> FastAPI:
         msg_limit: int = Query(50, ge=1, le=500),
     ):
         with get_session(engine) as session:
+            if session.get_bind().dialect.name == "postgresql":
+                # Exact COUNT(*) / recent-credential scans on the unindexed
+                # source_conversation_id column can run for minutes over
+                # hundreds of millions of rows; bound every query here.
+                session.execute(text("SET LOCAL statement_timeout = '12s'"))
             conv = session.get(Conversation, conversation_id)
             if not conv:
                 return HTMLResponse("<h1>Not found</h1>", status_code=404)
@@ -4976,23 +5009,50 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 .filter(Message.conversation_id == conversation_id)
                 .scalar() or 0
             )
-            cred_count = (
-                session.query(func.count(ParsedCredential.id))
-                .filter(ParsedCredential.source_conversation_id == conversation_id)
-                .scalar() or 0
-            )
+            cred_count_raw = 0
+            recent_creds: list[ParsedCredential] = []
+            try:
+                # Capped count: LIMIT _COUNT_CAP means the count is exact only
+                # below the cap; above it the page shows "N+".
+                cred_count_subq = (
+                    session.query(ParsedCredential.id)
+                    .filter(ParsedCredential.source_conversation_id == conversation_id)
+                    .limit(_COUNT_CAP)
+                    .subquery()
+                )
+                cred_count_raw = (
+                    session.query(func.count()).select_from(cred_count_subq).scalar() or 0
+                )
+                recent_creds = (
+                    session.query(ParsedCredential)
+                    .filter(ParsedCredential.source_conversation_id == conversation_id)
+                    .order_by(ParsedCredential.created_at.desc())
+                    .limit(10)
+                    .all()
+                )
+            except SQLAlchemyError as exc:
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                logger.warning(
+                    "conversation %s credential lookups timed out: %s",
+                    conversation_id,
+                    exc,
+                )
+                cred_count_raw = 0
+                recent_creds = []
+
+            if cred_count_raw >= _COUNT_CAP:
+                cred_count = f"{_COUNT_CAP - 1:,}+"
+            else:
+                cred_count = f"{cred_count_raw:,}"
+
             recent_messages = (
                 session.query(Message)
                 .filter(Message.conversation_id == conversation_id)
                 .order_by(Message.platform_timestamp.desc())
                 .limit(msg_limit)
-                .all()
-            )
-            recent_creds = (
-                session.query(ParsedCredential)
-                .filter(ParsedCredential.source_conversation_id == conversation_id)
-                .order_by(ParsedCredential.created_at.desc())
-                .limit(10)
                 .all()
             )
 
@@ -5017,42 +5077,18 @@ def create_app(database_url: str | None = None) -> FastAPI:
         limit: int = Query(50, ge=1, le=500),
     ):
         with get_session(engine) as session:
+            if session.get_bind().dialect.name == "postgresql":
+                # The per-page credential aggregation scans 319M rows on the
+                # unindexed source_conversation_id column; bound it and fall
+                # back to zero counts rather than hanging the page.
+                session.execute(text("SET LOCAL statement_timeout = '12s'"))
             excluded_conversations, _ = _get_exclusions(session)
 
-            msg_counts = (
-                session.query(
-                    Message.conversation_id.label("cid"),
-                    func.count(Message.id).label("n"),
-                )
-                .group_by(Message.conversation_id)
-                .subquery()
-            )
-            cred_counts = (
-                session.query(
-                    ParsedCredential.source_conversation_id.label("cid"),
-                    func.count(ParsedCredential.id).label("n"),
-                )
-                .group_by(ParsedCredential.source_conversation_id)
-                .subquery()
-            )
-
-            base = (
-                session.query(
-                    Conversation,
-                    func.coalesce(msg_counts.c.n, 0).label("msg_count"),
-                    func.coalesce(cred_counts.c.n, 0).label("cred_count"),
-                )
-                .outerjoin(msg_counts, msg_counts.c.cid == Conversation.id)
-                .outerjoin(cred_counts, cred_counts.c.cid == Conversation.id)
-            )
-
+            base = session.query(Conversation)
             if excluded_conversations:
                 base = base.filter(Conversation.id.notin_(excluded_conversations))
 
-            total_q = session.query(Conversation)
-            if excluded_conversations:
-                total_q = total_q.filter(Conversation.id.notin_(excluded_conversations))
-            total_convs = total_q.count()
+            total_convs = base.count()
             # Avoid full-table COUNT/GROUP BY over the 100M+ row tables — use
             # instant reltuples estimates like the home page does.
             counts = _pg_fast_count_estimates(session, "messages", "parsed_credentials")
@@ -5061,17 +5097,54 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
             pages = max(1, (total_convs + limit - 1) // limit)
             offset = (page - 1) * limit
-            rows = (
-                base.order_by(func.coalesce(cred_counts.c.n, 0).desc())
-                .offset(offset)
-                .limit(limit)
-                .all()
-            )
 
-            conversations = [
-                {"conv": r.Conversation, "msg_count": r.msg_count, "cred_count": r.cred_count}
-                for r in rows
-            ]
+            # Page the conversations first (deterministic id order), then
+            # aggregate messages and credentials only for the page's ids.
+            # The previous full-table GROUP BY subqueries aggregated all
+            # 100M+ rows on every load; parsed_credentials has no
+            # source_conversation_id index (dropped by migration x4y5z6a7b8c9),
+            # so one IN-filtered scan per page beats per-row subqueries.
+            rows = base.order_by(Conversation.id).offset(offset).limit(limit).all()
+            page_ids = [conv.id for conv in rows]
+            msg_count_by_id: dict[int, int] = {}
+            cred_count_by_id: dict[int, int] = {}
+            if page_ids:
+                try:
+                    msg_count_by_id = dict(
+                        session.query(Message.conversation_id, func.count(Message.id))
+                        .filter(Message.conversation_id.in_(page_ids))
+                        .group_by(Message.conversation_id)
+                        .all()
+                    )
+                    cred_count_by_id = dict(
+                        session.query(
+                            ParsedCredential.source_conversation_id,
+                            func.count(ParsedCredential.id),
+                        )
+                        .filter(ParsedCredential.source_conversation_id.in_(page_ids))
+                        .group_by(ParsedCredential.source_conversation_id)
+                        .all()
+                    )
+                except SQLAlchemyError as exc:
+                    try:
+                        session.rollback()
+                    except Exception:
+                        pass
+                    logger.warning("conversations aggregation timed out: %s", exc)
+                    msg_count_by_id = {}
+                    cred_count_by_id = {}
+
+            conversations = sorted(
+                (
+                    {
+                        "conv": conv,
+                        "msg_count": msg_count_by_id.get(conv.id, 0),
+                        "cred_count": cred_count_by_id.get(conv.id, 0),
+                    }
+                    for conv in rows
+                ),
+                key=lambda row: (-row["cred_count"], row["conv"].id),
+            )
 
             return templates.TemplateResponse(
                 "conversations.html",

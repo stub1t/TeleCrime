@@ -1,6 +1,7 @@
 """7-Zip command-line extractor wrapper."""
 
 import asyncio
+import itertools
 import logging
 import os
 import re
@@ -17,6 +18,26 @@ logger = logging.getLogger(__name__)
 # Keep only this much of 7z stdout/stderr when parsing results (error
 # detection needs the tail; the full output is unbounded for huge archives).
 _TAIL_BYTES = 64 * 1024
+
+
+def _extension_case_variants(extension: str) -> list[str]:
+    """Return every case permutation of an extension, without its leading dot.
+
+    7z wildcard matching is case-sensitive on Linux, so ``-ir!*.txt`` silently
+    skips an uppercase member like ``PASSWORDS.TXT``: extraction exits 0 with
+    zero files, the group is marked EXTRACTED and finalize deletes the source.
+    Enumerating the variants keeps the command-line pre-filter (avoids
+    extracting the whole archive) while matching any suffix casing. Suffixes
+    longer than 8 characters fall back to lower/upper to bound 2**n patterns.
+    """
+    ext = extension.lstrip(".")
+    if not ext:
+        return []
+    if len(ext) > 8:
+        return sorted({ext.lower(), ext.upper()})
+    return sorted(
+        {"".join(chars) for chars in itertools.product(*((c.lower(), c.upper()) for c in ext))}
+    )
 
 
 class SevenZipExtractor(ArchiveExtractor):
@@ -67,11 +88,13 @@ class SevenZipExtractor(ArchiveExtractor):
         else:
             cmd.append("-p-")  # No password (will fail if needed)
 
-        # Add file filters for target extensions
+        # Add file filters for target extensions. The glob is case-sensitive
+        # on Linux, so pass every case permutation: a plain `-ir!*.txt` skips
+        # `PASSWORDS.TXT` and the archive gets deleted after an empty extract.
         if target_extensions:
             for ext in target_extensions:
-                ext_clean = ext.lstrip(".")
-                cmd.append(f"-ir!*.{ext_clean}")
+                for variant in _extension_case_variants(ext):
+                    cmd.append(f"-ir!*.{variant}")
 
         cmd.append(str(archive_path))
 
@@ -235,6 +258,23 @@ class SevenZipExtractor(ArchiveExtractor):
                     error_code="UNSUPPORTED_FORMAT",
                     error_message="Unsupported archive format",
                 )
+
+            # 7z exit 1 = warning: some members may have extracted fine. Mirror
+            # the unrar partial path so the files that landed are not lost to a
+            # retry loop that ends in FAILED_TERMINAL + archive deletion.
+            # Corruption markers are excluded (password/data errors returned
+            # above); files whose integrity is suspect never count as success.
+            _lower_output = combined_output.lower()
+            _integrity_error = "crc failed" in _lower_output or "headers error" in _lower_output
+            if return_code == 1 and not _integrity_error:
+                extracted = await asyncio.to_thread(
+                    self._find_extracted_files, output_dir, target_extensions
+                )
+                if extracted:
+                    logger.warning(
+                        "7z exited with code 1 but extracted %d files", len(extracted)
+                    )
+                    return ExtractionResult(success=True, extracted_files=extracted)
 
             return ExtractionResult(
                 success=False,

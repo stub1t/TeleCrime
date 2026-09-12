@@ -543,3 +543,158 @@ async def test_failed_digest_flush_is_rate_limited():
     await n.archive_parsed("d.zip", 10, 0, 1)
     assert client.send_message.await_count == 2
     assert n._digest_archives == 4
+
+
+# ---------------------------------------------------------------------------
+# flush serialization + cancellation propagation + flusher resilience
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_flushes_send_digest_once():
+    """archive_parsed + the background flusher can call flush() concurrently;
+    the lock must prevent the same digest from being sent twice."""
+    import asyncio
+
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+    sent: list[str] = []
+
+    async def _slow_send(*args, **kwargs):
+        sent.append(args[1])
+        entered.set()
+        await gate.wait()
+
+    client.send_message = _slow_send
+    n = TelegramNotifier(client=client, enabled=True)
+    await n.archive_parsed("a.zip", 10, 0, 1)
+
+    first = asyncio.create_task(n.flush())
+    await entered.wait()
+    second = asyncio.create_task(n.flush())
+    await asyncio.sleep(0)  # let the second flush reach the lock
+    gate.set()
+    await asyncio.gather(first, second)
+
+    assert len(sent) == 1
+    assert n._digest_archives == 0
+
+
+@pytest.mark.asyncio
+async def test_flush_reset_before_await_keeps_archives_arriving_during_send():
+    """Counters are zeroed BEFORE the network await, so archives parsed while
+    the digest is in flight accumulate into the next window instead of being
+    wiped by a post-send reset."""
+    import asyncio
+
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _slow_send(*args, **kwargs):
+        entered.set()
+        await gate.wait()
+
+    client.send_message = _slow_send
+    n = TelegramNotifier(client=client, enabled=True)
+    await n.archive_parsed("a.zip", 10, 0, 1)
+
+    task = asyncio.create_task(n.flush())
+    await entered.wait()
+    await n.archive_parsed("b.zip", 5, 0, 1)
+    gate.set()
+    await task
+
+    assert n._digest_archives == 1
+    assert n._digest_new == 5
+    assert n._digest_since is not None
+
+
+@pytest.mark.asyncio
+async def test_send_propagates_external_cancellation():
+    """task.cancel() on a send must propagate (not be swallowed into False),
+    so callers can actually stop the pipeline."""
+    import asyncio
+
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def _hang(*args, **kwargs):
+        started.set()
+        await never.wait()
+
+    client.send_message = _hang
+    n = TelegramNotifier(client=client, enabled=True)
+
+    task = asyncio.create_task(n.send("hello"))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_send_returns_false_for_connection_drop_cancellation():
+    """A CancelledError raised by Telethon (no external task.cancel()) is a
+    retryable connection drop: best-effort False, not an exception."""
+    import asyncio
+
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock(side_effect=asyncio.CancelledError)
+    n = TelegramNotifier(client=client, enabled=True)
+
+    assert await n.send("hello") is False
+
+
+@pytest.mark.asyncio
+async def test_flusher_loop_continues_after_tick_error(monkeypatch):
+    """One failing tick (DB/Telegram hiccup) must not kill the background
+    flusher permanently."""
+    import asyncio
+
+    class _StopFlusher(BaseException):
+        pass
+
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock()
+    n = TelegramNotifier(client=client, enabled=True)
+    n._watchlist_interval = 0
+
+    calls = {"n": 0}
+
+    async def _wl():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("db hiccup")
+        return []
+
+    n.watchlist_provider = _wl
+
+    real_sleep = asyncio.sleep
+    ticks = {"n": 0}
+
+    async def _fast_sleep(_seconds):
+        ticks["n"] += 1
+        if ticks["n"] > 3:
+            raise _StopFlusher
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    with pytest.raises(_StopFlusher):
+        await n._flusher_loop()
+
+    # The first tick raised; the loop kept ticking and called the provider again.
+    assert calls["n"] >= 2

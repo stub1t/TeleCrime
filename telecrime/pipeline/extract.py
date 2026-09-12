@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlalchemy import select
@@ -29,6 +30,36 @@ from telecrime.states import ExtractionStatus, GroupStatus
 logger = logging.getLogger(__name__)
 
 _RAR5_SIGNATURE = b"\x52\x61\x72\x21\x1a\x07\x01\x00"
+
+# Nested-archive errors that retrying cannot fix. Anything else (TIMEOUT,
+# KILLED, VOLUME_MISSING, EXIT_*, ...) is transient and must keep the group
+# retryable so finalize does not delete sources that still hold recoverable
+# data.
+_NESTED_TERMINAL_ERROR_CODES = frozenset({"CORRUPTED", "UNSUPPORTED_FORMAT", "CANNOT_OPEN"})
+
+
+@dataclass
+class _NestedExtractionOutcome:
+    """Result of recursively extracting nested archives.
+
+    ``txt_files`` are the recovered target-extension paths. ``failures``
+    holds one ``(archive, result)`` pair per nested archive that was not
+    recovered. ``requires_password``/``retryable_error`` are set when a
+    failure is recoverable on a later run; the caller must then keep the
+    group out of EXTRACTED so finalize does not delete its sources.
+    """
+
+    txt_files: list[Path] = field(default_factory=list)
+    failures: list[tuple[Path, ExtractionResult]] = field(default_factory=list)
+    requires_password: bool = False
+    retryable_error: bool = False
+    error_code: str | None = None
+    error_message: str | None = None
+
+    @property
+    def retryable_failure(self) -> bool:
+        """True when a nested archive failed recoverably (retry-worthy)."""
+        return self.requires_password or self.retryable_error
 
 
 def _is_rar5(path: Path) -> bool:
@@ -397,9 +428,18 @@ class ExtractStage(PipelineStage):
 
             if do_nested:
                 # Outer extracted nested archives — now recurse into them for txt.
-                txt_files = await self._try_nested_extraction(
+                nested = await self._try_nested_extraction(
                     output_dir, target_exts, extractor, passwords, ctx,
                 )
+                if nested.retryable_failure:
+                    logger.warning(
+                        "Nested archives in %s failed recoverably — keeping group "
+                        "retryable so sources are not cleaned up",
+                        main_archive.name,
+                    )
+                    self._defer_nested_failure(job, group, nested)
+                    return False
+                txt_files = nested.txt_files
                 if not txt_files:
                     logger.info(
                         "Nested archives in %s yielded no txt files — skipping",
@@ -457,15 +497,27 @@ class ExtractStage(PipelineStage):
             # remainder permanently.
             _recoverable_errors = ("CORRUPTED", "UNSUPPORTED_FORMAT", "CANNOT_OPEN")
             if output_dir.exists() and result.error_code in _recoverable_errors:
-                nested_txts = await self._try_nested_extraction(
+                nested = await self._try_nested_extraction(
                     output_dir, target_exts, extractor, passwords, ctx,
                 )
-                if nested_txts:
+                if nested.retryable_failure:
+                    # Some nested archives were recovered but others still need
+                    # a password/retry: keep the group retryable instead of
+                    # terminalizing the outer error (which would delete every
+                    # nested source along with the unrecovered members).
+                    logger.warning(
+                        "Nested archives in %s failed recoverably after outer error "
+                        "— keeping group retryable",
+                        main_archive.name,
+                    )
+                    self._defer_nested_failure(job, group, nested)
+                    return False
+                if nested.txt_files:
                     logger.info(
                         "Recovered %d txt files from nested archives despite outer extraction error",
-                        len(nested_txts),
+                        len(nested.txt_files),
                     )
-                    await self._record_outputs(ctx, job, group, nested_txts)
+                    await self._record_outputs(ctx, job, group, nested.txt_files)
                     group.status = GroupStatus.EXTRACTED
                     job.status = ExtractionStatus.COMPLETED
                     return True
@@ -523,6 +575,12 @@ class ExtractStage(PipelineStage):
         logger.info("Direct txt file linked: %s", txt_path.name)
         return True
 
+    # Process nested archives in batches of this size. Archives beyond a batch
+    # boundary are still processed — a hard cap here would silently drop them
+    # while the caller marks the group EXTRACTED and finalize deletes the
+    # source archives, destroying them permanently.
+    _MAX_NESTED_ARCHIVES = 500
+
     async def _try_nested_extraction(
         self,
         output_dir: Path,
@@ -530,52 +588,130 @@ class ExtractStage(PipelineStage):
         extractor,
         passwords: list[PasswordCandidate],
         ctx: PipelineContext,
-    ) -> list[Path]:
+    ) -> _NestedExtractionOutcome:
         """Find nested zip/rar/7z files in output_dir and extract txt from each.
 
         Used when an outer archive contains per-victim zip files rather than
         raw txt files (e.g. PegasusCloud distributes each victim as a separate
-        zip inside the outer RAR).  Returns all extracted target-extension paths.
+        zip inside the outer RAR).  Returns the extracted target-extension
+        paths plus per-archive failure info.
+
+        All nested archives are processed, one ``_MAX_NESTED_ARCHIVES`` batch at
+        a time, so the batch size only bounds per-iteration work — never which
+        archives get extracted. Per-archive timeout protection is unchanged.
+
+        Failures are reported back to the caller: a wrong-password or transient
+        nested failure must keep the group retryable, otherwise the group is
+        marked EXTRACTED and finalize deletes every nested source.
         """
         _nested_exts = {".zip", ".rar", ".7z", ".tar"}
-        _max_nested = 500
 
         nested_archives = [
             f for f in output_dir.rglob("*")
             if f.is_file() and f.suffix.lower() in _nested_exts
         ]
+        outcome = _NestedExtractionOutcome()
         if not nested_archives:
-            return []
+            return outcome
 
-        if len(nested_archives) > _max_nested:
+        if len(nested_archives) > self._MAX_NESTED_ARCHIVES:
             logger.warning(
-                "Found %d nested archives — capping at %d", len(nested_archives), _max_nested
+                "Found %d nested archives — extracting in batches of %d",
+                len(nested_archives),
+                self._MAX_NESTED_ARCHIVES,
             )
-            nested_archives = nested_archives[:_max_nested]
 
-        logger.info("Extracting %d nested archives for txt files", len(nested_archives))
         password_values = [None] + [c.value for c in passwords]
-        txt_files: list[Path] = []
 
-        for nested in nested_archives:
-            nested_out = nested.parent / (nested.stem + "_inner")
-            nested_out.mkdir(parents=True, exist_ok=True)
-            for password in password_values:
-                result = await extractor.extract(
-                    nested,
-                    nested_out,
-                    password=password,
-                    target_extensions=target_exts,
-                    timeout_seconds=_extraction_timeout(ctx, nested),
+        for start in range(0, len(nested_archives), self._MAX_NESTED_ARCHIVES):
+            batch = nested_archives[start : start + self._MAX_NESTED_ARCHIVES]
+            logger.info(
+                "Extracting %d nested archives for txt files (%d/%d)",
+                len(batch),
+                start + len(batch),
+                len(nested_archives),
+            )
+            for nested in batch:
+                nested_out = nested.parent / (nested.stem + "_inner")
+                nested_out.mkdir(parents=True, exist_ok=True)
+                nested_extractor = self._extractor_for_nested(nested, extractor, ctx)
+                failure: ExtractionResult | None = None
+                for password in password_values:
+                    result = await nested_extractor.extract(
+                        nested,
+                        nested_out,
+                        password=password,
+                        target_extensions=target_exts,
+                        timeout_seconds=_extraction_timeout(ctx, nested),
+                    )
+                    if result.success:
+                        outcome.txt_files.extend(result.extracted_files)
+                        failure = None
+                        break
+                    failure = result
+                    if not result.requires_password:
+                        # Non-password failure — no point retrying with other passwords
+                        break
+                if failure is None:
+                    continue
+                outcome.failures.append((nested, failure))
+                if failure.requires_password:
+                    outcome.requires_password = True
+                    outcome.error_code = failure.error_code or outcome.error_code
+                    outcome.error_message = failure.error_message or outcome.error_message
+                elif failure.error_code not in _NESTED_TERMINAL_ERROR_CODES:
+                    outcome.retryable_error = True
+                    outcome.error_code = failure.error_code
+                    outcome.error_message = failure.error_message
+                logger.warning(
+                    "Nested archive %s failed: %s — %s",
+                    nested.name,
+                    failure.error_code,
+                    failure.error_message,
                 )
-                if result.success:
-                    txt_files.extend(result.extracted_files)
-                    break
-                elif not result.requires_password:
-                    # Non-password failure — no point retrying with other passwords
-                    break
 
-        return txt_files
+        return outcome
+
+    @staticmethod
+    def _extractor_for_nested(nested: Path, default, ctx: PipelineContext):
+        """Pick the extractor for a nested archive by its suffix.
+
+        The outer archive dictates the default extractor (a RAR5 outer switches
+        the whole run to unrar), but unrar cannot open nested zip/7z/tar
+        members — those failed UNSUPPORTED_FORMAT and were silently skipped
+        while the group was still marked EXTRACTED.
+        """
+        suffix = nested.suffix.lower()
+        if suffix == ".rar":
+            if isinstance(default, UnrarExtractor) or not UnrarExtractor.available():
+                return default
+            return UnrarExtractor()
+        if isinstance(default, UnrarExtractor):
+            return SevenZipExtractor(ctx.config.extraction.extractor_path)
+        return default
+
+    @staticmethod
+    def _defer_nested_failure(
+        job: ExtractionJob,
+        group: ArchiveGroup,
+        outcome: _NestedExtractionOutcome,
+    ) -> None:
+        """Keep a group retryable when nested archives failed recoverably.
+
+        Marking it EXTRACTED would let finalize delete every nested source
+        archive, permanently losing the members that a later run (with a
+        password or a recovered volume) could still extract.
+        """
+        if outcome.requires_password:
+            job.status = ExtractionStatus.PASSWORD_NEEDED
+            group.status = GroupStatus.READY
+            job.last_error_code = outcome.error_code or "PASSWORD_REQUIRED"
+            job.last_error_message = outcome.error_message or "Nested archive requires password"
+        else:
+            job.status = ExtractionStatus.FAILED
+            group.status = GroupStatus.FAILED
+            job.last_error_code = outcome.error_code
+            job.last_error_message = outcome.error_message or "Nested extraction failed (transient)"
 
     async def _try_extract_with_passwords(
         self,

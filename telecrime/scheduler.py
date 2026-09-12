@@ -308,9 +308,27 @@ def _apply_shutdown_status(config) -> None:
 
 
 def _write_pipeline_pid(pid: int) -> None:
+    # Atomic write (temp file + os.replace): the shell watchdog may read this
+    # file at any moment, and a Path.write_text() truncate+write can expose an
+    # empty/partial PID — which the watchdog interprets as "dead process"
+    # after the truncate window, or kills a healthy pipeline via a bad value.
     path = _pipeline_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(pid))
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        os.write(fd, str(pid).encode())
+        os.close(fd)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _read_pipeline_pid() -> int | None:
@@ -323,7 +341,15 @@ def _read_pipeline_pid() -> int | None:
         return None
 
 
-def _clear_pipeline_pid() -> None:
+def _clear_pipeline_pid(pid: int | None = None) -> None:
+    """Remove the pid file.
+
+    When `pid` is given, only remove the file if it still names that process:
+    a concurrent run's PID (or a restored previous PID) must not be cleared by
+    a finishing job that merely observed an older value.
+    """
+    if pid is not None and _read_pipeline_pid() != pid:
+        return
     try:
         _pipeline_pid_path().unlink(missing_ok=True)
     except OSError:
@@ -401,19 +427,19 @@ def _terminate_pipeline_process(pid: int, grace_seconds: int = 15) -> str:
 
     if not _pid_is_pipeline_process(pid):
         # Stale/recycled pid file — never signal an unrelated process group.
-        _clear_pipeline_pid()
+        _clear_pipeline_pid(pid)
         return f"pipeline pid {pid} no longer a telecrime process (stale pid file)"
 
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
-        _clear_pipeline_pid()
+        _clear_pipeline_pid(pid)
         return f"pipeline pid {pid} already exited"
 
     deadline = time.time() + grace_seconds
     while time.time() < deadline:
         if not _pid_is_alive(pid):
-            _clear_pipeline_pid()
+            _clear_pipeline_pid(pid)
             return f"terminated pipeline pid {pid}"
         time.sleep(0.5)
 
@@ -422,7 +448,7 @@ def _terminate_pipeline_process(pid: int, grace_seconds: int = 15) -> str:
     except ProcessLookupError:
         pass
 
-    _clear_pipeline_pid()
+    _clear_pipeline_pid(pid)
     return f"killed pipeline pid {pid}"
 
 
@@ -500,6 +526,12 @@ def _run_pipeline_job(config, engine) -> str:
     cmd = [sys.executable, "-m", "telecrime", "run"]
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
+    # Tag every DB connection the pipeline subprocess opens with
+    # application_name='telecrime-pipeline' (libpq reads PGAPPNAME). The host
+    # watchdog scopes its pg_stat_activity probe to this name so web polls and
+    # autovacuum cannot mask a genuinely hung pipeline. Set unconditionally:
+    # an inherited/stale PGAPPNAME must not win over the pipeline tag.
+    env["PGAPPNAME"] = "telecrime-pipeline"
     # Save the previous PID so we can restore it if this subprocess turns out
     # to be a "skipped" duplicate (rc=75 — lock already held by another run).
     prev_pid = _read_pipeline_pid()
@@ -570,7 +602,7 @@ def _run_pipeline_job(config, engine) -> str:
             if prev_pid is not None:
                 _write_pipeline_pid(prev_pid)
             else:
-                _clear_pipeline_pid()
+                _clear_pipeline_pid(proc.pid)
             return "skipped — another pipeline run is already active"
         if rc != 0:
             tail = "\n".join(stderr_lines[-30:]) if stderr_lines else "(no stderr)"
@@ -581,8 +613,7 @@ def _run_pipeline_job(config, engine) -> str:
     finally:
         # Only clear the PID file if it still points to our subprocess.
         # The "skipped" (rc=75) branch above already restored prev_pid.
-        if _read_pipeline_pid() == proc.pid:
-            _clear_pipeline_pid()
+        _clear_pipeline_pid(proc.pid)
 
     progress = read_progress() or {}
     creds = int(progress.get("credentials", 0) or 0)
@@ -801,10 +832,13 @@ def _run_channel_join_job(config, engine, max_joins: int = 1) -> str:
     )
     from telecrime.channels.service import (
         build_subscription_query,
+        mark_channel_check_failed,
+        mark_channel_checked,
         mark_channel_join_failed,
         mark_channel_join_result,
     )
     from telecrime.database import get_session
+    from telecrime.models import TelegramChannel
 
     async def _run():
         # Step 1: discover from DB (no Telegram needed)
@@ -860,82 +894,118 @@ def _run_channel_join_job(config, engine, max_joins: int = 1) -> str:
                     )
                 raise
 
+            # Verify a batch of channels first (oldest-checked first) so
+            # deleted/private channels drop out of the public channel list
+            # even if the pipeline rarely runs. Bounded to respect Telegram
+            # rate limits. TELECRIME_CHANNEL_CHECK_BATCH overrides.
+            import os as _os
+
+            check_batch = int(
+                _os.environ.get("TELECRIME_CHANNEL_CHECK_BATCH", "20")
+            )
+
+            # Short read transaction: copy only the fields the network calls
+            # need, then release the session. The Telegram calls below (up to
+            # `check_batch` get_entity calls with 1s sleeps) must not pin a DB
+            # connection/transaction — a half-open socket used to hold one for
+            # hours.
+            to_check: list[tuple[int, str | None, int | None]] = []
             with get_session(engine) as session:
-                # Verify a batch of channels first (oldest-checked first) so
-                # deleted/private channels drop out of the public channel list
-                # even if the pipeline rarely runs. Bounded to respect Telegram
-                # rate limits. TELECRIME_CHANNEL_CHECK_BATCH overrides.
-                import os as _os
-
-                check_batch = int(
-                    _os.environ.get("TELECRIME_CHANNEL_CHECK_BATCH", "20")
-                )
                 if check_batch > 0:
-                    from telecrime.channels.service import (
-                        mark_channel_check_failed,
-                        mark_channel_checked,
-                    )
-                    from telecrime.models import TelegramChannel
-
-                    to_check = (
-                        session.query(TelegramChannel)
-                        .filter(
-                            TelegramChannel.last_checked.isnot(None),
-                            TelegramChannel.is_active.is_(True),
-                            TelegramChannel.is_accessible.is_(True),
-                            (TelegramChannel.username.isnot(None)) | (TelegramChannel.platform_id.isnot(None)),
+                    to_check = [
+                        (channel.id, channel.username, channel.platform_id)
+                        for channel in (
+                            session.query(TelegramChannel)
+                            .filter(
+                                TelegramChannel.last_checked.isnot(None),
+                                TelegramChannel.is_active.is_(True),
+                                TelegramChannel.is_accessible.is_(True),
+                                (TelegramChannel.username.isnot(None)) | (TelegramChannel.platform_id.isnot(None)),
+                            )
+                            .order_by(TelegramChannel.last_checked.asc().nulls_last())
+                            .limit(check_batch)
+                            .all()
                         )
-                        .order_by(TelegramChannel.last_checked.asc().nulls_last())
-                        .limit(check_batch)
-                        .all()
-                    )
-                    checked_ok = checked_dead = 0
-                    for channel in to_check:
-                        target = (
-                            f"@{channel.username}"
-                            if channel.username
-                            else channel.platform_id
-                        )
-                        try:
-                            entity = await adapter.get_entity(target)
-                            if entity is not None:
-                                mark_channel_checked(channel, entity)
-                                checked_ok += 1
-                            else:
-                                mark_channel_check_failed(channel, "Entity not found")
-                                checked_dead += 1
-                        except Exception as e:
-                            mark_channel_check_failed(channel, str(e))
-                            checked_dead += 1
-                        await asyncio.sleep(1)  # gentle pacing, stay inside rate limits
-                    session.commit()
-                    if checked_ok or checked_dead:
-                        logger.info(
-                            "channel_join: verified %d channels (%d ok, %d removed)",
-                            len(to_check), checked_ok, checked_dead,
-                        )
+                    ]
 
-                candidates = build_subscription_query(session).limit(max_joins).all()
-
-                for channel in candidates:
-                    target = channel.username or channel.invite_link
+            if check_batch > 0:
+                check_results: list[tuple[int, object | None, str | None]] = []
+                checked_ok = checked_dead = 0
+                for channel_id, username, platform_id in to_check:
+                    target = f"@{username}" if username else platform_id
+                    entity = None
+                    error: str | None = None
                     try:
-                        success = await adapter.join_conversation(
-                            channel.platform_id or 0, username=target
-                        )
+                        entity = await adapter.get_entity(target)
+                        if entity is not None:
+                            checked_ok += 1
+                        else:
+                            error = "Entity not found"
+                            checked_dead += 1
+                    except Exception as e:
+                        error = str(e)
+                        checked_dead += 1
+                    check_results.append((channel_id, entity, error))
+                    await asyncio.sleep(1)  # gentle pacing, stay inside rate limits
+
+                # Short write transaction: re-fetch by id so a channel deleted
+                # while Telegram was slow is not resurrected from a stale ORM
+                # instance.
+                with get_session(engine) as session:
+                    for channel_id, entity, error in check_results:
+                        channel = session.get(TelegramChannel, channel_id)
+                        if channel is None:
+                            continue
+                        if error is None:
+                            mark_channel_checked(channel, entity)
+                        else:
+                            mark_channel_check_failed(channel, error)
+                if checked_ok or checked_dead:
+                    logger.info(
+                        "channel_join: verified %d channels (%d ok, %d removed)",
+                        len(to_check), checked_ok, checked_dead,
+                    )
+
+            # Read join candidates in their own short transaction, AFTER the
+            # check results are committed: a channel just found dead must not
+            # still be a candidate.
+            candidates: list[tuple[int, str | None, str | None, int]] = []
+            with get_session(engine) as session:
+                candidates = [
+                    (
+                        channel.id,
+                        channel.username,
+                        channel.invite_link,
+                        channel.platform_id or 0,
+                    )
+                    for channel in build_subscription_query(session).limit(max_joins).all()
+                ]
+
+            join_results: list[tuple[int, bool, str | None]] = []
+            for channel_id, username, invite_link, platform_id in candidates:
+                target = username or invite_link
+                try:
+                    success = await adapter.join_conversation(platform_id, username=target)
+                    join_results.append((channel_id, success, None))
+                except (Exception, asyncio.CancelledError) as e:
+                    join_results.append((channel_id, False, str(e)))
+                    await asyncio.sleep(2)
+
+            # Short write transaction for the join outcomes.
+            with get_session(engine) as session:
+                for channel_id, success, error in join_results:
+                    channel = session.get(TelegramChannel, channel_id)
+                    if channel is None:
+                        continue
+                    if error is None:
                         if mark_channel_join_result(channel, success) == "joined":
                             joined += 1
                         else:
                             failed += 1
-                    except (Exception, asyncio.CancelledError) as e:
-                        result = mark_channel_join_failed(channel, str(e))
-                        if result == "already":
-                            skipped += 1
-                        else:
-                            failed += 1
-                        await asyncio.sleep(2)
-
-                session.commit()
+                    elif mark_channel_join_failed(channel, error) == "already":
+                        skipped += 1
+                    else:
+                        failed += 1
 
         finally:
             try:
@@ -1346,6 +1416,59 @@ def _watchlist_match_filter(item):
     )
 
 
+# Serialize watchlist scans. The pipeline runs _collect_watchlist_alerts in a
+# worker thread via asyncio.to_thread under a 45s wait_for, and the scheduler
+# thread calls it directly; without a non-blocking guard a scan that outlives
+# the wait_for would overlap with the next one, stacking COUNT(*) scans over
+# the 319M-row table and leaking pooled connections.
+_watchlist_scan_lock = threading.Lock()
+
+# Hard DB-side bound on each watchlist COUNT(*). It must be finite: with
+# statement_timeout=0 a slow scan kept running for minutes after notify's 45s
+# wait_for abandoned it, pinning a worker thread + pooled connection every 15
+# minutes until the pipeline pool was exhausted. 40s fires just before that
+# wait_for, so PostgreSQL itself cancels the backend and the connection is
+# returned.
+_WATCHLIST_COUNT_STATEMENT_TIMEOUT = "40s"
+
+
+def _watchlist_count_matches(session, item, *, created_since=None) -> int:
+    """Count credentials matching a watchlist item.
+
+    Uses separate per-column queries UNION-ed together instead of one
+    ``domain ILIKE … OR username ILIKE …``: the OR cannot use the per-column
+    trigram indexes on the 319M-row table and degrades to a sequential scan,
+    while each UNION branch can use its own index (UNION also dedups rows that
+    match more than one column, matching the OR's semantics).
+    """
+    from sqlalchemy import func, select
+
+    from telecrime.models.credential import ParsedCredential
+
+    query = f"%{item.query}%"
+
+    def _col_stmt(col_filter):
+        stmt = select(ParsedCredential.id).where(col_filter)
+        if created_since is not None:
+            stmt = stmt.where(ParsedCredential.created_at >= created_since)
+        return stmt
+
+    if item.match_type == "domain":
+        stmt = _col_stmt(ParsedCredential.domain.ilike(query))
+    elif item.match_type == "user":
+        stmt = _col_stmt(ParsedCredential.username.ilike(query))
+    elif item.match_type == "url":
+        stmt = _col_stmt(ParsedCredential.url.ilike(query))
+    else:
+        stmt = _col_stmt(ParsedCredential.domain.ilike(query)).union(
+            _col_stmt(ParsedCredential.username.ilike(query))
+        )
+    return int(
+        session.execute(select(func.count()).select_from(stmt.subquery())).scalar()
+        or 0
+    )
+
+
 def _credential_identity_value(credential) -> str | int:
     return (
         getattr(credential, "soft_credential_hash", None)
@@ -1460,10 +1583,25 @@ def _watchlist_new_hits(session, item, limit: int) -> list[dict[str, object]]:
 
 
 def _collect_watchlist_alerts(engine) -> list[dict]:
+    """Collect watchlist alerts, serialized against overlapping scans.
+
+    Runs synchronously (blocking the calling thread), so a scan that outlives
+    notify's 45s wait_for must not be started again: the guard makes the next
+    attempt a no-op until the current one finishes.
+    """
+    if not _watchlist_scan_lock.acquire(blocking=False):
+        logger.info("Watchlist scan already in progress — skipping overlapping scan")
+        return []
+    try:
+        return _collect_watchlist_alerts_unlocked(engine)
+    finally:
+        _watchlist_scan_lock.release()
+
+
+def _collect_watchlist_alerts_unlocked(engine) -> list[dict]:
     from sqlalchemy import text
 
     from telecrime.database import get_session
-    from telecrime.models.credential import ParsedCredential
     from telecrime.models.watchlist import WatchlistItem
 
     now = datetime.now(UTC)
@@ -1498,11 +1636,7 @@ def _collect_watchlist_alerts(engine) -> list[dict]:
                         session.commit()
                         continue
                     # First run on SQLite / small DB: full count to catch pre-existing matches.
-                    current = (
-                        session.query(ParsedCredential)
-                        .filter(_watchlist_match_filter(item))
-                        .count()
-                    )
+                    current = _watchlist_count_matches(session, item)
                     previous = int(item.last_alerted_count or 0)
                     if current > previous:
                         new_matches = current - previous
@@ -1529,16 +1663,19 @@ def _collect_watchlist_alerts(engine) -> list[dict]:
                         )
                 else:
                     # Incremental path: only count credentials created since last alert.
-                    # Disable statement_timeout — ILIKE + large date ranges can exceed 5m.
+                    # Keep a FINITE statement_timeout (40s): the caller may abandon
+                    # the thread after its 45s wait_for, and an unbounded ILIKE scan
+                    # would then pin the worker thread + pooled connection. 40s lets
+                    # PostgreSQL cancel the query first, so the connection returns.
                     if is_pg:
-                        session.execute(text("SET LOCAL statement_timeout = 0"))
-                    new_matches = (
-                        session.query(ParsedCredential)
-                        .filter(
-                            _watchlist_match_filter(item),
-                            ParsedCredential.created_at >= item.last_alerted_at,
+                        session.execute(
+                            text(
+                                "SET LOCAL statement_timeout = "
+                                f"'{_WATCHLIST_COUNT_STATEMENT_TIMEOUT}'"
+                            )
                         )
-                        .count()
+                    new_matches = _watchlist_count_matches(
+                        session, item, created_since=item.last_alerted_at
                     )
                     if new_matches > 0:
                         total = int(item.last_alerted_count or 0) + new_matches

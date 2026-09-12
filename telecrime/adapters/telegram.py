@@ -242,6 +242,19 @@ class TelegramAdapter(BaseAdapter):
         )
         return any(p in msg for p in patterns)
 
+    @staticmethod
+    def _cancellation_requested() -> bool:
+        """True when THIS task was cancelled externally.
+
+        Telethon raises ``CancelledError`` when it aborts an in-flight request
+        after a connection drop; an external ``task.cancel()`` (shutdown,
+        stall monitor) raises the same exception. Only the latter sets the
+        task's cancelling count, so it is the discriminator between a
+        retryable drop and a cancel that must propagate.
+        """
+        task = asyncio.current_task()
+        return task is not None and task.cancelling() > 0
+
     # Maximum wall-clock time we will spend on any single _ensure_connected
     # call (including disconnect of the prior client + new connect). Hard cap
     # so a stuck Telethon reconnect can't wedge the caller for hours.
@@ -262,6 +275,12 @@ class TelegramAdapter(BaseAdapter):
     # contention. On timeout the run fails and the watchdog restarts it with a
     # fresh connection.
     _ITER_STALL_SECONDS: int = 120
+
+    # Grace period for a cancelled download task to honour the cancellation
+    # before its client is torn down anyway. Telethon's request loop can
+    # swallow CancelledError, leaving task.cancelled() False while the task
+    # is still running.
+    _DOWNLOAD_CANCEL_GRACE_SECONDS: float = 5.0
 
     async def _ensure_connected(self, timeout: int = 30, reason: str = "telegram operation") -> None:
         if (
@@ -395,7 +414,7 @@ class TelegramAdapter(BaseAdapter):
                 # task.cancel()). Re-connecting and retrying after an external
                 # cancel leaks the task — it survives its own cancellation and
                 # keeps hammering reconnect — so propagate it.
-                if asyncio.current_task() is not None and asyncio.current_task().cancelling():
+                if self._cancellation_requested():
                     raise
                 if attempt >= retries:
                     raise ConnectionError(
@@ -422,8 +441,6 @@ class TelegramAdapter(BaseAdapter):
                     retries,
                 )
                 await self._reconnect_blocking(operation, timeout)
-
-        raise RuntimeError(f"{operation} failed after reconnect retries")
 
     async def _reconnect_blocking(self, operation: str, timeout: int) -> None:
         """Disconnect + reconnect under the connect lock, BOUNDED.
@@ -502,6 +519,11 @@ class TelegramAdapter(BaseAdapter):
                     is_accessible=is_accessible,
                 )
         except asyncio.CancelledError:
+            # Telethon cancels its in-flight request when the connection
+            # drops; an EXTERNAL cancel of the ingest task (shutdown) must
+            # propagate as CancelledError instead.
+            if self._cancellation_requested():
+                raise
             # A connection drop must NOT look like a completed scan: silently
             # returning here let IngestStage advance its checkpoint past
             # unfetched messages and report success — on 24h-deletion channels
@@ -595,6 +617,10 @@ class TelegramAdapter(BaseAdapter):
 
                 yield msg_info, files
         except asyncio.CancelledError:
+            # Telethon drop-cancel → fail the scan (see iter_conversations);
+            # an EXTERNAL cancel of the ingest task must propagate instead.
+            if self._cancellation_requested():
+                raise
             logger.error(
                 "iter_messages cancelled by Telethon (connection dropped) for conv %s — aborting iteration",
                 conversation_id,
@@ -759,6 +785,33 @@ class TelegramAdapter(BaseAdapter):
             for h in handles:
                 h.close()
 
+    async def _teardown_download_task(self, task: asyncio.Task) -> None:
+        """Cancel a download task and drop the client if it won't stay dead.
+
+        Telethon's request loop can swallow ``CancelledError``, so
+        ``task.cancelled()`` is False even while the task is still running and
+        issuing ``upload.getFile`` requests (writing to the now-unlinked
+        destination). The sequential fallback must not share a client with
+        such a zombie: whenever the task did not finish cleanly, disconnect so
+        the next operation gets a fresh connection.
+        """
+        if not task.done():
+            task.cancel()
+            try:
+                # Never await the task directly: one that swallowed the
+                # cancellation would hang us forever. Give it a bounded grace
+                # period, then tear the client down regardless.
+                await asyncio.wait(
+                    {task}, timeout=self._DOWNLOAD_CANCEL_GRACE_SECONDS
+                )
+            except Exception:
+                pass
+        if (task.cancelled() or not task.done()) and self.client:
+            try:
+                await asyncio.wait_for(self.client.disconnect(), timeout=5)
+            except Exception:
+                pass
+
     async def download_message_media(
         self,
         conversation_id: int,
@@ -894,30 +947,11 @@ class TelegramAdapter(BaseAdapter):
                 # Propagate any exception from the task
                 task.result()
             finally:
-                if not task.done():
-                    task.cancel()
-                    try:
-                        # Use asyncio.wait instead of awaiting directly —
-                        # Telethon's reconnection loop can swallow
-                        # CancelledError, causing an indefinite hang. Give it
-                        # 5 s to honour the cancel, then abandon.
-                        await asyncio.wait({task}, timeout=5.0)
-                    except Exception:
-                        pass
-                # If the task was cancelled (stall or hard timeout), drop the
-                # connection so the next Telegram operation starts clean.
-                # _ensure_connected will reconnect transparently on the next
-                # Telegram operation. Bounded: with auto_reconnect=False the
-                # old client is quiescent, and a slow teardown must not stall
-                # the acquire stage.
-                if task.cancelled() and self.client:
-                    try:
-                        await asyncio.wait_for(
-                            self.client.disconnect(),
-                            timeout=5,
-                        )
-                    except Exception:
-                        pass
+                # Drop the client whenever the task did not finish cleanly
+                # (cancelled, or still running after Telethon swallowed the
+                # cancellation) so nothing survives into the fallback/download
+                # caller. Bounded: a slow teardown must not stall acquire.
+                await self._teardown_download_task(task)
 
         if use_parallel:
             try:
@@ -926,6 +960,13 @@ class TelegramAdapter(BaseAdapter):
                 # Parallel path can fail e.g. when the account is throttled
                 # for concurrent getFile requests — fall back to the classic
                 # single-stream download rather than failing the artifact.
+                # But only if the parallel task is truly done: one that
+                # survived the monitor's bounded cancel (Telethon swallowed
+                # CancelledError) can still be issuing getFile requests, and
+                # starting the fallback on the shared client would let the two
+                # interleave on the same file/session.
+                if not download_task.done():
+                    raise
                 logger.warning(
                     "Parallel download failed (%s: %s), falling back to "
                     "sequential download",
@@ -975,13 +1016,34 @@ class TelegramAdapter(BaseAdapter):
             # Check if we're a member
             is_member = False
             try:
-                # Try to get dialogs to check membership
-                async for dialog in self.client.iter_dialogs():
+                # Try to get dialogs to check membership. Bounded by the same
+                # per-item stall guard as iter_conversations: a half-open
+                # socket here would otherwise hang the resolve forever while
+                # the heartbeat keeps the watchdog satisfied.
+                async for dialog in self._bounded_aiter(
+                    self.client.iter_dialogs(),
+                    "resolving forwarded source",
+                    self._ITER_STALL_SECONDS,
+                ):
                     if dialog.id == forwarded_from_id:
                         is_member = True
                         break
-            except (Exception, asyncio.CancelledError):
-                pass
+            except asyncio.CancelledError:
+                # Telethon cancels the pending request when the connection
+                # drops; an EXTERNAL cancel of this task (shutdown) must not
+                # be swallowed. Membership is best-effort either way.
+                if self._cancellation_requested():
+                    raise
+                logger.debug(
+                    "Forwarded-source membership check cancelled by Telethon for %d",
+                    forwarded_from_id,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Forwarded-source membership check failed for %d: %s",
+                    forwarded_from_id,
+                    exc,
+                )
 
             return ConversationInfo(
                 platform_id=forwarded_from_id,

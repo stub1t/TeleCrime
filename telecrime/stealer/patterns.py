@@ -46,6 +46,8 @@ r"(?:^|[_ ])(?:pass|login|logins|combo|dump|dumps|creds?|ulp|txtlog)\w*\.txt$",
     r"(?:txtlog|url\s*log(?:in)?\s*pass|log\s*in\s*pass|login\s*pass|mail\s*pass).*\.txt$",
     r"\b(?:email|mail|valid)(?:pass|creds?|dump|login|list|account|id|pwd)\w*\.txt$",
     r"passwords?\s*(?:backup|list|dump).*\.txt$",
+    # Chromium's credential database export name.
+    r"(?:^|[_ ])login\s*data\b.*\.txt$",
     # ^ anchor REQUIRED: without it, "notes@example.com.txt" matches via
     # re.search. Channel dump names start with @.
     r"^@[\w. ()\[\]-]{2,}\.txt$",
@@ -77,11 +79,39 @@ _system_info_regex = re.compile(
     re.IGNORECASE
 )
 
+# Download managers, file explorers and dedup extractors rename duplicates
+# with a trailing counter or "copy" marker. Stripping it before the gate turns
+# "Passwords (1).txt", "Passwords - Copy.txt" etc. into their base name.
+_DUPLICATE_SUFFIX_RE = re.compile(
+    r"(?:[\s_-]*[\(\[]\s*\d{1,3}\s*[\)\]]"
+    r"|[\s_-]+\d{1,3}"
+    r"|[\s_-]+copy(?:\s*[\(\[]?\s*\d{1,3}\s*[\)\]]?)?)$",
+    re.IGNORECASE,
+)
+
+
+def _strip_duplicate_suffix(name: str) -> str:
+    """Remove trailing duplicate/copy suffixes from a filename stem.
+
+    ``Passwords (1).txt`` → ``Passwords.txt``; ``dump - Copy (2).txt`` →
+    ``dump.txt``. The extension is preserved as-is.
+    """
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        return name
+    previous = None
+    while previous != stem:
+        previous = stem
+        stem = _DUPLICATE_SUFFIX_RE.sub("", stem)
+    return f"{stem}{dot}{ext}"
+
 
 def is_credential_file(filename: str) -> bool:
     """Check if filename matches credential file patterns."""
     name = Path(filename).name
-    return bool(_credential_regex.search(name))
+    if _credential_regex.search(name):
+        return True
+    return bool(_credential_regex.search(_strip_duplicate_suffix(name)))
 
 
 def is_system_info_file(filename: str) -> bool:

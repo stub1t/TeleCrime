@@ -228,7 +228,13 @@ class PipelineProgressWriter:
 
     def stage_start(self, name: str) -> None:
         if self._current_stage and self._current_stage != name:
-            if self._current_stage not in self._stages_completed:
+            # A failed stage must never also be recorded as completed — e.g.
+            # after stage_error() the writer must not promote it on the next
+            # stage_start (it would be reported in both lists).
+            if (
+                self._current_stage not in self._stages_completed
+                and self._current_stage not in self._stages_failed
+            ):
                 self._stages_completed.append(self._current_stage)
         self._current_stage = name
         self._dl_active = False
@@ -246,6 +252,10 @@ class PipelineProgressWriter:
     def stage_error(self, name: str) -> None:
         if name not in self._stages_failed:
             self._stages_failed.append(name)
+        # Clear the failed stage so the next stage_start cannot promote it to
+        # completed (a stage must never appear in both lists).
+        if self._current_stage == name:
+            self._current_stage = None
         self._errors += 1
         self._mark_progress()
         self._write()

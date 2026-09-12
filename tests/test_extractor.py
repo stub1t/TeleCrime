@@ -1,6 +1,8 @@
 """Tests for archive extractor."""
 
 import asyncio
+import shutil
+import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -176,20 +178,23 @@ class TestSevenZipExtractor:
             (2, "ERROR: Cannot open encrypted archive. Wrong password?", "", False, "WRONG_PASSWORD", True, False),
             (2, "Cannot open the file", "", False, "CANNOT_OPEN", False, False),
             (2, "Unsupported archive type", "", False, "UNSUPPORTED_FORMAT", False, False),
+            # Exit 1 is only a failure when nothing usable landed on disk; the
+            # partial-success path is covered by the dedicated test below.
             (1, "", "some other failure", False, "EXIT_1", False, False),
         ],
     )
     @pytest.mark.asyncio
     async def test_parse_result_error_cases(
-        self, rc, stdout, stderr, success, error_code, wrong_password, needs_password
+        self, rc, stdout, stderr, success, error_code, wrong_password, needs_password, tmp_path
     ):
         """Table-driven _parse_result error classification."""
         extractor = SevenZipExtractor()
+        # Empty output dir: an exit-1 parse must not pick up unrelated files.
         result = await extractor._parse_result(
             return_code=rc,
             stdout=stdout,
             stderr=stderr,
-            output_dir=Path("/tmp"),
+            output_dir=tmp_path,
             target_extensions=None,
         )
         assert result.success is success
@@ -278,6 +283,50 @@ class TestSevenZipExtractor:
         assert "file3.pdf" in filenames
         assert "file1.txt" not in filenames
 
+    @pytest.mark.asyncio
+    async def test_parse_result_exit1_with_files_is_partial_success(self, tmp_path):
+        """7z exit 1 (warning) with files on disk must be partial success.
+
+        Returning EXIT_1 retried to the attempt cap, marked the group
+        FAILED_TERMINAL and let finalize delete the archive along with the
+        successfully extracted files.
+        """
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "creds.txt").write_text("data")
+
+        extractor = SevenZipExtractor()
+        result = await extractor._parse_result(
+            return_code=1,
+            stdout="WARNINGS: There are some data after the end of the payload data",
+            stderr="",
+            output_dir=output_dir,
+            target_extensions=["txt"],
+        )
+
+        assert result.success is True
+        assert [f.name for f in result.extracted_files] == ["creds.txt"]
+
+    @pytest.mark.asyncio
+    async def test_parse_result_exit1_with_integrity_error_is_failure(self, tmp_path):
+        """Exit 1 plus a corruption marker must never count as partial success:
+        the file that was written may itself be corrupt."""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "creds.txt").write_text("data")
+
+        extractor = SevenZipExtractor()
+        result = await extractor._parse_result(
+            return_code=1,
+            stdout="CRC Failed : creds.txt",
+            stderr="",
+            output_dir=output_dir,
+            target_extensions=["txt"],
+        )
+
+        assert result.success is False
+        assert result.error_code == "EXIT_1"
+
     def test_find_extracted_files_recursive(self, tmp_path):
         """Test finding files in nested directories."""
         output_dir = tmp_path / "output"
@@ -292,6 +341,115 @@ class TestSevenZipExtractor:
         files = extractor._find_extracted_files(output_dir, None)
 
         assert len(files) == 2
+
+    def test_extension_case_variants_cover_mixed_case_suffixes(self):
+        """Every suffix casing must be matched, not just all-lower/all-upper."""
+        from telecrime.extractor.seven_zip import _extension_case_variants
+
+        variants = _extension_case_variants(".TXT")
+        assert set(variants) == {
+            "txt", "txT", "tXt", "tXT", "Txt", "TxT", "TXt", "TXT",
+        }
+        # Pathological long extensions fall back to two patterns, not 2**n.
+        assert _extension_case_variants("longextension") == [
+            "LONGEXTENSION",
+            "longextension",
+        ]
+
+
+class TestUnrarExtractor:
+    """Tests for UnrarExtractor integrity/partial-output handling."""
+
+    @pytest.mark.asyncio
+    async def test_crc_failed_with_password_attempt_is_wrong_password(self, tmp_path):
+        """A CRC failure after a password attempt means the password was wrong.
+
+        Previously a non-empty (garbage) file on disk made this a success, so
+        finalize deleted the still-encrypted source archive.
+        """
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "secret.txt").write_text("garbage from wrong password")
+
+        extractor = UnrarExtractor()
+        result = await extractor._parse_result(
+            return_code=3,
+            stdout="Extracting  secret.txt\nCRC failed in secret.txt\n",
+            stderr="",
+            output_dir=output_dir,
+            target_extensions=["txt"],
+            password="guess",
+        )
+
+        assert result.success is False
+        assert result.error_code == "WRONG_PASSWORD"
+        assert result.wrong_password is True
+
+    @pytest.mark.asyncio
+    async def test_bad_archive_without_password_is_corrupted(self, tmp_path):
+        """Without a password attempt an integrity error is pure corruption —
+        leftover partial output must not be accepted as success."""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "secret.txt").write_text("partial bytes")
+
+        extractor = UnrarExtractor()
+        result = await extractor._parse_result(
+            return_code=3,
+            stdout="Bad archive\n",
+            stderr="",
+            output_dir=output_dir,
+            target_extensions=["txt"],
+        )
+
+        assert result.success is False
+        assert result.error_code == "CORRUPTED"
+        assert result.wrong_password is False
+
+    @pytest.mark.asyncio
+    async def test_checksum_error_with_zero_exit_is_corrupted(self, tmp_path):
+        """Even exit 0 must not mask a member integrity failure."""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "secret.txt").write_text("partial bytes")
+
+        extractor = UnrarExtractor()
+        result = await extractor._parse_result(
+            return_code=0,
+            stdout="Checksum error in secret.txt\n",
+            stderr="",
+            output_dir=output_dir,
+            target_extensions=["txt"],
+            password="guess",
+        )
+
+        assert result.success is False
+        assert result.error_code == "WRONG_PASSWORD"
+
+    @pytest.mark.asyncio
+    async def test_extract_masks_include_case_variants(self, tmp_path):
+        """unrar masks are case-sensitive on Linux: `*.txt` alone skipped an
+        uppercase member and the archive was deleted after an empty extract."""
+        extractor = UnrarExtractor()
+        archive = tmp_path / "test.rar"
+        archive.touch()
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_process = AsyncMock()
+            mock_process.communicate = AsyncMock(return_value=(b"", b""))
+            mock_process.returncode = 0
+            mock_exec.return_value = mock_process
+
+            await extractor.extract(
+                archive,
+                tmp_path / "output",
+                target_extensions=["txt"],
+            )
+
+        call_args = mock_exec.call_args[0]
+        assert "*.txt" in call_args
+        assert "*.TXT" in call_args
+        assert "*.Txt" in call_args
 
 
 class TestSevenZipExtractorAsync:
@@ -415,10 +573,39 @@ Folder = +
                 target_extensions=[".epub", ".pdf"],
             )
 
-            # Check that -ir flags were included
+            # Check that -ir flags were included. Case variants are required:
+            # 7z's glob is case-sensitive on Linux, so `-ir!*.epub` alone
+            # silently skipped `MEMBER.EPUB` (exit 0, zero files extracted).
             call_args = mock_exec.call_args[0]
             assert any("-ir!*.epub" in str(arg) for arg in call_args)
             assert any("-ir!*.pdf" in str(arg) for arg in call_args)
+            assert any("-ir!*.EPUB" in str(arg) for arg in call_args)
+            assert any("-ir!*.ePub" in str(arg) for arg in call_args)
+
+    @pytest.mark.asyncio
+    async def test_extract_uppercase_extension_member_is_not_skipped(self, tmp_path):
+        """Regression: a `Passwords.TXT` member must survive extraction.
+
+        With the old case-sensitive `-ir!*.txt` filter 7z exited 0 having
+        extracted nothing; the group was marked EXTRACTED and finalize deleted
+        the source archive.
+        """
+        if shutil.which("7z") is None:
+            pytest.skip("7z is not installed")
+
+        archive = tmp_path / "logs.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("Passwords.TXT", "https://example.com;user;pass\n")
+
+        extractor = SevenZipExtractor()
+        result = await extractor.extract(
+            archive,
+            tmp_path / "output",
+            target_extensions=["txt"],
+        )
+
+        assert result.success is True
+        assert [f.name for f in result.extracted_files] == ["Passwords.TXT"]
 
     @pytest.mark.asyncio
     async def test_extract_timeout_returns_error(self, tmp_path):

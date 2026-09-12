@@ -32,6 +32,10 @@ SPLIT_PATTERNS = [
     # archive_1of3.zip, archive_2of3.zip — must come BEFORE the generic
     # .rar/.zip match below, otherwise part numbers are never extracted.
     (re.compile(r"^(.+?)[-_]?(\d+)of(\d+)\.(zip|rar|7z)$", re.IGNORECASE), 1, 2),
+    # volume1.zip, volume2.zip, archive_vol1.rar, archive-vol2.7z — must come
+    # BEFORE the bare .rar match below, otherwise archive_vol1.rar is taken as
+    # a standalone "archive_vol1" archive and its companions stay separate.
+    (re.compile(r"^(.+?)[-_]?(?:vol|volume)[-_]?(\d+)\.(zip|rar|7z)$", re.IGNORECASE), 1, 2),
     # archive.rar (main) - matches with .r00 series
     (re.compile(r"^(.+?)\.rar$", re.IGNORECASE), 1, None),
     # .7z.001, .7z.002
@@ -42,8 +46,6 @@ SPLIT_PATTERNS = [
     (re.compile(r"^(.+?)\.z(\d{2})$", re.IGNORECASE), 1, 2),
     # Generic .001, .002, .003
     (re.compile(r"^(.+?)\.(\d{3})$"), 1, 2),
-    # volume1.zip, volume2.zip
-    (re.compile(r"^(.+?)[-_]?(?:vol|volume)[-_]?(\d+)\.(zip|rar|7z)$", re.IGNORECASE), 1, 2),
 ]
 
 
@@ -133,62 +135,87 @@ def group_by_pattern(attachments: list[FileAttachment]) -> list[GroupingResult]:
         has_explicit_parts = any(p[1] is not None for p in parts)
 
         if has_explicit_parts:
-            # Genuine multi-part archive (e.g. .part1.rar, .part2.rar)
-            explicit_parts = [p for p in parts if p[1] is not None]
-            no_part_files = [p[0] for p in parts if p[1] is None]
-
-            # If the split uses .partN format, companion bare .rar files are
-            # standalone archives that happen to share the base name.
-            # Only include no-part-number files when the split uses the OLD
-            # RAR format (.r00, .r01, ...) where archive.rar is the companion.
+            # Genuine multi-part archive (e.g. .part1.rar, .part2.rar).
+            # Each message carries at most one upload set: two messages with
+            # the same base name each containing part1..partN are independent
+            # archives. Sets from different messages are merged only when
+            # their explicit part indexes are disjoint (the same split
+            # uploaded in pieces by the poster).
             uses_part_n = any(
                 re.search(r"\.part\d+\b", p[0].filename or "", re.IGNORECASE)
-                for p in explicit_parts
+                for p in parts
+                if p[1] is not None
             )
-            if uses_part_n:
-                # Bare .rar files (e.g. Archive.rar mixed with Archive.part1.rar)
-                # are standalone uploads, not part of this multi-part set.
-                standalone.extend(no_part_files)
-            else:
-                # Old-style RAR: companion .rar accompanies .r00/.r01 series.
-                explicit_parts = parts  # include all
 
-            attachments_list = [p[0] for p in explicit_parts]
-            if uses_part_n:
-                part_numbers = {
-                    p[0].id: p[1] if p[1] is not None else idx
-                    for idx, p in enumerate(sorted(explicit_parts, key=lambda x: x[1] or 0))
-                }
-            else:
-                # Old-style RAR: the bare .rar is the header-bearing first
-                # volume (index 0); .r00/.r01/.r02... follow as 1,2,3.
-                # Sorting by `x[1] or 0` would tie the bare .rar with .r00,
-                # and assigning the .rar an enumerate index could collide with
-                # .r00's explicit 0 → two parts with part_index 0, breaking
-                # 7z's volume order and failing extraction.
-                part_numbers = {}
-                for p in sorted(
-                    explicit_parts,
-                    key=lambda x: x[1] if x[1] is not None else -1,
-                ):
-                    part_numbers[p[0].id] = 0 if p[1] is None else p[1] + 1
+            by_message: dict[int | None, list[tuple[FileAttachment, int | None]]] = defaultdict(list)
+            for p in parts:
+                by_message[getattr(p[0], "message_id", None)].append(p)
 
-            # Infer expected parts from the range of part numbers.
-            # Most formats are 1-indexed (.part1, .001, .z01) so the count
-            # is max-min+1.  0-indexed formats (.r00) also work correctly.
-            part_nums = [p[1] for p in explicit_parts if p[1] is not None]
-            expected_parts = max(part_nums) - min(part_nums) + 1
-            # Old-style RAR includes the bare .rar as an extra part before .r00.
-            if not uses_part_n and any(p[1] is None for p in explicit_parts):
-                expected_parts += 1
+            message_sets: list[list[tuple[FileAttachment, int | None]]] = []
+            for msg_parts in by_message.values():
+                msg_explicit = [p for p in msg_parts if p[1] is not None]
+                msg_no_part = [p[0] for p in msg_parts if p[1] is None]
+                if uses_part_n:
+                    # Bare .rar files (e.g. Archive.rar mixed with
+                    # Archive.part1.rar) are standalone uploads, not part of
+                    # this multi-part set.
+                    standalone.extend(msg_no_part)
+                    if msg_explicit:
+                        message_sets.append(msg_explicit)
+                else:
+                    # Old-style RAR: companion .rar accompanies the
+                    # .r00/.r01 series. A no-part-only message set has an
+                    # empty index set and is absorbed by a matching series.
+                    message_sets.append(list(msg_parts))
 
-            results.append(GroupingResult(
-                base_name=attachments_list[0].detected_base_name or attachments_list[0].filename or base_name,
-                attachments=attachments_list,
-                expected_parts=expected_parts,
-                part_numbers=part_numbers,
-                confidence=0.9,
-            ))
+            merged_sets: list[list[tuple[FileAttachment, int | None]]] = []
+            for msg_set in message_sets:
+                indexes = {p[1] for p in msg_set if p[1] is not None}
+                for existing in merged_sets:
+                    existing_indexes = {p[1] for p in existing if p[1] is not None}
+                    if indexes.isdisjoint(existing_indexes):
+                        existing.extend(msg_set)
+                        break
+                else:
+                    merged_sets.append(list(msg_set))
+
+            for merged_parts in merged_sets:
+                attachments_list = [p[0] for p in merged_parts]
+                if uses_part_n:
+                    part_numbers = {
+                        p[0].id: p[1] if p[1] is not None else idx
+                        for idx, p in enumerate(sorted(merged_parts, key=lambda x: x[1] or 0))
+                    }
+                else:
+                    # Old-style RAR: the bare .rar is the header-bearing first
+                    # volume (index 0); .r00/.r01/.r02... follow as 1,2,3.
+                    # Sorting by `x[1] or 0` would tie the bare .rar with .r00,
+                    # and assigning the .rar an enumerate index could collide with
+                    # .r00's explicit 0 → two parts with part_index 0, breaking
+                    # 7z's volume order and failing extraction.
+                    part_numbers = {}
+                    for p in sorted(
+                        merged_parts,
+                        key=lambda x: x[1] if x[1] is not None else -1,
+                    ):
+                        part_numbers[p[0].id] = 0 if p[1] is None else p[1] + 1
+
+                # Infer expected parts from the range of part numbers.
+                # Most formats are 1-indexed (.part1, .001, .z01) so the count
+                # is max-min+1.  0-indexed formats (.r00) also work correctly.
+                part_nums = [p[1] for p in merged_parts if p[1] is not None]
+                expected_parts = max(part_nums) - min(part_nums) + 1
+                # Old-style RAR includes the bare .rar as an extra part before .r00.
+                if not uses_part_n and any(p[1] is None for p in merged_parts):
+                    expected_parts += 1
+
+                results.append(GroupingResult(
+                    base_name=attachments_list[0].detected_base_name or attachments_list[0].filename or base_name,
+                    attachments=attachments_list,
+                    expected_parts=expected_parts,
+                    part_numbers=part_numbers,
+                    confidence=0.9,
+                ))
         else:
             # No explicit part numbers — group by message instead.
             # Files in the same message belong together; files in
@@ -214,29 +241,29 @@ def group_by_pattern(attachments: list[FileAttachment]) -> list[GroupingResult]:
 
     # Add standalone files as single-file groups
     for attachment in standalone:
-        # Split-series end volume: a bare "file.zip" is the FINAL volume of a
-        # "file.z01/z02/..." series (and "file.7z" ends a ".001/.002"
-        # series). Left standalone, 7z CANNOT_OPEN it and the group is
-        # deleted. Attach it to the matching series when one exists — the
-        # series itself must have been found in the explicit-parts branch.
+        # Split-series end volume: a bare "file.zip" is the FINAL volume of an
+        # old-style PKZIP split "file.z01/z02/...". Left standalone, 7z
+        # CANNOT_OPEN it and the group is deleted, so attach it to the matching
+        # series when one exists (the series itself must have been found in
+        # the explicit-parts branch). A bare ".7z" or ".zip" is otherwise a
+        # complete independent archive — never absorb it into a ".7z.001"/
+        # ".zip.001" series just because the base name matches (doing so made
+        # finalize delete the complete archive along with the failed series).
         _linked = False
-        _series_key: str | None = None
         _filename = attachment.filename or ""
-        _suffix = _filename.lower()
-        if _suffix.endswith(".zip"):
-            _series_key = _filename[:-4]
-        elif _suffix.endswith(".7z"):
-            _series_key = _filename[:-3]
-        if _series_key:
-            _series_norm = normalize_group_key(_series_key)
+        if _filename.lower().endswith(".zip"):
+            _series_norm = normalize_group_key(_filename[:-4])
             for existing in results:
                 _first = existing.attachments[0].filename if existing.attachments else ""
+                # Compare the series *base*: the first attachment carries its
+                # part suffix ("file.z01"), which normalize_group_key keeps.
+                _first_base = extract_base_and_part(_first)[0] if _first else None
                 if (
                     existing.attachments
-                    and _first
-                    and normalize_group_key(_first) == _series_norm
+                    and _first_base
+                    and normalize_group_key(_first_base) == _series_norm
                     and any(
-                        (a.filename or "").lower().endswith((".z01", ".z02", ".001", ".002"))
+                        re.search(r"\.z\d{2}$", a.filename or "", re.IGNORECASE)
                         for a in existing.attachments
                     )
                 ):

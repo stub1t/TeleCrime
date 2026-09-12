@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -417,3 +418,213 @@ async def test_client_created_with_auto_reconnect_disabled(monkeypatch, tmp_path
     adapter = TelegramAdapter(cfg)
     await adapter.connect(timeout=5)
     assert created.get("auto_reconnect") is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_forwarded_source_bounds_dialog_scan():
+    """The membership probe in resolve_forwarded_source must use the bounded
+    iterator: a half-open socket in iter_dialogs used to hang it forever while
+    the heartbeat kept the watchdog satisfied."""
+    adapter = _make_adapter()
+    adapter._ITER_STALL_SECONDS = 1
+
+    entity = MagicMock()
+    entity.title = "stealer logs"
+    entity.username = "stealerlogs"
+    entity.access_hash = 123
+    client = MagicMock()
+    client.get_entity = AsyncMock(return_value=entity)
+
+    async def _hangs():
+        await asyncio.sleep(60)
+        yield  # pragma: no cover
+
+    client.iter_dialogs = lambda: _hangs()
+    adapter.client = client
+
+    started = time.monotonic()
+    info = await adapter.resolve_forwarded_source(999)
+    elapsed = time.monotonic() - started
+
+    assert info is not None
+    assert info.is_member is False
+    assert elapsed < 5, f"resolve_forwarded_source took {elapsed:.1f}s (unbounded scan)"
+
+
+@pytest.mark.asyncio
+async def test_resolve_forwarded_source_propagates_external_cancel():
+    """An external task cancel during the membership probe must propagate as
+    CancelledError, not be swallowed by the best-effort try/except."""
+    adapter = _make_adapter()
+    adapter._ITER_STALL_SECONDS = 60
+
+    entity = MagicMock()
+    entity.title = "t"
+    client = MagicMock()
+    client.get_entity = AsyncMock(return_value=entity)
+    started = asyncio.Event()
+
+    async def _hangs():
+        started.set()
+        await asyncio.sleep(60)
+        yield  # pragma: no cover
+
+    client.iter_dialogs = lambda: _hangs()
+    adapter.client = client
+
+    task = asyncio.create_task(adapter.resolve_forwarded_source(999))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_iter_conversations_propagates_external_cancel():
+    """A genuine external cancel of the scan must surface as CancelledError
+    (Telethon drop-cancels still become RuntimeError)."""
+    adapter = _make_adapter()
+    adapter._ITER_STALL_SECONDS = 60
+    client = AsyncMock()
+    adapter.client = client
+    started = asyncio.Event()
+
+    async def _hangs():
+        started.set()
+        await asyncio.sleep(60)
+        yield  # pragma: no cover
+
+    client.iter_dialogs = lambda: _hangs()
+
+    async def _consume():
+        async for _ in adapter.iter_conversations():
+            pass
+
+    task = asyncio.create_task(_consume())
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_iter_messages_propagates_external_cancel():
+    """Same external-cancel discrimination for the message iterator."""
+    adapter = _make_adapter()
+    adapter._ITER_STALL_SECONDS = 60
+    client = AsyncMock()
+    adapter.client = client
+    started = asyncio.Event()
+
+    async def _hangs():
+        started.set()
+        await asyncio.sleep(60)
+        yield  # pragma: no cover
+
+    client.iter_messages = lambda **kw: _hangs()
+
+    async def _consume():
+        async for _ in adapter.iter_messages(1, min_id=0):
+            pass
+
+    task = asyncio.create_task(_consume())
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_teardown_download_task_disconnects_on_swallowed_cancel():
+    """Telethon can swallow CancelledError: task.cancelled() stays False while
+    the task is still running. Teardown must disconnect anyway so a fallback
+    can never share the client with the zombie download."""
+    adapter = _make_adapter()
+    adapter._DOWNLOAD_CANCEL_GRACE_SECONDS = 0.02
+    client = MagicMock()
+    client.disconnect = AsyncMock()
+    adapter.client = client
+
+    release = asyncio.Event()
+
+    async def _swallow_cancel():
+        while not release.is_set():
+            try:
+                await asyncio.sleep(0.02)
+            except asyncio.CancelledError:
+                continue
+
+    task = asyncio.create_task(_swallow_cancel())
+    await asyncio.sleep(0.01)
+    await adapter._teardown_download_task(task)
+
+    assert not task.done()
+    assert not task.cancelled()  # cancellation was swallowed
+    client.disconnect.assert_awaited_once()
+
+    release.set()
+    await asyncio.wait({task}, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_teardown_download_task_keeps_client_on_clean_completion():
+    """A cleanly finished download must not trigger a client disconnect."""
+    adapter = _make_adapter()
+    client = MagicMock()
+    client.disconnect = AsyncMock()
+    adapter.client = client
+
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task
+    await adapter._teardown_download_task(task)
+    client.disconnect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_parallel_fallback_not_started_while_old_task_pending(tmp_path):
+    """A parallel download task that survives the monitor's cancel must block
+    the sequential fallback: otherwise the zombie (still issuing getFile) and
+    the fallback would run on the same client."""
+    adapter = _make_adapter()
+    adapter.config.download.parallel_chunks = 2
+    adapter.config.download.parallel_min_bytes = 0
+    adapter._DOWNLOAD_CANCEL_GRACE_SECONDS = 0.02
+
+    size = 8 * 1024 * 1024
+    msg = _FakeMessage(size)
+    dest = tmp_path / "fallback_race.bin"
+
+    client = MagicMock()
+    client.is_connected = lambda: True
+    client.get_messages = AsyncMock(return_value=msg)
+    client.disconnect = AsyncMock()
+    client.download_media = AsyncMock()
+    adapter.client = client
+
+    release = asyncio.Event()
+
+    async def _stubborn(*args, **kwargs):
+        while not release.is_set():
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                continue
+
+    adapter._download_media_parallel = _stubborn
+
+    with pytest.raises(asyncio.TimeoutError):
+        await adapter.download_message_media(
+            conversation_id=1,
+            message_id=2,
+            destination=dest,
+            timeout_seconds=1,
+            stall_seconds=1,
+        )
+
+    client.download_media.assert_not_awaited()
+    client.disconnect.assert_awaited()
+
+    release.set()
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if pending:
+        await asyncio.wait(pending, timeout=1)

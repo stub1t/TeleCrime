@@ -111,6 +111,12 @@ except Exception:
     print('')
 " 2>/dev/null || echo "")
 
+# MUST be initialized before the conditional below: `set -u` would otherwise
+# abort the script with "NOW_TS: unbound variable" whenever the snapshot or
+# progress file was missing (e.g. after every reboot — /tmp is tmpfs), i.e.
+# exactly before the snapshot write that gets it unstuck. Watchdog stays dead
+# forever without this.
+NOW_TS=$(date +%s)
 FROZEN=0
 if [ -n "$SIG" ] && [ -f "$SNAP" ]; then
   # SIG can contain spaces (archive names like "ULP Combo (1).zip"), so the
@@ -120,7 +126,6 @@ if [ -n "$SIG" ] && [ -f "$SNAP" ]; then
   PREV_SIG=$(sed -n '1p' "$SNAP")
   PREV_TS=$(sed -n '2p' "$SNAP")
   PREV_TS=${PREV_TS:-0}
-  NOW_TS=$(date +%s)
   # Two-consecutive-identical-signatures must be observed at least 9 minutes
   # apart. The cron watchdog (10-min) and the monitor loop (5-min) interleave,
   # so consecutive *invocations* can be ~2 seconds apart — without the time
@@ -182,13 +187,27 @@ if [ "$DL_OK" = "1" ]; then
 fi
 
 # --- 4. Active DB query (pipeline doing real work)? ---
+# Pipeline-scoped: the pipeline subprocess tags its connections with
+# application_name='telecrime-pipeline' (PGAPPNAME in scheduler.py), so web
+# polls/autovacuum cannot mask a genuinely hung pipeline. Fallback to the old
+# any-query behaviour while NO pipeline-tagged connection exists (older
+# already-running subprocesses, or a pipeline that has not connected yet).
 DB_ACTIVE=0
 DB_ACTIVITY_AGE=9999
 DB_Q=$(timeout 20 docker compose -f "$COMPOSE_FILE" exec -T db psql -U telecrime -t -A -c "
   SELECT COALESCE(EXTRACT(EPOCH FROM (now() - max(query_start)))::int, 9999)
   FROM pg_stat_activity
   WHERE datname='telecrime' AND state='active'
+    AND pid <> pg_backend_pid()
     AND query NOT LIKE '%pg_stat_activity%'
+    AND (
+      application_name = 'telecrime-pipeline'
+      OR NOT EXISTS (
+        SELECT 1 FROM pg_stat_activity p
+        WHERE p.datname='telecrime'
+          AND p.application_name = 'telecrime-pipeline'
+      )
+    )
 " 2>/dev/null | tr -d ' ')
 if [ -n "$DB_Q" ] && [ "$DB_Q" != "9999" ] && [ "$DB_Q" -lt "$NO_DB_ACTIVITY_SEC" ]; then
   DB_ACTIVE=1
@@ -253,10 +272,15 @@ if [ "$PIPELINE_ALIVE" = "0" ] && [ "$PIPELINE_PID" != "0" ]; then
   # Pipeline process is gone but left its pid file → crashed mid-run.
   NEED_HEAL=1
   REASON="pipeline process dead (pid=$PIPELINE_PID)"
-elif [ "$HEARTBEAT_AGE" -gt "$STALE_HEARTBEAT_SEC" ] && [ "$DB_ACTIVE" = "0" ]; then
-  # Heartbeat stale AND no DB work → hung (e.g. deadlock in I/O)
+elif [ "$HEARTBEAT_AGE" -gt "$STALE_HEARTBEAT_SEC" ] && [ "$DB_ACTIVE" = "0" ] && [ "$PIPELINE_ALIVE" = "0" ]; then
+  # Heartbeat stale AND no DB work AND the process is gone (PIPELINE_PID may
+  # be 0 when the pid file is missing, e.g. a pipeline started from another
+  # container). Requiring PIPELINE_ALIVE=0 prevents a stale progress file
+  # left by a crashed run from killing a freshly started healthy pipeline;
+  # an alive-but-hung process is caught by the two-consecutive-check FROZEN
+  # branch below instead.
   NEED_HEAL=1
-  REASON="hung pipeline (heartbeat ${HEARTBEAT_AGE}s old, no DB activity)"
+  REASON="hung pipeline (heartbeat ${HEARTBEAT_AGE}s old, process not alive, no DB activity)"
 elif [ "$FROZEN" = "1" ] && [ "$DB_ACTIVE" = "0" ] && [ "$DL_ACTIVE" = "0" ]; then
   # Fresh heartbeat but the counters/archive/download have not moved between
   # two consecutive checks AND there is no DB query running AND no active

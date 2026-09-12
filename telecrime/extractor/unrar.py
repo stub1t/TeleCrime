@@ -5,6 +5,7 @@ Uses the unrar binary from Alexander Roshal which supports all RAR formats.
 """
 
 import asyncio
+import itertools
 import logging
 import shutil
 from pathlib import Path
@@ -16,6 +17,26 @@ from telecrime.extractor.interface import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _extension_case_variants(extension: str) -> list[str]:
+    """Return every case permutation of an extension, without its leading dot.
+
+    unrar file masks are case-sensitive on Linux, so ``*.txt`` silently skips
+    an uppercase member like ``PASSWORDS.TXT``: extraction succeeds with zero
+    files, the group is marked EXTRACTED and finalize deletes the source.
+    Enumerating the variants keeps the command-line pre-filter (avoids
+    extracting the whole archive) while matching any suffix casing. Suffixes
+    longer than 8 characters fall back to lower/upper to bound 2**n masks.
+    """
+    ext = extension.lstrip(".")
+    if not ext:
+        return []
+    if len(ext) > 8:
+        return sorted({ext.lower(), ext.upper()})
+    return sorted(
+        {"".join(chars) for chars in itertools.product(*((c.lower(), c.upper()) for c in ext))}
+    )
 
 
 class UnrarExtractor(ArchiveExtractor):
@@ -58,9 +79,12 @@ class UnrarExtractor(ArchiveExtractor):
         # File masks BEFORE the output dir: without them unrar extracts every
         # member (jpg/db/exe included) and only post-filters — for 650-900 MB
         # RAR5 dumps that is massively wasted I/O, disk and wall time.
+        # Masks are case-sensitive on Linux: pass every extension case
+        # permutation so an uppercase member like PASSWORDS.TXT still matches.
         if target_extensions:
             for ext in target_extensions:
-                cmd.append(f"*.{ext.lstrip('.')}")
+                for variant in _extension_case_variants(ext):
+                    cmd.append(f"*.{variant}")
         # unrar needs trailing slash on output dir
         cmd.append(str(output_dir) + "/")
 
@@ -113,6 +137,7 @@ class UnrarExtractor(ArchiveExtractor):
                 stderr_text,
                 output_dir,
                 target_extensions,
+                password=password,
             )
 
         except Exception as e:
@@ -131,8 +156,20 @@ class UnrarExtractor(ArchiveExtractor):
         stderr: str,
         output_dir: Path,
         target_extensions: list[str] | None,
+        password: str | None = None,
     ) -> ExtractionResult:
         combined = stdout + stderr
+        combined_lower = combined.lower()
+
+        # Integrity errors mean the recovered data is incomplete/corrupt and
+        # must never be accepted as (partial) success: a CRC-failed file can
+        # still be non-empty on disk, which previously marked the group
+        # EXTRACTED and let finalize delete the source archives.
+        integrity_error = (
+            "crc failed" in combined_lower
+            or "bad archive" in combined_lower
+            or "checksum error" in combined_lower
+        )
 
         if return_code != 0:
             # Signal death (OOM killer) is never an archive problem: check it
@@ -155,22 +192,42 @@ class UnrarExtractor(ArchiveExtractor):
                     error_message="Wrong password",
                     wrong_password=True,
                 )
-            # Non-header-encrypted RARs with wrong passwords produce CRC errors
-            if "CRC failed" in combined or "Bad archive" in combined:
-                encrypted = "encrypted" in combined.lower() or "password" in combined.lower()
-                if encrypted:
-                    return ExtractionResult(
-                        success=False,
-                        error_code="WRONG_PASSWORD",
-                        error_message="Wrong password (CRC failure in encrypted file)",
-                        wrong_password=True,
-                    )
-            if "password" in combined.lower() and "enter password" in combined.lower():
+
+            # Volume chain broken (missing/renamed parts) is retryable, so it
+            # is classified before generic integrity errors: a partial-extract
+            # "Bad archive" must not be terminalized as corruption.
+            if "Unexpected end of archive" in combined or "Cannot find volume" in combined:
+                return ExtractionResult(
+                    success=False,
+                    error_code="VOLUME_MISSING",
+                    error_message="Archive incomplete — missing or renamed volume",
+                )
+
+            # A header-encrypted archive asks for a password before any member
+            # is touched; keep this recoverable classification ahead of the
+            # terminal integrity one.
+            if "password" in combined_lower and "enter password" in combined_lower:
                 return ExtractionResult(
                     success=False,
                     error_code="PASSWORD_REQUIRED",
                     error_message="Archive requires password",
                     needs_password=True,
+                )
+
+            # Non-header-encrypted RARs with wrong passwords produce CRC errors.
+            # Without a password attempt an integrity failure is corruption.
+            if integrity_error:
+                if password is not None:
+                    return ExtractionResult(
+                        success=False,
+                        error_code="WRONG_PASSWORD",
+                        error_message="Wrong password (integrity failure in encrypted file)",
+                        wrong_password=True,
+                    )
+                return ExtractionResult(
+                    success=False,
+                    error_code="CORRUPTED",
+                    error_message="Archive is corrupted (integrity failure)",
                 )
             if "No files to extract" in combined:
                 return ExtractionResult(
@@ -187,21 +244,7 @@ class UnrarExtractor(ArchiveExtractor):
 
             # Partial success: some files extracted with errors (e.g. corrupt headers
             # in multi-volume archives missing later volumes). Treat as success if
-            # we got any files.
-            # EXCEPTION: "Unexpected end of archive" means the volume chain is
-            # broken (missing/renamed parts) — treating it as success lets
-            # finalize delete ALL volumes while the group is only partially
-            # parsed. That must be retryable so a late-arriving part (plan's
-            # late-part linking) can rescue the group.
-            # Narrow the volume check to unrar's actual messages (a bare
-            # "volume" substring could appear in normal multi-volume output).
-            if "Unexpected end of archive" in combined or "Cannot find volume" in combined:
-                return ExtractionResult(
-                    success=False,
-                    error_code="VOLUME_MISSING",
-                    error_message="Archive incomplete — missing or renamed volume",
-                )
-
+            # we got any files. Integrity errors already returned above.
             extracted = await asyncio.to_thread(
                 self._find_extracted_files, output_dir, target_extensions
             )
@@ -217,6 +260,21 @@ class UnrarExtractor(ArchiveExtractor):
                 success=False,
                 error_code=f"EXIT_{return_code}",
                 error_message=combined[:500],
+            )
+
+        # Even a zero exit code must not mask a member integrity failure.
+        if integrity_error:
+            if password is not None:
+                return ExtractionResult(
+                    success=False,
+                    error_code="WRONG_PASSWORD",
+                    error_message="Wrong password (integrity failure in encrypted file)",
+                    wrong_password=True,
+                )
+            return ExtractionResult(
+                success=False,
+                error_code="CORRUPTED",
+                error_message="Archive is corrupted (integrity failure)",
             )
 
         extracted = await asyncio.to_thread(

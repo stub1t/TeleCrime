@@ -579,3 +579,100 @@ class TestExtractPasswordsFromContext:
 
         values = [c.value for c in candidates]
         assert values.count("dupcloud") == 1
+
+    def test_repeat_extraction_reuses_existing_candidates(self, session, test_config):
+        """Re-extracting the same conversation must not insert duplicate rows.
+
+        Previously every archive/group inserted fresh candidates, so
+        never-tried rows accumulated forever.
+        """
+        from telecrime.models import Conversation, Message, PasswordCandidate
+        from telecrime.passwords.extractor import extract_passwords_from_context
+
+        conv = Conversation(
+            platform_id=1, username="repeatcloud", conversation_type="channel"
+        )
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=10,
+            platform_timestamp=datetime.now(UTC),
+            text="password: repeatsecret99",
+        )
+        session.add(msg)
+        session.flush()
+
+        import asyncio
+        first = asyncio.run(extract_passwords_from_context(
+            session, msg, attachment_filename="logs_pass_9f3x2k.zip"
+        ))
+        session.flush()
+        first_count = session.query(PasswordCandidate).count()
+        assert first, "first extraction should create candidates"
+
+        second = asyncio.run(extract_passwords_from_context(
+            session, msg, attachment_filename="logs_pass_9f3x2k.zip"
+        ))
+        session.flush()
+
+        assert second == []
+        assert session.query(PasswordCandidate).count() == first_count
+
+    def test_nearby_lookup_matches_global_abs_order(self, session):
+        """The two bounded scans keep the old ORDER BY abs(...) result.
+
+        Uses 15 messages before the anchor and only 2 after so a naive
+        per-side LIMIT 10 would drop the 10 nearest before-rows.
+        """
+        from sqlalchemy import func, select
+
+        from telecrime.models import Conversation, Message
+        from telecrime.passwords.extractor import _nearby_messages
+
+        conv = Conversation(platform_id=1, conversation_type="channel")
+        other = Conversation(platform_id=2, conversation_type="channel")
+        session.add_all([conv, other])
+        session.flush()
+        anchor = Message(
+            conversation_id=conv.id,
+            platform_id=100,
+            platform_timestamp=datetime.now(UTC),
+            text="anchor",
+        )
+        session.add(anchor)
+        for platform_id in range(85, 100):
+            session.add(Message(
+                conversation_id=conv.id,
+                platform_id=platform_id,
+                platform_timestamp=datetime.now(UTC),
+                text=f"pw {platform_id}",
+            ))
+        for platform_id in (101, 102):
+            session.add(Message(
+                conversation_id=conv.id,
+                platform_id=platform_id,
+                platform_timestamp=datetime.now(UTC),
+                text=f"pw {platform_id}",
+            ))
+        session.add(Message(
+            conversation_id=other.id,
+            platform_id=100,
+            platform_timestamp=datetime.now(UTC),
+            text="other conversation",
+        ))
+        session.flush()
+
+        nearby = _nearby_messages(session, anchor, nearby_count=5)
+        reference = session.execute(
+            select(Message)
+            .where(
+                Message.conversation_id == anchor.conversation_id,
+                Message.platform_id != anchor.platform_id,
+            )
+            .order_by(func.abs(Message.platform_id - anchor.platform_id))
+            .limit(10)
+        ).scalars().all()
+
+        assert {m.id for m in nearby} == {m.id for m in reference}
+        assert all(m.conversation_id == conv.id for m in nearby)

@@ -53,9 +53,10 @@ _DIGEST_ARCHIVES_DEFAULT = 25
 _DIGEST_SECONDS_DEFAULT = 20 * 60
 
 # Watchlist rescan cadence (env-tunable: TELECRIME_NOTIFY_WATCHLIST_SECONDS).
-# Mirrors the scheduler's 15-minute watchlist job: each check runs an ILIKE
-# COUNT(*) scan over parsed_credentials with statement_timeout disabled, so
-# running it every 60s tick (and again on every digest flush) hammered the DB.
+# Mirrors the scheduler's 15-minute watchlist job: each check runs ILIKE
+# COUNT(*) scans over parsed_credentials (bounded by the scheduler's 40s
+# statement_timeout), so running it every 60s tick (and again on every digest
+# flush) hammered the DB.
 _WATCHLIST_SECONDS_DEFAULT = 15 * 60
 
 # After a failed digest send, archive_parsed() must not retry the flush on
@@ -127,6 +128,19 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _cancellation_requested() -> bool:
+    """True when THIS task was cancelled externally.
+
+    Telethon raises ``CancelledError`` when it aborts an in-flight request
+    after a connection drop; an external ``task.cancel()`` (shutdown, stall
+    monitor) raises the same exception. Only the latter sets the task's
+    cancelling count, so it is the discriminator between a retryable drop and
+    a cancel that must propagate (same check as TelegramAdapter).
+    """
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 def _header(icon: str, title: str) -> str:
     """The standard message header: icon + title + timestamp."""
     return f"{icon} <b>{title}</b>\n<i>{_esc(_now_iso())}</i>\n{_DIVIDER}"
@@ -191,6 +205,15 @@ class TelegramNotifier:
         self._digest_domains: Counter[str] = Counter()
         self._digest_last_archive: str | None = None
         self._digest_since: float | None = None
+        # Serializes flush(): archive_parsed() and the background flusher can
+        # both call it concurrently, and without this lock the same digest was
+        # built and sent twice while both callers reset the counters.
+        self._flush_lock = asyncio.Lock()
+        # The in-flight watchlist scan future (pipeline path). Kept so a scan
+        # that outlives notify's wait_for is tracked to completion instead of
+        # being abandoned — abandoning it leaked a worker thread plus pooled
+        # connection every 15 minutes until the pipeline pool was exhausted.
+        self._watchlist_task: asyncio.Task | None = None
         # Earliest loop time at which archive_parsed() may auto-flush again
         # after a failed send; None when there is no pending failure.
         self._digest_retry_after: float | None = None
@@ -267,8 +290,15 @@ class TelegramNotifier:
                     ):
                         await self._send_status_only()
                         self._last_status_sent = now
-            except (Exception, asyncio.CancelledError):
+            except asyncio.CancelledError:
                 return
+            except Exception:
+                # One bad tick (DB hiccup, Telegram error, formatting bug) must
+                # not kill the flusher forever: log and keep ticking, or no
+                # digest/watchlist alerts are ever sent again for the run.
+                logger.exception(
+                    "Background digest flusher tick failed — continuing"
+                )
 
     async def _status_lines(self) -> list[str] | None:
         """The live-pipeline section for digest/status messages."""
@@ -323,13 +353,37 @@ class TelegramNotifier:
         Runs on the flusher tick and on digest flushes, but at most once per
         `_watchlist_interval` (default 15 minutes, matching the scheduler's
         watchlist job): each check runs ILIKE COUNT(*) scans over
-        parsed_credentials with statement_timeout disabled, so a per-minute
-        cadence was pure DB load for no extra alerts. The window advances only
-        on a confirmed send.
+        parsed_credentials, so a per-minute cadence was pure DB load for no
+        extra alerts. The window advances only on a confirmed send.
+
+        The scan runs in a worker thread (`asyncio.to_thread` from the
+        pipeline entry) and cannot be cancelled. It is therefore tracked as a
+        future: on timeout it keeps running (bounded by the scheduler's 40s
+        statement_timeout, which makes PostgreSQL cancel the backend and
+        release the pooled connection) and no new scan starts until it
+        finishes — previously every 15-minute timeout abandoned a thread +
+        connection, eventually exhausting the pipeline's DB pool.
         """
         if self.watchlist_provider is None:
             return
         now = asyncio.get_event_loop().time()
+
+        pending = self._watchlist_task
+        if pending is not None:
+            if not pending.done():
+                # Previous scan still running — do not stack another one. The
+                # throttle timestamp is NOT advanced, so the next tick retries.
+                return
+            # Finished since the last check (e.g. after a timeout): consume its
+            # result/exception so asyncio does not warn about it. Its alerts
+            # are intentionally dropped — the window was not advanced, so the
+            # next due check re-collects them.
+            try:
+                pending.result()
+            except BaseException:
+                pass
+            self._watchlist_task = None
+
         if (
             self._last_watchlist_check is not None
             and now - self._last_watchlist_check < self._watchlist_interval
@@ -337,11 +391,24 @@ class TelegramNotifier:
             return
         self._last_watchlist_check = now
         try:
-            alerts = await asyncio.wait_for(
-                self.watchlist_provider(), timeout=45
+            task = asyncio.ensure_future(self.watchlist_provider())
+        except Exception as _w:
+            logger.warning("Watchlist provider could not be scheduled: %s", _w)
+            return
+        self._watchlist_task = task
+        try:
+            # shield: a timeout must not cancel the underlying thread-backed
+            # scan (asyncio cannot cancel it anyway); it stays tracked above.
+            alerts = await asyncio.wait_for(asyncio.shield(task), timeout=45)
+        except TimeoutError:
+            logger.warning(
+                "Watchlist scan exceeded 45s — leaving it running (bounded by "
+                "statement_timeout) and skipping new scans until it finishes"
             )
+            return
         except Exception as _w:
             return
+        self._watchlist_task = None
         if not alerts:
             return
         try:
@@ -417,7 +484,17 @@ class TelegramNotifier:
             )
             logger.debug("Notification sent: %s", _trunc(message, 80))
             return True
-        except (Exception, asyncio.CancelledError) as e:
+        except asyncio.CancelledError:
+            # Telethon raises CancelledError when it drops an in-flight request
+            # (retryable, return False); an external task.cancel() must
+            # propagate or the caller's cancellation is silently swallowed.
+            if _cancellation_requested():
+                raise
+            logger.warning(
+                "Failed to send notification: request cancelled by the connection drop"
+            )
+            return False
+        except Exception as e:
             logger.warning("Failed to send notification: %s", e)
             return False
 
@@ -471,68 +548,95 @@ class TelegramNotifier:
         Watchlist alerts are checked here too (flush is also called from
         archive_parsed) — but the background flusher calls _check_watchlist
         directly every tick, so alerts never depend on digest content.
+
+        Serialized via ``_flush_lock``: archive_parsed() and the background
+        flusher call this concurrently, and unsynchronized flushing sent the
+        same digest twice while losing whichever counters the other caller
+        reset. Counters are snapshotted and zeroed BEFORE the network await so
+        archives arriving mid-send land in a fresh window; on failure the
+        snapshot is merged back into whatever accumulated meanwhile.
         """
-        await self._check_watchlist()
-        if not self._digest_archives:
-            return
-        new = self._digest_new
-        dups = self._digest_dups
-        total = new + dups
-        dedup_pct = ""
-        if total:
-            dedup_pct = f" ({100.0 * dups / total:.0f}% dedup)"
+        async with self._flush_lock:
+            await self._check_watchlist()
+            if not self._digest_archives:
+                return
 
-        lines = [
-            _header("📊", "Progress digest"),
-            "",
-            f"• <b>Archives parsed:</b> {_fmt_int(self._digest_archives)}",
-            f"• <b>New credentials:</b> {_fmt_int(new)}",
-            f"• <b>Duplicates:</b> {_fmt_int(dups)}{dedup_pct}",
-        ]
-        if self._digest_last_archive:
-            lines.append(
-                f"• <b>Last archive:</b> {_code(_trunc(self._digest_last_archive, 60))}"
-            )
+            archives = self._digest_archives
+            new = self._digest_new
+            dups = self._digest_dups
+            # Take the Counter object itself (not a copy) and install a fresh
+            # one: anything accumulated during the send goes to the new one.
+            domains = self._digest_domains
+            last_archive = self._digest_last_archive
+            since = self._digest_since
+            self._digest_archives = 0
+            self._digest_new = 0
+            self._digest_dups = 0
+            self._digest_domains = Counter()
+            self._digest_last_archive = None
+            self._digest_since = None
 
-        # Live status section: what the pipeline is doing right now. The
-        # provider is called with a short budget — a wedged drive or slow
-        # query must not stall the digest.
-        status_lines = await self._status_lines()
-        if status_lines:
-            lines.extend(status_lines)
+            total = new + dups
+            dedup_pct = ""
+            if total:
+                dedup_pct = f" ({100.0 * dups / total:.0f}% dedup)"
 
-        if self._digest_domains:
-            top = self._digest_domains.most_common(5)
-            lines.append("")
-            lines.append("<b>Top domains</b>")
-            for domain, count in top:
-                lines.append(f"• {_esc(_trunc(domain, 48))} — {_fmt_int(count)}")
+            lines = [
+                _header("📊", "Progress digest"),
+                "",
+                f"• <b>Archives parsed:</b> {_fmt_int(archives)}",
+                f"• <b>New credentials:</b> {_fmt_int(new)}",
+                f"• <b>Duplicates:</b> {_fmt_int(dups)}{dedup_pct}",
+            ]
+            if last_archive:
+                lines.append(
+                    f"• <b>Last archive:</b> {_code(_trunc(last_archive, 60))}"
+                )
 
-        sent = await self.send("\n".join(lines))
-        if not sent:
-            # Keep the accumulated digest: a failed send (transient blip,
-            # busy adapter) must not permanently lose the window's news —
-            # the next flusher tick retries it. Back off before archive_parsed
-            # may try again so a down Telegram link doesn't block the parse
-            # hot path on every archive.
-            self._digest_retry_after = (
-                asyncio.get_event_loop().time() + self._digest_retry_seconds
-            )
-            logger.info(
-                "Digest send failed — keeping %d archives of accumulated results for retry",
-                self._digest_archives,
-            )
-            return
-        self._digest_retry_after = None
-        self._digest_archives = 0
-        self._digest_new = 0
-        self._digest_dups = 0
-        self._digest_domains.clear()
-        self._digest_last_archive = None
-        self._digest_since = None
-        self._last_status_sent = asyncio.get_event_loop().time()
-        # Keep _reported_archives: a digest flush mid-run must not re-report
-        # archives already counted once this run.
+            # Live status section: what the pipeline is doing right now. The
+            # provider is called with a short budget — a wedged drive or slow
+            # query must not stall the digest.
+            status_lines = await self._status_lines()
+            if status_lines:
+                lines.extend(status_lines)
+
+            if domains:
+                top = domains.most_common(5)
+                lines.append("")
+                lines.append("<b>Top domains</b>")
+                for domain, count in top:
+                    lines.append(f"• {_esc(_trunc(domain, 48))} — {_fmt_int(count)}")
+
+            sent = await self.send("\n".join(lines))
+            if not sent:
+                # Restore the failed snapshot, merged with anything that
+                # accumulated while the send was in flight: a failed send
+                # (transient blip, busy adapter) must not permanently lose the
+                # window's news — the next flusher tick retries it. Back off
+                # before archive_parsed may try again so a down Telegram link
+                # doesn't block the parse hot path on every archive.
+                self._digest_archives += archives
+                self._digest_new += new
+                self._digest_dups += dups
+                self._digest_domains.update(domains)
+                if last_archive and self._digest_last_archive is None:
+                    self._digest_last_archive = last_archive
+                if since is not None and (
+                    self._digest_since is None or since < self._digest_since
+                ):
+                    self._digest_since = since
+                self._digest_retry_after = (
+                    asyncio.get_event_loop().time() + self._digest_retry_seconds
+                )
+                logger.info(
+                    "Digest send failed — keeping %d archives of accumulated results for retry",
+                    self._digest_archives,
+                )
+                return
+            self._digest_retry_after = None
+            self._last_status_sent = asyncio.get_event_loop().time()
+            # Keep _reported_archives: a digest flush mid-run must not
+            # re-report archives already counted once this run.
 
     # ------------------------------------------------------------------ stages
 

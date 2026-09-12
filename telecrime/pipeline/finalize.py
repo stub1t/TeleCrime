@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import selectinload
 
@@ -22,10 +22,31 @@ from telecrime.models import (
     Message,
     ParsedCredential,
 )
+from telecrime.pipeline.constants import EXTRACTION_MAX_ATTEMPTS
 from telecrime.pipeline.orchestrator import PipelineContext, PipelineStage
 from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _as_aware_utc(value: datetime) -> datetime:
+    """Normalise naive DB datetimes and aware Python datetimes for comparison."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _first_seen_insert(session):
+    """Dialect-specific INSERT constructor supporting ``on_conflict_do_update``.
+
+    Production is PostgreSQL; SQLite support keeps the in-memory test fixtures
+    (which exercise this path) working.
+    """
+    if session.get_bind().dialect.name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as _insert
+    else:
+        from sqlalchemy.dialects.postgresql import insert as _insert
+    return _insert(FirstSeenIndex)
 
 
 class FinalizeStage(PipelineStage):
@@ -199,10 +220,9 @@ class FinalizeStage(PipelineStage):
         # recoverable download; only clean groups whose jobs are all settled.
         # A PENDING job already AT the attempts cap is genuinely terminal —
         # skipping cleanup for it would flap the group forever.
-        _job_max_attempts = 3
         _pending = any(
             job.status == ExtractionStatus.PENDING
-            and (job.attempts_count or 0) < _job_max_attempts
+            and (job.attempts_count or 0) < EXTRACTION_MAX_ATTEMPTS
             for job in group.extraction_jobs
         )
         if _pending:
@@ -284,6 +304,7 @@ class FinalizeStage(PipelineStage):
             )
         }
 
+        candidates: list[tuple[Path, str]] = []
         for entry in downloads_dir.iterdir():
             if entry.is_dir() or entry.suffix.lower() in (".tmp", ".part"):
                 continue
@@ -295,16 +316,27 @@ class FinalizeStage(PipelineStage):
                     continue  # Recently written — possibly an in-flight prefetch
             except OSError:
                 continue
+            candidates.append((entry, entry_str))
 
-            artifact_rows = ctx.session.execute(
+        # One batched IN query per chunk instead of one unindexed local_path
+        # seq scan per file (the directory can hold thousands of leftovers).
+        artifacts_by_path: dict[str, list[tuple[DownloadArtifact, GroupStatus | None]]] = {}
+        for i in range(0, len(candidates), self._BATCH_SIZE):
+            chunk = [path for _, path in candidates[i : i + self._BATCH_SIZE]]
+            rows = ctx.session.execute(
                 select(DownloadArtifact, ArchiveGroup.status)
                 .outerjoin(ArchiveGroupPart, ArchiveGroupPart.artifact_id == DownloadArtifact.id)
                 .outerjoin(ArchiveGroup, ArchiveGroup.id == ArchiveGroupPart.group_id)
                 .where(
-                    DownloadArtifact.local_path == entry_str,
+                    DownloadArtifact.local_path.in_(chunk),
                     DownloadArtifact.is_deleted.is_(False),
                 )
             ).all()
+            for artifact, status in rows:
+                artifacts_by_path.setdefault(artifact.local_path, []).append((artifact, status))
+
+        for entry, entry_str in candidates:
+            artifact_rows = artifacts_by_path.get(entry_str, [])
             if artifact_rows:
                 # Legitimately present if any non-CLEANED grouped artifact or an
                 # ungrouped artifact still claims it.  CLEANED groups no longer
@@ -359,6 +391,32 @@ class FinalizeStage(PipelineStage):
 
     _BATCH_SIZE = 500
 
+    def _upsert_first_seen(
+        self,
+        session,
+        *,
+        output: ExtractedOutput,
+        msg: Message | None,
+        first_seen_ts: datetime,
+    ) -> None:
+        """Insert a first_seen row, atomically bumping duplicate_count when a
+        concurrent finalize run already inserted the same content_hash."""
+        insert_stmt = _first_seen_insert(session).values(
+            content_hash=output.output_hash,
+            content_type="extracted",
+            first_seen_timestamp=first_seen_ts,
+            first_seen_conversation_id=output.source_conversation_id,
+            first_seen_message_id=output.source_message_id,
+            first_seen_message_platform_id=msg.platform_id if msg else None,
+            duplicate_count=0,
+        )
+        session.execute(
+            insert_stmt.on_conflict_do_update(
+                index_elements=[FirstSeenIndex.content_hash],
+                set_={"duplicate_count": FirstSeenIndex.duplicate_count + 1},
+            )
+        )
+
     async def _record_first_seen(self, ctx: PipelineContext, group: ArchiveGroup) -> None:
         """Record first-seen timestamps for extracted outputs.
 
@@ -396,34 +454,62 @@ class FinalizeStage(PipelineStage):
         now = datetime.now(UTC)
         new_count = 0
         dup_count = 0
+        seen_this_run: set[str] = set()
+        # Earliest first_seen we have recorded this run, per hash (the prefetched
+        # ORM rows are left untouched so stale in-memory state is never flushed).
+        known_ts: dict[str, datetime] = {
+            content_hash: row.first_seen_timestamp
+            for content_hash, row in existing_map.items()
+        }
         for output in outputs:
             existing = existing_map.get(output.output_hash)
             if existing is None:
                 msg = msg_map.get(output.source_message_id) if output.source_message_id else None
                 first_seen_ts = msg.platform_timestamp if msg else now
-                first_seen = FirstSeenIndex(
-                    content_hash=output.output_hash,
-                    content_type="extracted",
-                    first_seen_timestamp=first_seen_ts,
-                    first_seen_conversation_id=output.source_conversation_id,
-                    first_seen_message_id=output.source_message_id,
-                    first_seen_message_platform_id=msg.platform_id if msg else None,
-                    duplicate_count=0,
+                # Atomic upsert: two finalize runs that both missed the row
+                # cannot abort each other with an IntegrityError, and repeated
+                # hashes within this run increment instead of double-inserting.
+                self._upsert_first_seen(
+                    ctx.session,
+                    output=output,
+                    msg=msg,
+                    first_seen_ts=first_seen_ts,
                 )
-                ctx.session.add(first_seen)
-                # Add to map so duplicate outputs within the same group are
-                # handled correctly (won't try to insert twice).
-                existing_map[output.output_hash] = first_seen
-                new_count += 1
+                if output.output_hash in seen_this_run:
+                    dup_count += 1
+                else:
+                    seen_this_run.add(output.output_hash)
+                    new_count += 1
             else:
-                # Check if this archive saw it earlier than recorded
+                # Atomic increment: the old read-modify-write on the ORM object
+                # lost concurrent updates.
+                ctx.session.execute(
+                    update(FirstSeenIndex)
+                    .where(FirstSeenIndex.id == existing.id)
+                    .values(duplicate_count=FirstSeenIndex.duplicate_count + 1),
+                    execution_options={"synchronize_session": False},
+                )
+                # Check if this archive saw it earlier than recorded. The
+                # timestamp predicate is re-checked in SQL so a stale snapshot
+                # cannot overwrite an even earlier concurrent first_seen.
                 msg = msg_map.get(output.source_message_id) if output.source_message_id else None
-                if msg and msg.platform_timestamp < existing.first_seen_timestamp:
-                    existing.first_seen_timestamp = msg.platform_timestamp
-                    existing.first_seen_conversation_id = output.source_conversation_id
-                    existing.first_seen_message_id = output.source_message_id
-                    existing.first_seen_message_platform_id = msg.platform_id
-                existing.duplicate_count += 1
+                known = known_ts.get(output.output_hash)
+                if msg and (known is None or _as_aware_utc(msg.platform_timestamp) < _as_aware_utc(known)):
+                    ctx.session.execute(
+                        update(FirstSeenIndex)
+                        .where(
+                            FirstSeenIndex.id == existing.id,
+                            FirstSeenIndex.first_seen_timestamp > msg.platform_timestamp,
+                        )
+                        .values(
+                            first_seen_timestamp=msg.platform_timestamp,
+                            first_seen_conversation_id=output.source_conversation_id,
+                            first_seen_message_id=output.source_message_id,
+                            first_seen_message_platform_id=msg.platform_id,
+                        ),
+                        execution_options={"synchronize_session": False},
+                    )
+                    known_ts[output.output_hash] = msg.platform_timestamp
                 dup_count += 1
 
         logger.debug(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +19,7 @@ from telecrime.scheduler import (
     _mark_stale_pipeline_runs_failed,
     _pipeline_pid_path,
     _progress_age_seconds,
+    _read_pipeline_pid,
     _run_pipeline_health_job,
     _run_pipeline_job,
     _send_telegram_notification,
@@ -26,6 +27,9 @@ from telecrime.scheduler import (
     _shutdown_state,
     _status_path,
     _update_job,
+    _watchlist_count_matches,
+    _watchlist_scan_lock,
+    _write_pipeline_pid,
     _write_status,
     clear_shutdown_request,
     read_shutdown_request,
@@ -818,3 +822,208 @@ def test_send_telegram_notification_returns_ok_on_success():
 
     assert result == "ok"
     assert len(called) == 1
+
+
+def test_run_channel_join_job_releases_session_during_network(in_memory_engine, monkeypatch):
+    """Regression: the check/join Telegram calls must run with no DB session
+    (and therefore no transaction) open. The old code held one session across
+    up to 20 get_entity calls with 1s sleeps, so a half-open socket pinned the
+    connection/transaction for hours."""
+    import contextlib
+    from types import SimpleNamespace
+
+    from telecrime import scheduler as scheduler_mod
+    from telecrime.database import get_session as real_get_session
+    from telecrime.models import TelegramChannel
+
+    engine = in_memory_engine
+
+    # Discovery step is irrelevant: stub it to a no-op.
+    monkeypatch.setattr(
+        "telecrime.channels.discover.discover_channels_from_db",
+        lambda session: SimpleNamespace(
+            channels={}, last_message_id=0, last_credential_id=0
+        ),
+    )
+    monkeypatch.setattr(
+        "telecrime.channels.discover.save_discovered_channels",
+        lambda session, channels: (0, 0),
+    )
+    monkeypatch.setattr(
+        "telecrime.channels.discover.persist_discovery_state",
+        lambda session, scan_result: None,
+    )
+    monkeypatch.setattr(
+        "telecrime.channels.discover.update_channel_stats", lambda session: None
+    )
+    monkeypatch.setattr(scheduler_mod, "read_progress", lambda: {})
+
+    with real_get_session(engine) as session:
+        # A channel to verify (Last checked in the past, subscribed so it is
+        # not also a join candidate).
+        session.add(
+            TelegramChannel(
+                platform_id=222,
+                username="stealer_logs_old",
+                title="stealer logs old",
+                source="test",
+                is_subscribed=True,
+                is_active=True,
+                is_accessible=True,
+                last_checked=datetime.now(UTC) - timedelta(days=1),
+            )
+        )
+        # A join candidate.
+        session.add(
+            TelegramChannel(
+                platform_id=111,
+                username="stealer_logs_chan",
+                title="stealer logs",
+                source="test",
+                is_subscribed=False,
+                is_active=True,
+                is_accessible=True,
+            )
+        )
+
+    open_sessions = {"n": 0}
+    violations: list[str] = []
+
+    @contextlib.contextmanager
+    def tracked_get_session(engine_arg):
+        open_sessions["n"] += 1
+        try:
+            with real_get_session(engine_arg) as session:
+                yield session
+        finally:
+            open_sessions["n"] -= 1
+
+    monkeypatch.setattr("telecrime.database.get_session", tracked_get_session)
+
+    class _FakeAdapter:
+        def __init__(self, config):
+            self.calls = []
+
+        async def connect(self):
+            self.calls.append("connect")
+
+        async def get_entity(self, target):
+            if open_sessions["n"]:
+                violations.append(
+                    f"get_entity({target}) with {open_sessions['n']} session(s) open"
+                )
+            self.calls.append(("get_entity", target))
+            return SimpleNamespace(title="Checked Title", participants_count=7)
+
+        async def join_conversation(self, conversation_id, username=None):
+            if open_sessions["n"]:
+                violations.append(
+                    f"join({username}) with {open_sessions['n']} session(s) open"
+                )
+            self.calls.append(("join", conversation_id, username))
+            return True
+
+        async def disconnect(self):
+            self.calls.append("disconnect")
+
+    monkeypatch.setattr("telecrime.adapters.telegram.TelegramAdapter", _FakeAdapter)
+
+    config = MagicMock()
+    config.with_aux_telegram_session.return_value = config
+
+    result = scheduler_mod._run_channel_join_job(config, engine)
+
+    assert violations == []
+    assert "joined 1" in result
+    assert "failed 0" in result
+
+    with real_get_session(engine) as session:
+        checked = session.query(TelegramChannel).filter_by(platform_id=222).one()
+        assert checked.title == "Checked Title"
+        assert checked.check_error is None
+        joined = session.query(TelegramChannel).filter_by(platform_id=111).one()
+        assert joined.is_subscribed is True
+
+
+# ---------------------------------------------------------------------------
+# PID file atomicity + watchlist scan guard
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_pid_write_is_atomic_and_clear_is_guarded(tmp_path, monkeypatch):
+    pid_file = tmp_path / "pipeline.pid"
+    monkeypatch.setenv("TELECRIME_PIPELINE_PID_FILE", str(pid_file))
+
+    _write_pipeline_pid(1234)
+
+    assert _read_pipeline_pid() == 1234
+    # Temp file must be gone — readers only ever see the complete value.
+    assert list(tmp_path.glob("*.tmp")) == []
+
+    # A finishing job that observed a different PID must not clear the file.
+    _clear_pipeline_pid(9999)
+    assert pid_file.exists()
+    assert _read_pipeline_pid() == 1234
+
+    _clear_pipeline_pid(1234)
+    assert not pid_file.exists()
+
+
+def test_collect_watchlist_alerts_skips_while_scan_running(in_memory_engine):
+    """A scan that outlives notify's wait_for must not be overlapped."""
+    assert _watchlist_scan_lock.acquire(blocking=False)
+    try:
+        assert _collect_watchlist_alerts(in_memory_engine) == []
+    finally:
+        _watchlist_scan_lock.release()
+
+
+def test_watchlist_count_matches_all_dedups_union(in_memory_engine):
+    """Per-column UNION counts each credential once, even when it matches
+    both the domain and the username."""
+    from telecrime.database import get_session
+    from telecrime.models.credential import ParsedCredential
+    from telecrime.models.watchlist import WatchlistItem
+
+    engine = in_memory_engine
+    with get_session(engine) as session:
+        session.add_all(
+            [
+                ParsedCredential(
+                    url="https://needle.example/login",
+                    domain="needle.example",
+                    username="needle.example",
+                    password="x",
+                    credential_hash="union-1",
+                ),
+                ParsedCredential(
+                    url="https://needle2.example/login",
+                    domain="needle2.example",
+                    username="someone",
+                    password="x",
+                    credential_hash="union-2",
+                ),
+                ParsedCredential(
+                    url="https://other.example/login",
+                    domain="other.example",
+                    username="someone",
+                    password="x",
+                    credential_hash="union-3",
+                ),
+            ]
+        )
+        session.commit()
+
+    item = WatchlistItem(label="t", query="needle", match_type="all", enabled=True)
+    with get_session(engine) as session:
+        assert _watchlist_count_matches(session, item) == 2
+
+
+def test_unattended_watchdog_script_is_valid_bash():
+    import subprocess
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "unattended-watchdog.sh"
+    result = subprocess.run(
+        ["bash", "-n", str(script)], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr

@@ -25,6 +25,8 @@ from telecrime.models.system_info import SystemInfoRecord
 from telecrime.pipeline.orchestrator import PipelineContext, PipelineStage
 from telecrime.states import ExtractionStatus, GroupStatus
 from telecrime.stealer.parser import (
+    _COMBO_CLASSIFY_LINES,
+    _classify_combo_head,
     _open_credential_file,
     iter_credentials_file,
     parse_credential_lines,
@@ -75,7 +77,22 @@ def _iter_line_chunks(
         yield buf
 
 
-def _parse_lines_chunk_worker(args: tuple[list[str], str]) -> list:
+def _read_combo_probe(fh) -> tuple[list[str], bool]:
+    """Read the true file head (at most _COMBO_CLASSIFY_LINES lines) and
+    classify it.
+
+    Classification must happen once per file, from the real head, in the
+    submitting process: chunks of the same file are parsed by independent
+    workers, and a later combo-dominant chunk would otherwise classify itself
+    as a pure combo file and silently drop the labeled credentials it also
+    contains. The consumed lines are returned so the caller can re-chain them
+    into the chunk reader.
+    """
+    head = list(itertools.islice(fh, _COMBO_CLASSIFY_LINES))
+    return head, _classify_combo_head(head)
+
+
+def _parse_lines_chunk_worker(args: tuple[list[str], str, bool | None]) -> list:
     """Worker entry point: parse a chunk of lines into pre-processed tuples.
 
     Kept at module level so the ProcessPoolExecutor can pickle it. The worker
@@ -86,9 +103,11 @@ def _parse_lines_chunk_worker(args: tuple[list[str], str]) -> list:
      credential_hash, soft_credential_hash). soft_credential_hash input is
     the domain-or-url (untruncated) exactly like the sequential path.
     """
-    lines, source_file = args
+    lines, source_file, combo_decision = args
     out = []
-    for c in parse_credential_lines(iter(lines), source_file):
+    for c in parse_credential_lines(
+        iter(lines), source_file, combo_decision=combo_decision
+    ):
         url = c.url or ""
         if "\x00" in url:
             url = url.replace("\x00", "")
@@ -220,6 +239,20 @@ def _is_dup_batch(new_count: int, dup_count: int, batch_size: int) -> bool:
     return total >= batch_size // 2 and (dup_count / total) >= 0.95
 
 
+# PostgreSQL rejects statements binding more than 65,535 parameters, so an
+# unbatched `column.in_(...)` over a large job's outputs raises
+# OperationalError and aborts the file mid-parse.
+_IN_QUERY_BATCH_SIZE = 1000
+
+
+def _iter_in_batches(
+    values: list[str], batch_size: int = _IN_QUERY_BATCH_SIZE
+) -> Iterator[list[str]]:
+    """Split ``values`` into bind-parameter-safe IN-list batches."""
+    for i in range(0, len(values), batch_size):
+        yield values[i : i + batch_size]
+
+
 def _hash64_expr(alias: str) -> str:
     """SQL expression for the compact 64-bit credential-hash fingerprint.
 
@@ -332,6 +365,14 @@ class ParseStage(PipelineStage):
         if fh is None:
             return
 
+        # Classify ONCE in this (submitting) process from the file's true head
+        # and pass the decision to every chunk worker. Letting each worker
+        # classify its own chunk's head would route a combo-dominant later
+        # chunk of a mixed file through the combo fast path, silently dropping
+        # its labeled credentials, and workers could disagree about the file.
+        head, combo_decision = _read_combo_probe(fh)
+        chunk_source = itertools.chain(head, fh)
+
         loop = asyncio.get_event_loop()
 
         # Chunks are read in a background thread (pure file I/O, no pool
@@ -354,7 +395,7 @@ class ParseStage(PipelineStage):
 
         def _read_chunks() -> None:
             try:
-                for chunk in _iter_line_chunks(fh):
+                for chunk in _iter_line_chunks(chunk_source):
                     while not stop_event.is_set():
                         try:
                             chunks_q.put(chunk, timeout=0.5)
@@ -415,7 +456,10 @@ class ParseStage(PipelineStage):
                             submitting = False
                             break
                         in_flight.append(
-                            pool.submit(_parse_lines_chunk_worker, (chunk, source_file))
+                            pool.submit(
+                                _parse_lines_chunk_worker,
+                                (chunk, source_file, combo_decision),
+                            )
                         )
                     if not in_flight and not submitting:
                         break
@@ -733,20 +777,24 @@ class ParseStage(PipelineStage):
         )
 
         # Bulk-load already parsed source_file values for this job once.
-        # This avoids an extra existence query per credential file.
+        # This avoids an extra existence query per credential file. Batched:
+        # a job with tens of thousands of outputs would otherwise exceed
+        # PostgreSQL's 65,535 bind-parameter limit.
         source_paths = [str(Path(o.output_path)) for o in credential_outputs if o.output_path]
-        parsed_source_files = set(
-            ctx.session.execute(
-                select(ParsedCredential.source_file)
-                .where(
-                    ParsedCredential.extraction_job_id == job.id,
-                    ParsedCredential.source_file.in_(source_paths),
+        parsed_source_files: set[str] = set()
+        for batch_paths in _iter_in_batches(source_paths):
+            parsed_source_files.update(
+                ctx.session.execute(
+                    select(ParsedCredential.source_file)
+                    .where(
+                        ParsedCredential.extraction_job_id == job.id,
+                        ParsedCredential.source_file.in_(batch_paths),
+                    )
+                    .distinct()
                 )
-                .distinct()
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
 
         # Pre-skip files we've already seen multiple times.  When a credential
         # file's content has been observed ≥3× via first_seen_index, every row
@@ -765,11 +813,11 @@ class ParseStage(PipelineStage):
         all_output_hashes = [o.output_hash for o in credential_outputs if o.output_hash]
         from telecrime.models import FirstSeenIndex
         preskip_hashes: set[str] = set()
-        if all_output_hashes:
-            preskip_hashes = set(
+        for hash_batch in _iter_in_batches(all_output_hashes):
+            preskip_hashes.update(
                 ctx.session.execute(
                     select(FirstSeenIndex.content_hash).where(
-                        FirstSeenIndex.content_hash.in_(all_output_hashes),
+                        FirstSeenIndex.content_hash.in_(hash_batch),
                         FirstSeenIndex.duplicate_count >= _preskip_dup_threshold,
                     )
                 ).scalars().all()
