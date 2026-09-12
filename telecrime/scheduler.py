@@ -1889,7 +1889,9 @@ class TelecrimeWorker:
                     result = self._run_pipeline_watchdog_job()
                 elif name == "pipeline_health":
                     result = _run_pipeline_health_job(
-                        self.config, self.engine, on_recovered=self.run_now
+                        self.config,
+                        self.engine,
+                        on_recovered=lambda: self.run_now("pipeline"),
                     )
                 elif name == "vacuum":
                     result = _run_vacuum_job(self.engine)
