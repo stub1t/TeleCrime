@@ -208,7 +208,7 @@ class Pipeline:
                         if notifier:
                             await notifier.stage_complete(stage.name)
 
-                    except (Exception, asyncio.CancelledError) as e:
+                    except Exception as e:
                         logger.error("Stage %s failed with exception: %s", stage.name, e)
                         ctx.errors.append(f"{stage.name}: {str(e)}")
                         _record_stage_failure(stages_failed, stage.name)
@@ -480,7 +480,7 @@ async def _process_ready_groups_batch(
                     notifier=ctx.notifier,
                     display=ctx.display,
                 )
-            except (Exception, asyncio.CancelledError) as e:
+            except Exception as e:
                 logger.error("Error processing READY group %s: %s", group_id, e)
                 # Mark the group transiently FAILED so the main loop does not
                 # retry it forever in the same run (which would starve downloads).
@@ -1147,7 +1147,7 @@ async def run_sequential_pipeline(
                     if notifier:
                         await notifier.stage_complete(stage.name)
                     session.commit()
-                except (Exception, asyncio.CancelledError) as e:
+                except Exception as e:
                     logger.error("Stage %s failed with exception: %s", stage.name, e)
                     ctx.errors.append(f"{stage.name}: {str(e)}")
                     _record_stage_failure(stages_failed, stage.name)
@@ -1269,7 +1269,7 @@ async def run_sequential_pipeline(
                     if display:
                         display.set_archive_total(min(new_total, archives_to_process))
                     logger.info("Periodic %s re-ingest done; %d downloads pending", label, new_total)
-                except (Exception, asyncio.CancelledError) as _e:
+                except Exception as _e:
                     logger.warning("Periodic %s re-ingest failed, continuing: %s", label, _e)
                     ctx.errors.append(f"Re-ingest ({label}): {type(_e).__name__}: {_e}")
                     try:
@@ -1447,7 +1447,7 @@ async def run_sequential_pipeline(
                                 ctx, {_gid} if _gid else None
                             )
                             session.commit()
-                        except (Exception, asyncio.CancelledError) as e:
+                        except Exception as e:
                             # A dead/terminated PostgreSQL backend (e.g.
                             # idle_in_transaction_session_timeout) raises
                             # PendingRollbackError here; it must not crash the
@@ -1656,7 +1656,18 @@ async def run_sequential_pipeline(
                     # memory growth over thousands of archives in a long pipeline run.
                     session.expire_all()
 
-                except (Exception, asyncio.CancelledError) as e:
+                except asyncio.CancelledError:
+                    # Cooperative shutdown: dispose of this run's prefetch
+                    # tasks so a cancelled download cannot keep writing a
+                    # .partial after the next run resets the artifact, then
+                    # propagate (the outer finally still closes the run row).
+                    for _task, _ in _prefetch_queue:
+                        if not _task.done():
+                            _task.cancel()
+                    _in_flight_ids.clear()
+                    _prefetch_queue.clear()
+                    raise
+                except Exception as e:
                     logger.error("Error processing %s: %s", filename, e)
                     ctx.errors.append(f"{filename}: {str(e)}")
                     current_stage = "acquire"

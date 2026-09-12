@@ -1106,7 +1106,13 @@ def _run_vacuum_job(engine) -> str:
     return f"VACUUM completed, pruned {pruned:,} stale extracted_output rows"
 
 
-def _reparse_stealers_impl(engine, limit: int | None = None, dry_run: bool = False) -> str:
+def _reparse_stealers_impl(
+    engine,
+    limit: int | None = None,
+    dry_run: bool = False,
+    *,
+    return_counts: bool = False,
+) -> str | tuple[int, int, int]:
     """Backfill stealer_type on ParsedCredential rows where it is NULL.
 
     For each ExtractionJob that has NULL-stealer_type credentials:
@@ -1119,9 +1125,12 @@ def _reparse_stealers_impl(engine, limit: int | None = None, dry_run: bool = Fal
         engine: SQLAlchemy engine.
         limit: Max number of ExtractionJobs to process (None = all).
         dry_run: If True, count affected rows without writing.
+        return_counts: When True, return ``(updated, selected, processed)``
+            instead of the summary string so callers can drain in bounded
+            batches.
 
     Returns:
-        Summary string.
+        Summary string (or the counts tuple when ``return_counts`` is set).
     """
     import sqlalchemy as _sa
     from sqlalchemy.orm import selectinload
@@ -1148,6 +1157,7 @@ def _reparse_stealers_impl(engine, limit: int | None = None, dry_run: bool = Fal
         if limit is not None:
             q = q.limit(limit)
         job_ids = list(session.execute(q).scalars())
+        jobs_selected = len(job_ids)
 
         if dry_run:
             count = session.execute(
@@ -1155,6 +1165,8 @@ def _reparse_stealers_impl(engine, limit: int | None = None, dry_run: bool = Fal
                     ParsedCredential.stealer_type.is_(None)
                 )
             ).scalar() or 0
+            if return_counts:
+                return 0, jobs_selected, 0
             return f"dry-run: {count:,} credentials with NULL stealer_type across {len(job_ids)} jobs"
 
         # Batch-fetch jobs (with outputs) and SystemInfoRecords to avoid N+1 queries
@@ -1223,12 +1235,45 @@ def _reparse_stealers_impl(engine, limit: int | None = None, dry_run: bool = Fal
 
         session.commit()
 
+    if return_counts:
+        return updated_total, jobs_selected, jobs_processed
     return f"backfilled stealer_type on {updated_total:,} credentials across {jobs_processed} jobs"
 
 
+# Jobs selected per reparse batch. The scheduler used to call the impl with no
+# limit, forcing one unbounded SELECT DISTINCT extraction_job_id over the
+# 319M-row parsed_credentials table per run.
+_REPARSE_STEALERS_BATCH_LIMIT = 500
+
+
 def _run_reparse_stealers_job(config, engine) -> str:
-    """Scheduler entry point for reparse_stealers job."""
-    return _reparse_stealers_impl(engine)
+    """Scheduler entry point for reparse_stealers job.
+
+    Drains the NULL stealer_type backlog in bounded batches, committing between
+    them. Stops when a batch selects fewer jobs than the limit (the backlog is
+    exhausted) or makes no progress (the remaining jobs have no detectable
+    stealer type), so a batch of permanently-undetectable jobs can't loop
+    forever.
+    """
+    total_updated = 0
+    total_jobs = 0
+    while True:
+        updated, selected, processed = cast(
+            tuple[int, int, int],
+            _reparse_stealers_impl(
+                engine,
+                limit=_REPARSE_STEALERS_BATCH_LIMIT,
+                return_counts=True,
+            ),
+        )
+        total_updated += updated
+        total_jobs += processed
+        if selected < _REPARSE_STEALERS_BATCH_LIMIT or updated == 0:
+            break
+    return (
+        f"backfilled stealer_type on {total_updated:,} credentials "
+        f"across {total_jobs} jobs"
+    )
 
 
 def _run_channel_export_job(config, engine) -> str:

@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -278,9 +278,9 @@ def discover_channels_from_db(
         if key.startswith("id:") and channel.username
     }
     mention_count = 0
-    for message_id, text, caption in messages:
+    for message_id, message_text, caption in messages:
         del message_id
-        for content in [text, caption]:
+        for content in [message_text, caption]:
             if content:
                 for username in extract_mentions_from_text(content):
                     key = f"@{username}"
@@ -466,6 +466,14 @@ def persist_discovery_state(session: Session, scan_result: DiscoveryScanResult) 
 
 
 _CHANNEL_STATS_LAST_RUN = "channel_stats.last_run"
+# Transaction-scoped advisory lock key (ASCII "TELC") serializing the scheduler
+# job and CLI runs: without it both can read the same watermark, apply the same
+# credential deltas (double-count) and overwrite each other's advanced value.
+_CHANNEL_STATS_ADVISORY_LOCK = 0x54454C43
+# Explicit bound for the first-run full aggregate over the 319M-row
+# parsed_credentials table. The server default (5 min, or 0 on some
+# deployments) must not let a runaway full scan pin a scheduler connection.
+# (SET LOCAL statement_timeout = '900s' below.)
 
 
 def update_channel_stats(session: Session) -> None:
@@ -474,8 +482,22 @@ def update_channel_stats(session: Session) -> None:
     Incremental: after the first (full) run, only rows created since the
     previous run are aggregated via the created_at indexes. The old version
     re-scanned the whole 319M-row parsed_credentials table every hour.
+
+    On PostgreSQL a transaction-scoped advisory lock serializes concurrent
+    callers (scheduler + CLI) so the watermark is read/advanced once.
     """
     from telecrime.models import TelegramChannel
+
+    is_pg = session.get_bind().dialect.name == "postgresql"
+    if is_pg:
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"),
+            {"key": _CHANNEL_STATS_ADVISORY_LOCK},
+        )
+        # SET LOCAL reverts automatically at the function's commit/rollback.
+        session.execute(
+            text("SET LOCAL statement_timeout = '900s'")
+        )
 
     last_run = _get_state_ts(session, _CHANNEL_STATS_LAST_RUN)
     channels = session.execute(

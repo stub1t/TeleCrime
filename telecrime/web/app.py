@@ -1294,6 +1294,20 @@ def _watchlist_worker(engine_url: str, interval: int) -> None:
         time.sleep(interval)
 
 
+# Bound for web-process watchlist ILIKE COUNT scans. parsed_credentials has no
+# trigram indexes yet, so a single `%query%` scan can touch 121 GB; PostgreSQL
+# must cancel it server-side instead of holding a pooled connection for
+# minutes. On timeout the previous count is kept (see _check_watchlist).
+_WATCHLIST_WEB_STATEMENT_TIMEOUT = "20s"
+
+# Single-flight guard for web watchlist scans. The background sweep and the
+# synchronous initial count on add would otherwise overlap and stack
+# sequential scans over parsed_credentials (the nav badge polls make the
+# overlap window wider). When the lock is held the add path stores the
+# unknown sentinel (-1) and the next sweep seeds the baseline.
+_watchlist_web_scan_lock = threading.Lock()
+
+
 def _check_watchlist(engine, *, incremental_only: bool = False) -> None:
     """Check all enabled watchlist items and update new_count.
 
@@ -1307,72 +1321,98 @@ def _check_watchlist(engine, *, incremental_only: bool = False) -> None:
     cancelled_count = 0
     failed_count = 0
 
-    with get_session(engine) as session:
-        items = session.query(WatchlistItem).filter(WatchlistItem.enabled == True).all()
-        if not items:
-            return
-        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-            # Bound (not disable) the per-item timeout: a pathological item
-            # (e.g. match_type "any" with a single-char query) would otherwise
-            # hold a backend indefinitely with no external watchdog to cancel.
-            try:
-                conn.execute(text("SET statement_timeout = '300s'"))
-            except Exception:
-                pass
-            for item in items:
-                try:
-                    if incremental_only:
-                        if item.last_checked_at is None:
-                            continue
-                        if item.last_known_count is None or item.last_known_count < 0:
-                            # Unseeded baseline (initial count timed out): seed
-                            # with a full count WITHOUT alerting on history.
-                            count = _watchlist_count(conn, item.query, item.match_type)
-                            item.last_known_count = count
-                            item.new_count = 0
-                        else:
-                            delta = _watchlist_count(
-                                conn, item.query, item.match_type, since=item.last_checked_at,
-                            )
-                            item.new_count = int(item.new_count or 0) + delta
-                            item.last_known_count = int(item.last_known_count or 0) + delta
-                    else:
-                        count = _watchlist_count(conn, item.query, item.match_type)
-                        if item.last_known_count is None or item.last_known_count < 0:
-                            # Sentinel from a timed-out initial count: seed the
-                            # baseline WITHOUT alerting on every historical
-                            # match.
-                            item.last_known_count = count
-                            item.new_count = 0
-                        else:
-                            item.new_count = max(0, count - item.last_known_count)
-                            item.last_known_count = count
-                    item.last_checked_at = now
-                except Exception as e:
-                    msg = str(e)
-                    # Watchdog cancels these queries during heavy parse to
-                    # protect bulk INSERT throughput — it's expected, not an
-                    # error. Demote to DEBUG and tally for a single summary.
-                    if "QueryCanceled" in type(e).__name__ or "canceling statement" in msg:
-                        cancelled_count += 1
-                        logger.debug(
-                            "Watchlist item %r cancelled (watchdog/timeout): %s",
-                            item.query, msg,
-                        )
-                    else:
-                        failed_count += 1
-                        logger.warning(
-                            "Watchlist item check failed for %r: %s", item.query, e
-                        )
-        session.commit()
+    if not _watchlist_web_scan_lock.acquire(blocking=False):
+        logger.info("Watchlist scan already in progress — skipping overlapping sweep")
+        return
 
-    if cancelled_count:
-        logger.info(
-            "Watchlist sweep: %d/%d items cancelled by watchdog/timeout (expected during heavy parse)",
-            cancelled_count, len(items),
-        )
-    if failed_count:
-        logger.warning("Watchlist sweep: %d/%d items failed", failed_count, len(items))
+    try:
+        with get_session(engine) as session:
+            items = session.query(WatchlistItem).filter(WatchlistItem.enabled == True).all()
+            if not items:
+                return
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                # Bound (not disable) the per-item timeout: a pathological item
+                # (e.g. match_type "any" with a single-char query) would otherwise
+                # hold a backend indefinitely with no external watchdog to cancel.
+                try:
+                    conn.execute(
+                        text(
+                            "SET statement_timeout = "
+                            f"'{_WATCHLIST_WEB_STATEMENT_TIMEOUT}'"
+                        )
+                    )
+                except Exception:
+                    pass
+                try:
+                    for item in items:
+                        try:
+                            if incremental_only:
+                                if item.last_checked_at is None:
+                                    continue
+                                if item.last_known_count is None or item.last_known_count < 0:
+                                    # Unseeded baseline (initial count timed out): seed
+                                    # with a full count WITHOUT alerting on history.
+                                    count = _watchlist_count(conn, item.query, item.match_type)
+                                    item.last_known_count = count
+                                    item.new_count = 0
+                                else:
+                                    delta = _watchlist_count(
+                                        conn, item.query, item.match_type,
+                                        since=item.last_checked_at,
+                                    )
+                                    item.new_count = int(item.new_count or 0) + delta
+                                    item.last_known_count = (
+                                        int(item.last_known_count or 0) + delta
+                                    )
+                            else:
+                                count = _watchlist_count(conn, item.query, item.match_type)
+                                if item.last_known_count is None or item.last_known_count < 0:
+                                    # Sentinel from a timed-out initial count: seed the
+                                    # baseline WITHOUT alerting on every historical
+                                    # match.
+                                    item.last_known_count = count
+                                    item.new_count = 0
+                                else:
+                                    item.new_count = max(0, count - item.last_known_count)
+                                    item.last_known_count = count
+                            item.last_checked_at = now
+                        except Exception as e:
+                            msg = str(e)
+                            # Watchdog/timeout cancels these queries during heavy
+                            # parse to protect bulk INSERT throughput — it's
+                            # expected, not an error. The item keeps its previous
+                            # count so a timeout never resets the baseline to 0.
+                            # Demote to DEBUG and tally for a single summary.
+                            if "QueryCanceled" in type(e).__name__ or "canceling statement" in msg:
+                                cancelled_count += 1
+                                logger.debug(
+                                    "Watchlist item %r cancelled (watchdog/timeout): %s",
+                                    item.query, msg,
+                                )
+                            else:
+                                failed_count += 1
+                                logger.warning(
+                                    "Watchlist item check failed for %r: %s", item.query, e
+                                )
+                finally:
+                    # The timeout was set session-wide on a pooled connection;
+                    # restore the server default so other web requests are not
+                    # silently capped at 20s after this sweep.
+                    try:
+                        conn.execute(text("SET statement_timeout = DEFAULT"))
+                    except Exception:
+                        pass
+            session.commit()
+
+        if cancelled_count:
+            logger.info(
+                "Watchlist sweep: %d/%d items cancelled by watchdog/timeout (expected during heavy parse)",
+                cancelled_count, len(items),
+            )
+        if failed_count:
+            logger.warning("Watchlist sweep: %d/%d items failed", failed_count, len(items))
+    finally:
+        _watchlist_web_scan_lock.release()
 
 
 def _watchlist_count(
@@ -2281,8 +2321,9 @@ def _claim_cred_counts_refresh(cache: dict, ttl: float) -> bool:
 
     Returns True exactly once per TTL window, marking the refresh in-flight
     and stamping the cache fresh so concurrent HTMX polls can't spawn
-    duplicate COUNT/JOIN threads (a refresh may run for up to 120s). The
-    caller must clear ``cache["refreshing"]`` when the refresh finishes.
+    duplicate COUNT/JOIN threads (the query itself is bounded by
+    ``_CRED_COUNTS_STATEMENT_TIMEOUT``). The caller must clear
+    ``cache["refreshing"]`` when the refresh finishes.
     """
     with cache["lock"]:
         if cache["refreshing"]:
@@ -2293,6 +2334,42 @@ def _claim_cred_counts_refresh(cache: dict, ttl: float) -> bool:
         cache["refreshing"] = True
         cache["ts"] = now
         return True
+
+
+# Bound for the web-layer credential-count JOIN (ExtractionJob ×
+# ParsedCredential). Keep it below the pipeline watchdog's 15s
+# parse-competitor cancellation threshold so PostgreSQL cancels the query
+# first and the pooled connection is returned cleanly; the caller falls back
+# to 0 for that group.
+_CRED_COUNTS_STATEMENT_TIMEOUT = "12s"
+
+
+# Jobs that hold the shared pipeline lock / rewrite its PID file even though
+# they do not open Telegram themselves. The host watchdog only inspects the
+# PID inside the worker container, so triggering these from web fights the
+# worker's pipeline supervision.
+_WEB_SCHEDULER_PIPELINE_LOCK_JOBS = frozenset(
+    {"pipeline", "pipeline_watchdog", "pipeline_health"}
+)
+
+
+def _web_scheduler_run_blocked(job_name: str) -> bool:
+    """Return True when ``job_name`` must not be started from the web process.
+
+    Jobs that open a Telegram session (``requires_telegram`` in JOB_DEFS) or
+    manipulate the pipeline lock/PID can race the worker's pipeline for the
+    single Telethon session file and bypass the worker's in-process locks and
+    PID bookkeeping. ``TELECRIME_ALLOW_WEB_SCHEDULER_RUN=1`` is the explicit
+    operator escape hatch.
+    """
+    if os.environ.get("TELECRIME_ALLOW_WEB_SCHEDULER_RUN") == "1":
+        return False
+    from telecrime.scheduler import JOB_DEFS
+
+    defn = JOB_DEFS.get(job_name)
+    if defn is None:
+        return False
+    return bool(defn.get("requires_telegram")) or job_name in _WEB_SCHEDULER_PIPELINE_LOCK_JOBS
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
@@ -2485,7 +2562,14 @@ def create_app(database_url: str | None = None) -> FastAPI:
         try:
             with get_session(engine) as s:
                 if engine.dialect.name == "postgresql":
-                    s.execute(text("SET LOCAL statement_timeout = '120s'"))
+                    # Self-cancel below the watchdog's parse-competitor
+                    # threshold (15s) instead of being force-cancelled.
+                    s.execute(
+                        text(
+                            "SET LOCAL statement_timeout = "
+                            f"'{_CRED_COUNTS_STATEMENT_TIMEOUT}'"
+                        )
+                    )
                 rows = s.execute(
                     select(ExtractionJob.group_id, func.count(ParsedCredential.id).label("creds"))
                     .join(ParsedCredential, ParsedCredential.extraction_job_id == ExtractionJob.id)
@@ -4725,20 +4809,36 @@ def create_app(database_url: str | None = None) -> FastAPI:
             match_type = "any"
 
         def _initial_count() -> int | None:
-            with engine.connect() as conn:
-                conn.execute(text("SET LOCAL statement_timeout = '30s'"))
-                try:
-                    return _watchlist_count(conn, query, match_type)
-                except Exception:
-                    # Query too expensive for the 30s budget — accept the item
-                    # with an UNKNOWN count. The route stores -1 as the sentinel
-                    # so the background worker seeds the baseline WITHOUT
-                    # firing every historical match as a new alert.
-                    return None
+            # Never stack a full ILIKE scan on top of an in-flight sweep: the
+            # item is stored with the unknown sentinel and seeded later.
+            if not _watchlist_web_scan_lock.acquire(blocking=False):
+                logger.info(
+                    "Watchlist scan in progress — storing unknown baseline for %r", query
+                )
+                return None
+            try:
+                with engine.connect() as conn:
+                    conn.execute(
+                        text(
+                            "SET LOCAL statement_timeout = "
+                            f"'{_WATCHLIST_WEB_STATEMENT_TIMEOUT}'"
+                        )
+                    )
+                    try:
+                        return _watchlist_count(conn, query, match_type)
+                    except Exception:
+                        # Query too expensive for the timeout budget — accept
+                        # the item with an UNKNOWN count. The route stores -1 as
+                        # the sentinel so the background worker seeds the
+                        # baseline WITHOUT firing every historical match as a
+                        # new alert.
+                        return None
+            finally:
+                _watchlist_web_scan_lock.release()
 
         try:
             count = await asyncio.wait_for(
-                asyncio.to_thread(_initial_count), timeout=35
+                asyncio.to_thread(_initial_count), timeout=25
             )
         except TimeoutError:
             count = None
@@ -4862,6 +4962,29 @@ def create_app(database_url: str | None = None) -> FastAPI:
             return RedirectResponse(
                 f"/scheduler?flash=Unknown+job+{job_name}&flash_type=error", status_code=303
             )
+
+        if _web_scheduler_run_blocked(job_name):
+            message = (
+                f"Refusing to run {job_name} from the web process: it opens the "
+                "Telegram session or manipulates the pipeline lock. Run it via "
+                "the worker, or set TELECRIME_ALLOW_WEB_SCHEDULER_RUN=1 to override."
+            )
+            if request.headers.get("HX-Request"):
+                from telecrime.scheduler import read_status
+
+                statuses = read_status()
+                jobs = _build_jobs_rows(statuses, prefer_status_interval=False)
+                return templates.TemplateResponse(
+                    "partials/scheduler_jobs.html",
+                    {
+                        "request": request,
+                        "jobs": jobs,
+                        "flash": message,
+                        "flash_type": "error",
+                    },
+                    status_code=409,
+                )
+            return HTMLResponse(message, status_code=409)
 
         def _run_bg():
             from telecrime.config import load_config

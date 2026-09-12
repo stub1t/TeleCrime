@@ -911,7 +911,24 @@ class ExtractStage(PipelineStage):
                 source_conv_id = msg.conversation_id
                 source_msg_id = msg.id
 
+        # Idempotency: a job can be extracted again (crash retry, group
+        # resurrected), and re-recording the same (job_id, output_path) inflates
+        # first_seen_index.duplicate_count and repeats hashing/parse work.
+        existing_paths: set[str] = set(
+            ctx.session.execute(
+                select(ExtractedOutput.output_path).where(
+                    ExtractedOutput.job_id == job.id
+                )
+            )
+            .scalars()
+            .all()
+        )
+
         for i, file_path in enumerate(extracted_files):
+            path_str = str(file_path)
+            if path_str in existing_paths:
+                logger.debug("Output already recorded, skipping: %s", file_path.name)
+                continue
             sha256 = hashlib.sha256()
             file_size = 0
             with open(file_path, "rb") as f:
@@ -922,7 +939,7 @@ class ExtractStage(PipelineStage):
 
             output = ExtractedOutput(
                 job_id=job.id,
-                output_path=str(file_path),
+                output_path=path_str,
                 output_filename=file_path.name,
                 output_type=file_path.suffix.lower(),
                 output_size=file_size,
@@ -931,6 +948,7 @@ class ExtractStage(PipelineStage):
                 source_message_id=source_msg_id,
             )
             ctx.session.add(output)
+            existing_paths.add(path_str)
 
             if (i + 1) % self._RECORD_BATCH == 0:
                 ctx.session.flush()

@@ -575,6 +575,83 @@ def test_reparse_stealers_impl_backfills(pg_engine):
     assert cred.stealer_type == "redline"
 
 
+def test_run_reparse_stealers_job_drains_in_bounded_batches(pg_engine, monkeypatch):
+    """The scheduler drains the backlog with a bounded per-batch LIMIT."""
+    from telecrime.database import get_session
+    from telecrime.models import ExtractionJob
+    from telecrime.models.archive_group import ArchiveGroup
+    from telecrime.models.credential import ParsedCredential
+    from telecrime.models.extraction import ExtractedOutput
+    from telecrime.scheduler import _run_reparse_stealers_job
+    from telecrime.states import ExtractionStatus, GroupStatus
+
+    with get_session(pg_engine) as session:
+        for i in range(3):
+            group = ArchiveGroup(
+                fingerprint=f"redline-{i}.zip",
+                base_name=f"redline-{i}.zip",
+                status=GroupStatus.INCOMPLETE,
+                expected_part_count=1,
+                detected_part_count=1,
+            )
+            session.add(group)
+            session.flush()
+            job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+            session.add(job)
+            session.flush()
+            session.add(ExtractedOutput(
+                job_id=job.id,
+                output_path=f"/tmp/DomainDetects{i}.txt",
+                output_filename="DomainDetects.txt",
+                output_hash=f"hash{i}",
+            ))
+            session.add(ParsedCredential(
+                url=f"https://example{i}.com/login",
+                domain=f"example{i}.com",
+                username=f"user{i}",
+                password="pass",
+                extraction_job_id=job.id,
+                credential_hash=ParsedCredential.compute_hash(
+                    f"example{i}.com", f"user{i}", "pass"
+                ),
+            ))
+        session.commit()
+
+    monkeypatch.setattr("telecrime.scheduler._REPARSE_STEALERS_BATCH_LIMIT", 2)
+    result = _run_reparse_stealers_job(MagicMock(), pg_engine)
+
+    assert "3" in result
+    with get_session(pg_engine) as session:
+        nulls = session.query(ParsedCredential).filter(
+            ParsedCredential.stealer_type.is_(None)
+        ).count()
+    assert nulls == 0
+
+
+def test_update_channel_stats_pg_takes_advisory_lock_and_bounds_scan(pg_engine):
+    """The PG path serializes callers and bounds the first-run full aggregate."""
+    from sqlalchemy import event
+
+    from telecrime.channels.discover import update_channel_stats
+    from telecrime.database import get_session
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(pg_engine, "before_cursor_execute", _record)
+    try:
+        with get_session(pg_engine) as session:
+            update_channel_stats(session)
+    finally:
+        event.remove(pg_engine, "before_cursor_execute", _record)
+
+    executed = " ".join(statements).lower()
+    assert "pg_advisory_xact_lock" in executed
+    assert "statement_timeout" in executed
+
+
 def test_count_recent_unique_credentials_uses_soft_dedup(pg_engine):
     from telecrime.database import get_session
     from telecrime.models.credential import ParsedCredential

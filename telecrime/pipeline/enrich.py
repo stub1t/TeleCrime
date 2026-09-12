@@ -3,7 +3,7 @@
 import logging
 
 from sqlalchemy import select
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import selectinload
 
 from telecrime.models import Conversation, Message
 from telecrime.pipeline.orchestrator import PipelineContext, PipelineStage
@@ -26,19 +26,27 @@ class EnrichStage(PipelineStage):
         last_id = 0
         total = 0
         while True:
+            # Page MESSAGE IDs first, then load the full rows with
+            # selectinload. joinedload + limit(100) limits the joined rows (not
+            # the messages), truncating attachment collections for messages
+            # with >100 attachments and mis-evaluating has_archives.
+            page_ids = (
+                select(Message.id)
+                .where(
+                    Message.is_forwarded == True,
+                    Message.is_processed == False,
+                    Message.id > last_id,
+                )
+                .order_by(Message.id)
+                .limit(100)
+            )
             forwarded_messages = (
                 ctx.session.execute(
                     select(Message)
-                    .where(
-                        Message.is_forwarded == True,
-                        Message.is_processed == False,
-                        Message.id > last_id,
-                    )
-                    .options(joinedload(Message.attachments))
+                    .where(Message.id.in_(page_ids))
+                    .options(selectinload(Message.attachments))
                     .order_by(Message.id)
-                    .limit(100)
                 )
-                .unique()
                 .scalars()
                 .all()
             )

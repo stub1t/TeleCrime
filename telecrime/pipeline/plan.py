@@ -26,6 +26,10 @@ class PlanStage(PipelineStage):
 
     name = "plan"
 
+    # Keyset page size. Bounds the ORM objects materialized and the transaction
+    # size when a re-ingest backlog leaves millions of unplanned attachments.
+    _BATCH_SIZE = 10_000
+
     async def run(self, ctx: PipelineContext) -> bool:
         """Run the plan stage."""
         logger.info("Starting download planning")
@@ -33,41 +37,57 @@ class PlanStage(PipelineStage):
         # Fix any bad groups from old code before planning new downloads
         await self._fix_bad_groups(ctx)
 
-        # Find archive candidates without download artifacts.
-        # Eagerly load .message so conversation_id is available after the commit below.
-        candidates = ctx.session.execute(
-            select(FileAttachment)
-            .where(
-                FileAttachment.is_archive_candidate == True,
-                ~FileAttachment.download_artifact.has(),
+        total_created = 0
+        last_id = 0
+        while True:
+            # Keyset-paginate by FileAttachment.id so the whole backlog is never
+            # loaded at once (each joinedload page is bounded) and each page's
+            # DownloadArtifact flush/commit is a short transaction.
+            # Eagerly load .message so conversation_id is available for grouping.
+            candidates = (
+                ctx.session.execute(
+                    select(FileAttachment)
+                    .where(
+                        FileAttachment.is_archive_candidate == True,
+                        ~FileAttachment.download_artifact.has(),
+                        FileAttachment.id > last_id,
+                    )
+                    .options(joinedload(FileAttachment.message))
+                    .order_by(FileAttachment.id)
+                    .limit(self._BATCH_SIZE)
+                )
+                .scalars()
+                .all()
             )
-            .options(joinedload(FileAttachment.message))
-        ).scalars().all()
-        # Release the read snapshot before doing any further work.
-        ctx.session.commit()
+            if not candidates:
+                break
+            last_id = candidates[-1].id
 
-        if not candidates:
+            # Create download artifacts for each candidate; keep an in-memory map
+            # so _create_or_update_group can look them up without N+1 DB queries.
+            artifact_map: dict[int, DownloadArtifact] = {}
+            for attachment in candidates:
+                artifact = DownloadArtifact(
+                    attachment_id=attachment.id,
+                    status=DownloadStatus.PENDING,
+                )
+                ctx.session.add(artifact)
+                artifact_map[attachment.id] = artifact
+
+            ctx.session.flush()
+            total_created += len(artifact_map)
+
+            # Group multi-part archives
+            await self._group_archives(ctx, candidates, artifact_map)
+
+            # Commit per page: releases the read snapshot and keeps each
+            # transaction (and the ORM identity map) bounded.
+            ctx.session.commit()
+
+        if total_created:
+            logger.info("Created %d download jobs", total_created)
+        else:
             logger.info("No new archive candidates to plan")
-            return True
-
-        # Create download artifacts for each candidate; keep an in-memory map
-        # so _create_or_update_group can look them up without N+1 DB queries.
-        artifact_map: dict[int, DownloadArtifact] = {}
-        for attachment in candidates:
-            artifact = DownloadArtifact(
-                attachment_id=attachment.id,
-                status=DownloadStatus.PENDING,
-            )
-            ctx.session.add(artifact)
-            artifact_map[attachment.id] = artifact
-
-        ctx.session.flush()
-        logger.info("Created %d download jobs", len(artifact_map))
-
-        # Group multi-part archives
-        await self._group_archives(ctx, candidates, artifact_map)
-
-        ctx.session.commit()
         return True
 
     async def _fix_bad_groups(self, ctx: PipelineContext) -> None:

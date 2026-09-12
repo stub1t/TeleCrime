@@ -263,6 +263,12 @@ def _hash64_expr(alias: str) -> str:
 
 
 _HAS_HASH64: bool | None = None  # resolved lazily against the live schema
+# On a transient probe failure (connection reset/timeout) the probe result is
+# left unresolved and retried after this short backoff instead of caching
+# False for the process lifetime — a single blip used to force the slow
+# left(hash,32) dedup fallback until the next restart.
+_HAS_HASH64_RETRY_AT: float = 0.0
+_HAS_HASH64_PROBE_BACKOFF_SECONDS = 60.0
 
 
 def _has_hash64_index(engine) -> bool:
@@ -272,10 +278,18 @@ def _has_hash64_index(engine) -> bool:
     CONCURRENTLY, but the planner ignores them. Treating an invalid index as
     present made every dedup INSERT fall back to a per-row full index scan of
     parsed_credentials (minutes per 50K chunk instead of milliseconds).
+
+    Tri-state: True is cached permanently; a successful probe that finds no
+    index caches False; probe *exceptions* leave the result unresolved and
+    retry after a short backoff, so a transient connection error never disables
+    the fast path for the rest of the process.
     """
-    global _HAS_HASH64
+    global _HAS_HASH64, _HAS_HASH64_RETRY_AT
     if _HAS_HASH64 is not None:
         return _HAS_HASH64
+    now = time.monotonic()
+    if now < _HAS_HASH64_RETRY_AT:
+        return False
     try:
         with engine.connect() as conn:
             row = conn.execute(
@@ -286,9 +300,16 @@ def _has_hash64_index(engine) -> bool:
                 )
             ).fetchone()
         _HAS_HASH64 = row is not None
-    except Exception:
-        _HAS_HASH64 = False
-    return _HAS_HASH64
+        _HAS_HASH64_RETRY_AT = 0.0
+    except Exception as exc:
+        logger.warning(
+            "Could not probe ix_pc_hash64 (%s) — will retry in %.0fs",
+            exc,
+            _HAS_HASH64_PROBE_BACKOFF_SECONDS,
+        )
+        _HAS_HASH64 = None
+        _HAS_HASH64_RETRY_AT = now + _HAS_HASH64_PROBE_BACKOFF_SECONDS
+    return bool(_HAS_HASH64)
 
 
 def _ensure_hash64_index(engine) -> None:
@@ -303,7 +324,7 @@ def _ensure_hash64_index(engine) -> None:
         return
     if _has_hash64_index(engine):
         return
-    global _HAS_HASH64
+    global _HAS_HASH64, _HAS_HASH64_RETRY_AT
     try:
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             # An invalid leftover from an interrupted CONCURRENTLY build still
@@ -320,7 +341,53 @@ def _ensure_hash64_index(engine) -> None:
         _HAS_HASH64 = None  # re-resolve against the live schema
     except Exception as exc:
         logger.warning("Could not create ix_pc_hash64 index: %s", exc)
-        _HAS_HASH64 = False
+        # Do not permanently cache False after a failed repair: the index may be
+        # created concurrently later (missing indexes are being rebuilt), and a
+        # transient DDL failure must not disable the fast dedup path.
+        _HAS_HASH64 = None
+        _HAS_HASH64_RETRY_AT = (
+            time.monotonic() + _HAS_HASH64_PROBE_BACKOFF_SECONDS
+        )
+
+
+def _shutdown_parse_pool(pool: ProcessPoolExecutor, *, force: bool) -> None:
+    """Shut down a parse pool, killing wedged workers on the failure path.
+
+    On success ``shutdown(wait=True)`` waits for in-flight chunks, which is
+    required to keep no worker writing after we move on. On the failure path a
+    worker wedged in native code (e.g. OOM-adjacent stall) makes that wait hang
+    forever — the pipeline process stays alive but makes no progress and the
+    watchdog cannot recover it. Cancel pending futures, terminate, then kill
+    surviving workers so the caller can fall back to the sequential parse.
+    """
+    if not force:
+        pool.shutdown(wait=True)
+        return
+
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception as exc:
+        logger.debug("Process pool shutdown(wait=False) failed: %s", exc)
+
+    processes = list((getattr(pool, "_processes", None) or {}).values())
+    for proc in processes:
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:
+            pass
+    deadline = time.monotonic() + 5.0
+    for proc in processes:
+        try:
+            proc.join(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            pass
+    for proc in processes:
+        try:
+            if proc.is_alive():
+                proc.kill()
+        except Exception:
+            pass
 
 
 class ParseStage(PipelineStage):
@@ -434,7 +501,9 @@ class ParseStage(PipelineStage):
         # main event-loop thread; the background thread only reads file chunks.
         ctx = multiprocessing.get_context("spawn")
 
-        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+        pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+        pool_failed = False
+        try:
             in_flight: list[Future] = []
             submitting = True
             # If the spawn workers get OOM-killed (RAM-tight host), the pool
@@ -515,6 +584,13 @@ class ParseStage(PipelineStage):
                     await asyncio.wait_for(asyncio.shield(read_task), timeout=5)
                 except (TimeoutError, Exception):
                     pass
+        except BaseException:
+            # Includes GeneratorExit (early-skip break) and CancelledError:
+            # never block on shutdown(wait=True) with a wedged worker.
+            pool_failed = True
+            raise
+        finally:
+            _shutdown_parse_pool(pool, force=pool_failed)
 
     async def run(self, ctx: PipelineContext) -> bool:
         """Parse credential files from successful extractions."""

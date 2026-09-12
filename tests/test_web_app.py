@@ -658,7 +658,10 @@ def test_errors_json_count_tolerates_malformed():
 
 
 def _web_request(
-    *, method: str = "GET", form: dict[str, str] | None = None
+    *,
+    method: str = "GET",
+    form: dict[str, str] | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> Request:
     """Minimal ASGI request; `form` makes request.form() parsable."""
     body = urlencode(form or {}).encode()
@@ -670,6 +673,8 @@ def _web_request(
     headers = (
         [(b"content-type", b"application/x-www-form-urlencoded")] if form is not None else []
     )
+    for name, value in (extra_headers or {}).items():
+        headers.append((name.lower().encode(), value.encode()))
     return Request(
         {
             "type": "http",
@@ -1125,3 +1130,124 @@ def test_claim_cred_counts_refresh_is_single_flight():
     with cache["lock"]:  # stale again later
         cache["ts"] = 0.0
     assert _claim_cred_counts_refresh(cache, 90) is True
+
+
+def test_web_scheduler_guard_blocks_telegram_and_pipeline_jobs(monkeypatch):
+    """Jobs that open Telegram or the pipeline lock must not run from web."""
+    from telecrime.web import app as web_app
+
+    monkeypatch.delenv("TELECRIME_ALLOW_WEB_SCHEDULER_RUN", raising=False)
+
+    assert web_app._web_scheduler_run_blocked("pipeline") is True
+    assert web_app._web_scheduler_run_blocked("channel_join") is True
+    # Summaries and watchlist notify open a Telegram adapter too.
+    assert web_app._web_scheduler_run_blocked("hourly_summary") is True
+    assert web_app._web_scheduler_run_blocked("watchlist_notify") is True
+    # Pipeline supervision rewrites the PID/lock the host watchdog tracks.
+    assert web_app._web_scheduler_run_blocked("pipeline_watchdog") is True
+    assert web_app._web_scheduler_run_blocked("pipeline_health") is True
+
+    # DB-only jobs stay available.
+    assert web_app._web_scheduler_run_blocked("vacuum") is False
+    assert web_app._web_scheduler_run_blocked("channel_export") is False
+    assert web_app._web_scheduler_run_blocked("reparse_stealers") is False
+
+    monkeypatch.setenv("TELECRIME_ALLOW_WEB_SCHEDULER_RUN", "1")
+    assert web_app._web_scheduler_run_blocked("pipeline") is False
+
+
+def test_scheduler_run_route_returns_409_for_telegram_jobs(tmp_path, monkeypatch):
+    """The route refuses pipeline/channel_join with HTTP 409 (plain and HTMX)."""
+    monkeypatch.delenv("TELECRIME_ALLOW_WEB_SCHEDULER_RUN", raising=False)
+    app, _ = _sqlite_app(tmp_path)
+    route = _route(app, "/scheduler/run/{job_name}", "POST")
+
+    for job_name in ("pipeline", "channel_join"):
+        response = route.endpoint(request=_web_request(method="POST"), job_name=job_name)
+        assert response.status_code == 409
+        assert "Refusing to run" in bytes(response.body).decode()
+
+    hx_response = route.endpoint(
+        request=_web_request(method="POST", extra_headers={"HX-Request": "true"}),
+        job_name="pipeline",
+    )
+    assert hx_response.status_code == 409
+    assert "Refusing to run" in bytes(hx_response.body).decode()
+
+
+def test_scheduler_run_route_allows_safe_jobs_and_escape_hatch(tmp_path, monkeypatch):
+    """vacuum runs in the web process; the env flag re-enables Telegram jobs."""
+    from telecrime import config as config_module
+    from telecrime import scheduler
+
+    app, _ = _sqlite_app(tmp_path)
+    route = _route(app, "/scheduler/run/{job_name}", "POST")
+
+    monkeypatch.delenv("TELECRIME_ALLOW_WEB_SCHEDULER_RUN", raising=False)
+    monkeypatch.setattr(config_module, "load_config", lambda: object())
+    monkeypatch.setattr(scheduler, "_update_job", lambda *args, **kwargs: None)
+    vacuum_started = threading.Event()
+
+    def _fake_vacuum(engine):
+        vacuum_started.set()
+        return "VACUUM completed"
+
+    monkeypatch.setattr(scheduler, "_run_vacuum_job", _fake_vacuum)
+    response = route.endpoint(request=_web_request(method="POST"), job_name="vacuum")
+    assert response.status_code == 303
+    assert vacuum_started.wait(timeout=5)
+
+    monkeypatch.setenv("TELECRIME_ALLOW_WEB_SCHEDULER_RUN", "1")
+    pipeline_started = threading.Event()
+
+    def _fake_pipeline(config, engine):
+        pipeline_started.set()
+        return "completed"
+
+    monkeypatch.setattr(scheduler, "_run_pipeline_job", _fake_pipeline)
+    response = route.endpoint(request=_web_request(method="POST"), job_name="pipeline")
+    assert response.status_code == 303
+    assert pipeline_started.wait(timeout=5)
+
+
+def test_watchlist_sweep_skips_when_scan_in_flight():
+    """The module-level single-flight guard prevents stacked ILIKE scans."""
+    from telecrime.web import app as web_app
+
+    assert web_app._watchlist_web_scan_lock.acquire(blocking=False)
+    try:
+        # Must return before touching the engine: it is not even a session.
+        _check_watchlist(object())
+    finally:
+        web_app._watchlist_web_scan_lock.release()
+
+
+def test_watchlist_add_defers_count_when_scan_in_flight(tmp_path, monkeypatch):
+    """The add route stores the unknown sentinel instead of stacking a scan."""
+    from telecrime.web import app as web_app
+
+    called = False
+
+    def _should_not_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        return 0
+
+    monkeypatch.setattr(web_app, "_watchlist_count", _should_not_run)
+    app, seed_engine = _sqlite_app(tmp_path)
+
+    assert web_app._watchlist_web_scan_lock.acquire(blocking=False)
+    try:
+        response = asyncio.run(
+            _route(app, "/api/watchlist", "POST").endpoint(
+                request=_web_request(method="POST", form={"query": "deferred"})
+            )
+        )
+    finally:
+        web_app._watchlist_web_scan_lock.release()
+
+    assert response.status_code == 200
+    assert called is False
+    with get_session(seed_engine) as session:
+        item = session.query(WatchlistItem).one()
+        assert item.last_known_count == -1

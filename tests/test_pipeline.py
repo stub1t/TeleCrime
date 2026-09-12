@@ -1,5 +1,6 @@
 """Tests for pipeline stages and orchestration."""
 
+import asyncio
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -120,6 +121,32 @@ class TestPipeline:
         assert stage2.was_called
         # Error should be recorded
         assert len(ctx.errors) == 1
+
+    @pytest.mark.asyncio
+    async def test_run_propagates_cancelled_stage(self, session, test_config):
+        """A cancelled stage must abort the run, not be recorded as an error
+        and silently continue through the remaining stages."""
+
+        class CancelledStage(PipelineStage):
+            name = "cancelled"
+
+            async def run(self, ctx):
+                raise asyncio.CancelledError()
+
+        class AfterStage(PipelineStage):
+            name = "after"
+
+            async def run(self, ctx):
+                ctx.messages_processed = 7
+                return True
+
+        pipeline = Pipeline(test_config, session, MagicMock())
+        pipeline.add_stage(CancelledStage()).add_stage(AfterStage())
+
+        with pytest.raises(asyncio.CancelledError):
+            await pipeline.run()
+
+        assert session.query(PipelineRun).order_by(PipelineRun.id.desc()).first() is not None
 
     @pytest.mark.asyncio
     async def test_run_passes_dry_run(self, session, test_config):
@@ -1020,6 +1047,64 @@ class TestEnrichStageOriginRetry:
         assert origin.title == "origin"
         assert origin.is_accessible is True
 
+    @pytest.mark.asyncio
+    async def test_many_attachments_not_truncated_by_page_limit(
+        self, session, test_config
+    ):
+        """An archive candidate past the page limit is still seen.
+
+        Regression: joinedload(Message.attachments) + limit(100) limits the
+        joined rows, not the messages, so a message with >100 attachments had
+        its collection silently truncated and has_archives could be False even
+        when the archive candidate was in the dropped rows.
+        """
+        from telecrime.models import Conversation, FileAttachment, Message
+        from telecrime.pipeline.enrich import EnrichStage
+
+        conv = Conversation(platform_id=555, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=1,
+            platform_timestamp=datetime.now(UTC),
+            text="dump",
+            is_forwarded=True,
+            forwarded_from_id=5550,
+            is_processed=False,
+        )
+        session.add(msg)
+        session.flush()
+        for i in range(120):
+            session.add(
+                FileAttachment(
+                    message_id=msg.id,
+                    platform_file_id=f"f-{i}",
+                    filename=f"plain_{i}.txt",
+                    is_archive_candidate=False,
+                )
+            )
+        # Inserted last, so it is the first attachment dropped by a joined LIMIT.
+        session.add(
+            FileAttachment(
+                message_id=msg.id,
+                platform_file_id="f-archive",
+                filename="dump.zip",
+                is_archive_candidate=True,
+            )
+        )
+        session.commit()
+
+        adapter = MagicMock()
+        adapter.resolve_forwarded_source = AsyncMock(return_value=None)
+        ctx = PipelineContext(config=test_config, session=session, adapter=adapter)
+
+        await EnrichStage().run(ctx)
+
+        assert adapter.resolve_forwarded_source.await_count == 1
+        session.expire_all()
+        assert session.get(Message, msg.id).is_processed is True
+
 
 class TestPlanStage:
     """Tests for PlanStage."""
@@ -1233,6 +1318,51 @@ class TestPlanStage:
         ]
         assert lazy_files == []
         assert lazy_messages == []
+
+    @pytest.mark.asyncio
+    async def test_run_pages_candidates_in_batches(
+        self, session, test_config, monkeypatch
+    ):
+        """Planning keyset-pages candidates and commits per batch."""
+        from telecrime.models import (
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+
+        conv = Conversation(platform_id=777, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        for i in range(5):
+            msg = Message(
+                conversation_id=conv.id,
+                platform_id=i,
+                platform_timestamp=datetime.now(UTC),
+            )
+            session.add(msg)
+            session.flush()
+            session.add(
+                FileAttachment(
+                    message_id=msg.id,
+                    platform_file_id=f"doc-{i}",
+                    filename=f"unique_{i}.zip",
+                    size=1000,
+                    is_archive_candidate=True,
+                    archive_type="zip",
+                )
+            )
+        session.commit()
+
+        monkeypatch.setattr(PlanStage, "_BATCH_SIZE", 2)
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+
+        assert await PlanStage().run(ctx) is True
+
+        assert session.query(DownloadArtifact).count() == 5
+        linked = session.execute(select(ArchiveGroupPart.artifact_id)).scalars().all()
+        assert len(set(linked)) == 5
 
 
 
@@ -2175,6 +2305,110 @@ class TestParseParallelChunking:
             all_creds.extend(_parse_lines_chunk_worker((chunk, src, decision)))
         assert len(all_creds) == 502
         assert {t[2] for t in all_creds} >= {"head", "late"}
+
+
+def test_has_hash64_probe_does_not_cache_transient_failure(monkeypatch):
+    """A transient probe error must not disable the fast dedup path forever."""
+    from telecrime.pipeline import parse as parse_mod
+
+    monkeypatch.setattr(parse_mod, "_HAS_HASH64", None)
+    monkeypatch.setattr(parse_mod, "_HAS_HASH64_RETRY_AT", 0.0)
+
+    class _FailingConn:
+        def __enter__(self):
+            raise OSError("connection reset")
+
+        def __exit__(self, *exc):
+            return False
+
+    class _FailingEngine:
+        def connect(self):
+            return _FailingConn()
+
+    assert parse_mod._has_hash64_index(_FailingEngine()) is False
+    # The failure must NOT be cached as a permanent False.
+    assert parse_mod._HAS_HASH64 is None
+    assert parse_mod._HAS_HASH64_RETRY_AT > 0.0
+
+    class _OkResult:
+        def fetchone(self):
+            return (1,)
+
+    class _OkConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, _stmt):
+            return _OkResult()
+
+    class _OkEngine:
+        def connect(self):
+            return _OkConn()
+
+    # Once the backoff window elapses the probe retries and caches True.
+    monkeypatch.setattr(parse_mod, "_HAS_HASH64_RETRY_AT", 0.0)
+    assert parse_mod._has_hash64_index(_OkEngine()) is True
+    assert parse_mod._HAS_HASH64 is True
+
+
+def test_shutdown_parse_pool_force_terminates_wedged_workers():
+    """The failure path must not block on shutdown(wait=True)."""
+    from telecrime.pipeline.parse import _shutdown_parse_pool
+
+    class _Proc:
+        def __init__(self):
+            self.alive = True
+            self.terminated = False
+            self.killed = False
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+        def kill(self):
+            self.killed = True
+            self.alive = False
+
+        def join(self, timeout=None):
+            self.alive = False
+
+    class _Pool:
+        def __init__(self, proc):
+            self._processes = {1: proc}
+            self.shutdown_kwargs = None
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_kwargs = {"wait": wait, "cancel_futures": cancel_futures}
+
+    proc = _Proc()
+    pool = _Pool(proc)
+
+    _shutdown_parse_pool(pool, force=True)
+
+    assert pool.shutdown_kwargs == {"wait": False, "cancel_futures": True}
+    assert proc.terminated
+
+
+def test_shutdown_parse_pool_graceful_waits():
+    from telecrime.pipeline.parse import _shutdown_parse_pool
+
+    class _Pool:
+        def __init__(self):
+            self.shutdown_kwargs = None
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_kwargs = {"wait": wait, "cancel_futures": cancel_futures}
+
+    pool = _Pool()
+    _shutdown_parse_pool(pool, force=False)
+
+    assert pool.shutdown_kwargs == {"wait": True, "cancel_futures": False}
 
 
 class TestParseInListBatching:
