@@ -13,6 +13,7 @@ services:
       -c statement_timeout=${TELECRIME_POSTGRES_STATEMENT_TIMEOUT:-5min}
       -c lock_timeout=${TELECRIME_POSTGRES_LOCK_TIMEOUT:-30s}
       -c idle_in_transaction_session_timeout=${TELECRIME_POSTGRES_IDLE_TRANSACTION_TIMEOUT:-10min}
+      -c synchronous_commit=off
     environment:
       POSTGRES_DB: telecrime
       POSTGRES_USER: telecrime
@@ -23,6 +24,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - /home/user/recovery/pgts:/pgts
+      - /home/user/recovery/pg_wal_ext:/pgwal
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U telecrime"]
