@@ -233,12 +233,16 @@ async def test_flush_batch_db_error_fails_archive_without_marking(tmp_path, monk
     assert stats.archives_processed == 0
     assert session.rollbacks == 1
     assert archive.exists()  # unpersisted data must never be deleted
+    # A rolled-back batch must not be reported as persisted or duplicate.
+    assert stats.credentials_new == 0
+    assert stats.credentials_duplicate == 0
 
 
 @pytest.mark.asyncio
 async def test_process_archive_rolls_back_on_parse_error(tmp_path, monkeypatch):
-    """A parse error must roll the session back so later statements don't all
-    fail with PendingRollbackError."""
+    """A parse error must roll the session back AND fail the archive: part of
+    the file was never read, so marking the archive processed would silently
+    drop its remaining credentials."""
     archive = tmp_path / "sample.zip"
     archive.touch()
     output_dir = tmp_path / "extract"
@@ -263,7 +267,110 @@ async def test_process_archive_rolls_back_on_parse_error(tmp_path, monkeypatch):
         delete_after=False,
     )
 
-    assert success is True  # parse errors keep the previous "try other files" path
+    assert success is False
+    assert stats.archives_failed == 1
+    assert stats.archives_processed == 0
+    assert archive.exists()
+    session.rollback.assert_called_once()
+
+
+class _ResultExtractor:
+    def __init__(self, result):
+        self._result = result
+
+    async def find_matching_files(self, archive_path, extensions, password=None):
+        return []
+
+    async def extract(self, archive_path, target_dir, target_extensions, password=None):
+        return self._result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        SimpleNamespace(
+            needs_password=True,
+            success=False,
+            error_message=None,
+            extracted_files=[],
+        ),
+        SimpleNamespace(
+            needs_password=False,
+            success=False,
+            error_message="corrupt archive",
+            extracted_files=[],
+        ),
+    ],
+)
+async def test_failed_archive_kept_with_delete_after(tmp_path, result):
+    """--delete-after must only delete genuinely handled archives; a
+    password-protected/corrupt archive must stay on disk for a later retry."""
+    archive = tmp_path / "sample.zip"
+    archive.write_bytes(b"data")
+    output_dir = tmp_path / "extract"
+    output_dir.mkdir()
+
+    stats = ProcessingStats()
+    success = await process_archive(
+        archive,
+        _ResultExtractor(result),
+        output_dir,
+        MagicMock(),
+        stats,
+        delete_after=True,
+    )
+
+    assert success is False
+    assert stats.archives_failed == 1
+    assert archive.exists()
+
+
+@pytest.mark.asyncio
+async def test_parse_error_in_one_file_still_parses_other_files(tmp_path, monkeypatch):
+    """One unreadable file must not suppress the archive's other files; the
+    archive itself is still reported failed so it is retried later."""
+    archive = tmp_path / "sample.zip"
+    archive.touch()
+    output_dir = tmp_path / "extract"
+    output_dir.mkdir()
+    bad = output_dir / "Passwords_bad.txt"
+    good = output_dir / "Passwords.txt"
+    bad.write_text("dummy")
+    good.write_text("dummy")
+
+    def _iter(path):
+        if Path(path) == bad:
+            raise ValueError("bad encoding")
+        return iter([_cred("alice")])
+
+    monkeypatch.setattr("process_folder.iter_credentials_file", _iter)
+    monkeypatch.setattr("process_folder.detect_stealer_type", lambda filenames: "redline")
+
+    class TwoFileExtractor:
+        async def find_matching_files(self, archive_path, extensions, password=None):
+            return [bad, good]
+
+        async def extract(self, archive_path, target_dir, target_extensions, password=None):
+            return SimpleNamespace(
+                needs_password=False,
+                success=True,
+                error_message=None,
+                extracted_files=[bad, good],
+            )
+
+    session = MagicMock()
+    stats = ProcessingStats()
+    success = await process_archive(
+        archive, TwoFileExtractor(), output_dir, session, stats, delete_after=False
+    )
+
+    assert success is False
+    assert stats.archives_failed == 1
+    assert archive.exists()
+    # The good file was still flushed (one INSERT) before the archive failure.
+    assert session.execute.call_count == 1
+    session.commit.assert_called_once()
     session.rollback.assert_called_once()
 
 

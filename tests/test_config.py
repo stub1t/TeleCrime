@@ -11,6 +11,7 @@ from telecrime.config import (
     DownloadConfig,
     ExtractionConfig,
     TelegramConfig,
+    _apply_config_dict,
     _apply_env_vars,
     get_default_config_path,
     get_default_data_dir,
@@ -352,3 +353,69 @@ class TestMaskDatabaseUrl:
 
     def test_unparseable_url_is_fully_masked(self):
         assert mask_database_url("not a url") == "***"
+
+
+class TestConfigTypeCoercion:
+    """TOML/env values must be coerced, not trusted blindly."""
+
+    def test_toml_float_api_id_is_coerced_to_int(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            'database_url = "postgresql://u:p@db:5432/telecrime"\n'
+            "[telegram]\n"
+            "api_id = 22584069.0\n"
+        )
+        config = load_config(config_path)
+        assert config.telegram.api_id == 22584069
+        assert isinstance(config.telegram.api_id, int)
+
+    def test_env_float_string_int_is_coerced(self):
+        config = Config()
+        with patch.dict(os.environ, {"TELECRIME_PARALLEL_CHUNKS": "4.0"}):
+            _apply_env_vars(config)
+        assert config.download.parallel_chunks == 4
+        assert isinstance(config.download.parallel_chunks, int)
+
+    def test_non_integral_int_value_is_rejected(self):
+        config = Config()
+        with patch.dict(os.environ, {"TELECRIME_PARALLEL_CHUNKS": "4.5"}):
+            with pytest.raises(ValueError, match="TELECRIME_PARALLEL_CHUNKS"):
+                _apply_env_vars(config)
+
+    def test_invalid_int_value_is_rejected(self):
+        config = Config()
+        with patch.dict(os.environ, {"TELECRIME_TELEGRAM_API_ID": "not-a-number"}):
+            with pytest.raises(ValueError, match="TELECRIME_TELEGRAM_API_ID"):
+                _apply_env_vars(config)
+
+    def test_toml_string_session_names_do_not_split_into_chars(self):
+        config = Config()
+        _apply_config_dict(
+            config,
+            {"download": {"download_session_names": "dl2, dl3"}},
+        )
+        assert config.telegram.download_session_names == ["dl2", "dl3"]
+
+    def test_toml_non_string_list_entry_is_rejected(self):
+        config = Config()
+        with pytest.raises(ValueError, match="target_extensions"):
+            _apply_config_dict(config, {"extraction": {"target_extensions": [".txt", 7]}})
+
+    def test_env_target_extensions_drops_empty_entries(self):
+        config = Config()
+        with patch.dict(
+            os.environ, {"TELECRIME_TARGET_EXTENSIONS": ".mobi, ,.azw3,"}
+        ):
+            _apply_env_vars(config)
+        assert config.extraction.target_extensions == [".mobi", ".azw3"]
+
+    def test_negative_download_session_index_falls_back_to_main(self):
+        config = Config()
+        config.telegram.download_session_names = ["dl2", "dl3"]
+        assert config.with_download_session(-1) is config
+
+    def test_empty_xdg_config_home_falls_back_to_home(self):
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}):
+            path = get_default_config_path()
+        assert path == Path.home() / ".config" / "telecrime" / "config.toml"
+

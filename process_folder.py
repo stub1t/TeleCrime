@@ -44,6 +44,17 @@ logger = logging.getLogger(__name__)
 # Archive extensions to process
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2"}
 
+# Per-file duplicate cache bound. The cache only avoids re-sending known
+# duplicates to the unique index; clearing it is safe (the index stays
+# authoritative), and prevents a multi-million-credential file from growing
+# the set without limit.
+_MAX_SEEN_IN_FILE = 200_000
+
+# Names per resume-probe IN-list. Production has no index on
+# parsed_credentials.source_archive, so each statement is a seq scan; send as
+# many names per statement as practical (well under PG's 65535 bind limit).
+_RESUME_PROBE_CHUNK = 20_000
+
 
 @dataclass
 class ProcessingStats:
@@ -161,18 +172,18 @@ async def process_archive(
             password=None,
         )
 
+        # Failed archives are retried later, so --delete-after must never
+        # remove them: a password-protected or corrupt archive can still be
+        # recovered once a password/parser fix exists. Only genuinely handled
+        # archives (credentials parsed, or no .txt files to parse) are deleted.
         if result.needs_password:
-            logger.warning("  Archive needs password: %s", archive.name)
+            logger.warning("  Archive needs password: %s (kept for retry)", archive.name)
             stats.archives_failed += 1
-            if delete_after:
-                _delete_archive_and_parts(archive, stats)
             return False
 
         if not result.success:
             logger.error("  Extraction failed: %s - %s", archive.name, result.error_message)
             stats.archives_failed += 1
-            if delete_after:
-                _delete_archive_and_parts(archive, stats)
             return False
 
         if not result.extracted_files:
@@ -192,6 +203,7 @@ async def process_archive(
             logger.info("  Detected stealer type: %s", stealer_type)
 
         # Find and parse credential files
+        parse_failed = False
         for txt_file in result.extracted_files:
             if not is_credential_file(txt_file.name):
                 continue
@@ -219,6 +231,7 @@ async def process_archive(
                         return True
 
                     rows_by_hash: dict[str, dict] = {}
+                    duplicates_in_batch = 0
                     for cred in items:
                         domain_value = truncate_field(cred.domain or cred.url or "", 255) or ""
                         username_value = truncate_field(cred.username, 255) or ""
@@ -227,7 +240,7 @@ async def process_archive(
                             domain_value, username_value, password_value
                         )
                         if credential_hash in seen_in_file or credential_hash in rows_by_hash:
-                            stats.credentials_duplicate += 1
+                            duplicates_in_batch += 1
                             continue
                         rows_by_hash[credential_hash] = {
                             "url": truncate_field(cred.url, 1024) or "",
@@ -242,13 +255,9 @@ async def process_archive(
                             "stealer_type": truncate_field(stealer_type, 50),
                             "credential_hash": credential_hash,
                         }
-                        if cred.domain:
-                            stats.unique_domains.add(cred.domain)
-                            stats.domain_counter[cred.domain] += 1
-                        if stealer_type:
-                            stats.stealer_counter[stealer_type] += 1
 
                     if not rows_by_hash:
+                        stats.credentials_duplicate += duplicates_in_batch
                         return True
 
                     try:
@@ -262,27 +271,8 @@ async def process_archive(
                             .returning(ParsedCredential.credential_hash)
                         )
                         inserted_hashes = {row[0] for row in session.execute(stmt)}
-
                         new_count = len(inserted_hashes)
-                        stats.credentials_found += new_count
-                        stats.credentials_new += new_count
-                        stats.credentials_duplicate += len(rows_by_hash) - new_count
-                        file_found_count += new_count
-                        seen_in_file.update(rows_by_hash.keys())
-
-                        if csv_writer is not None:
-                            for h in inserted_hashes:
-                                row = rows_by_hash[h]
-                                csv_writer.writerow({
-                                    **{k: row[k] for k in (
-                                        "url", "domain", "username", "password",
-                                        "application", "profile", "source_archive", "stealer_type",
-                                    )},
-                                    "source_file": txt_file_name,
-                                })
-
                         session.commit()
-                        session.expire_all()
                     except Exception as db_exc:
                         # Without the rollback every later statement on this
                         # session raises PendingRollbackError (also swallowed)
@@ -295,6 +285,41 @@ async def process_archive(
                             db_exc,
                         )
                         return False
+
+                    session.expire_all()
+
+                    # Account for rows only after COMMIT succeeded: a
+                    # rolled-back batch must never be reported as persisted
+                    # (or be counted as duplicates on a later error path).
+                    stats.credentials_found += new_count
+                    stats.credentials_new += new_count
+                    stats.credentials_duplicate += duplicates_in_batch + (
+                        len(rows_by_hash) - new_count
+                    )
+                    file_found_count += new_count
+                    # Bound the per-file duplicate cache; the unique index is
+                    # authoritative, so dropping remembered hashes only costs
+                    # a few no-op conflict checks.
+                    if len(seen_in_file) >= _MAX_SEEN_IN_FILE:
+                        seen_in_file.clear()
+                    seen_in_file.update(rows_by_hash.keys())
+                    for row in rows_by_hash.values():
+                        if row["domain"]:
+                            stats.unique_domains.add(row["domain"])
+                            stats.domain_counter[row["domain"]] += 1
+                        if row["stealer_type"]:
+                            stats.stealer_counter[row["stealer_type"]] += 1
+
+                    if csv_writer is not None:
+                        for h in inserted_hashes:
+                            row = rows_by_hash[h]
+                            csv_writer.writerow({
+                                **{k: row[k] for k in (
+                                    "url", "domain", "username", "password",
+                                    "application", "profile", "source_archive", "stealer_type",
+                                )},
+                                "source_file": txt_file_name,
+                            })
                     return True
 
                 batch_ok = True
@@ -325,10 +350,21 @@ async def process_archive(
 
             except Exception as e:
                 # Reset the transaction so one poisoned session can't make
-                # every later statement fail (and be swallowed) while the
-                # archive is still reported as processed.
+                # every later statement fail (and be swallowed). A parse
+                # failure means part of this file was never read, so the
+                # archive must NOT be counted as processed; continue with the
+                # remaining files and let the caller retry the whole archive
+                # later (hash dedup makes the retry idempotent).
                 session.rollback()
+                parse_failed = True
                 logger.error("    Error parsing %s: %s", txt_file.name, e)
+
+        if parse_failed:
+            stats.archives_failed += 1
+            logger.error(
+                "  Parse error(s) in %s — not marking it processed", archive.name
+            )
+            return False
 
         stats.archives_processed += 1
 
@@ -429,18 +465,44 @@ async def process_folder(
         already_processed.update(
             line.strip() for line in processed_marker.read_text().splitlines() if line.strip()
         )
-    # Probe DB for any remaining candidates using an indexed IN-lookup
-    # (cheap) rather than a DISTINCT scan of the whole credentials table.
+    # Probe DB for any remaining candidates. NOTE: production has NO index on
+    # parsed_credentials.source_archive, so each probe is a 353M-row seq scan —
+    # send as many names per statement as practical instead of one scan per
+    # 500 names, cap the probe with a statement timeout, and fall back to the
+    # marker file when it cannot finish (re-processing is safe: the unique
+    # credential_hash index absorbs the duplicates).
     candidate_names = [a.name for a in archives if a.name not in already_processed]
     if candidate_names:
+        from sqlalchemy import text as _sa_text
+
         with session_factory() as resume_session:
-            for chunk_start in range(0, len(candidate_names), 500):
-                chunk = candidate_names[chunk_start:chunk_start + 500]
-                already_processed.update(
-                    name for (name,) in resume_session.query(
-                        ParsedCredential.source_archive
-                    ).filter(ParsedCredential.source_archive.in_(chunk)).distinct().all()
-                    if name
+            try:
+                resume_session.execute(
+                    _sa_text("SET LOCAL statement_timeout = '120s'")
+                )
+            except Exception:
+                pass  # non-PostgreSQL fixture; the probe still works
+            try:
+                for chunk_start in range(0, len(candidate_names), _RESUME_PROBE_CHUNK):
+                    chunk = candidate_names[
+                        chunk_start:chunk_start + _RESUME_PROBE_CHUNK
+                    ]
+                    already_processed.update(
+                        name for (name,) in resume_session.query(
+                            ParsedCredential.source_archive
+                        ).filter(
+                            ParsedCredential.source_archive.in_(chunk)
+                        ).distinct().all()
+                        if name
+                    )
+            except Exception as exc:
+                try:
+                    resume_session.rollback()
+                except Exception:
+                    pass
+                logger.warning(
+                    "Resume probe unavailable (%s); relying on the marker file",
+                    exc,
                 )
     before_skip = len(archives)
     archives = [a for a in archives if a.name not in already_processed]

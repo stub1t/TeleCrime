@@ -22,25 +22,52 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-DEV="/dev/disk/by-uuid/${LUKS_UUID}"
-if [[ ! -e "$DEV" ]]; then
-    echo "LUKS device $DEV not found — is the USB SSD connected?" >&2
-    exit 1
+# Already mounted: nothing to do. Check this BEFORE the device lookup — after
+# a successful boot mount the by-uuid symlink can disappear while the mapper
+# stays mounted, and this also keeps re-runs from trying to re-open a volume
+# that is already in use.
+if mountpoint -q "$MOUNT_POINT"; then
+    echo "$MOUNT_POINT already mounted."
+    df -h "$MOUNT_POINT"
+    exit 0
 fi
 
-if [[ ! -e "/dev/mapper/${MAPPER_NAME}" ]]; then
+# The volume may already be open under the systemd/udisks2-generated mapper
+# name (luks-<uuid>) instead of the crypttab MAPPER_NAME. Re-running
+# `cryptsetup luksOpen` then fails with "already in use". Find the mapper
+# BEFORE looking for the by-uuid symlink: an open mapper is mountable even if
+# udev has not (re)created the device symlink yet.
+ACTUAL_MAPPER=""
+for name in "$MAPPER_NAME" "luks-${LUKS_UUID}"; do
+    if [[ -e "/dev/mapper/$name" ]]; then
+        ACTUAL_MAPPER="$name"
+        break
+    fi
+done
+
+if [[ -z "$ACTUAL_MAPPER" ]]; then
+    DEV="/dev/disk/by-uuid/${LUKS_UUID}"
+    if [[ ! -e "$DEV" ]]; then
+        echo "LUKS device $DEV not found — is the USB SSD connected?" >&2
+        exit 1
+    fi
     echo "Unlocking LUKS volume..."
     cryptsetup luksOpen "$DEV" "$MAPPER_NAME"
+    ACTUAL_MAPPER="$MAPPER_NAME"
 else
-    echo "LUKS mapper /dev/mapper/${MAPPER_NAME} already open."
+    echo "LUKS mapper /dev/mapper/${ACTUAL_MAPPER} already open."
 fi
 
-if ! mountpoint -q "$MOUNT_POINT"; then
-    mkdir -p "$MOUNT_POINT"
-    mount "/dev/mapper/${MAPPER_NAME}" "$MOUNT_POINT"
-    echo "Mounted /dev/mapper/${MAPPER_NAME} at $MOUNT_POINT"
+mkdir -p "$MOUNT_POINT"
+# Honor the fstab options for this mount point (noatime/nosuid/nodev/
+# errors=remount-ro here) instead of silently mounting with bare defaults.
+# `mount -o nofail` is accepted by util-linux; findmnt is best-effort.
+FSTAB_OPTS="$(findmnt --fstab --target "$MOUNT_POINT" --noheadings --output OPTIONS 2>/dev/null | tr -d ' ' || true)"
+if [[ -n "$FSTAB_OPTS" ]]; then
+    mount -o "$FSTAB_OPTS" "/dev/mapper/${ACTUAL_MAPPER}" "$MOUNT_POINT"
 else
-    echo "$MOUNT_POINT already mounted."
+    mount "/dev/mapper/${ACTUAL_MAPPER}" "$MOUNT_POINT"
 fi
+echo "Mounted /dev/mapper/${ACTUAL_MAPPER} at $MOUNT_POINT"
 
 df -h "$MOUNT_POINT"

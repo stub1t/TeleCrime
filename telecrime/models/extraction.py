@@ -52,6 +52,10 @@ class ExtractionJob(Base, TimestampMixin):
     outputs: Mapped[list["ExtractedOutput"]] = relationship(
         "ExtractedOutput", back_populates="job", cascade="all, delete-orphan"
     )
+    # WARNING: lazy list relationship to parsed_credentials, which can hold
+    # millions of rows per job. Never iterate/len() this on a real job — use
+    # COUNT(*)/DELETE ... WHERE extraction_job_id instead (see cli.reprocess,
+    # finalize._cleanup_extracted_files).
     parsed_credentials: Mapped[list["ParsedCredential"]] = relationship(
         "ParsedCredential", back_populates="extraction_job", cascade="all, delete-orphan"
     )
@@ -86,10 +90,15 @@ class ExtractedOutput(Base, TimestampMixin):
     output_hash: Mapped[str] = mapped_column(String(64), index=True)  # SHA256
 
     # Provenance - which message/conversation this came from
-    source_conversation_id: Mapped[int] = mapped_column(
+    # Both FKs are ON DELETE SET NULL. The nullable=True columns must be typed
+    # Optional or SQLAlchemy 2 / mypy treat them as non-nullable. No index is
+    # declared (web/app.py._ensure_stats_indexes adds one for
+    # source_conversation_id); extracted_outputs is small, so the FK-trigger
+    # scan is not the 353M-row hazard parsed_credentials has.
+    source_conversation_id: Mapped[int | None] = mapped_column(
         ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True
     )
-    source_message_id: Mapped[int] = mapped_column(
+    source_message_id: Mapped[int | None] = mapped_column(
         ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
     )
 

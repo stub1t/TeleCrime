@@ -54,6 +54,11 @@ SNAP=/tmp/telecrime-watchdog-snap.txt   # last observed progress signature
 # (TELECRIME_PIPELINE_STALE_SECONDS) rather than a hardcoded 600.
 STALE_HEARTBEAT_SEC="$(dotenv_value TELECRIME_PIPELINE_STALE_SECONDS)"
 STALE_HEARTBEAT_SEC="${STALE_HEARTBEAT_SEC:-1200}"
+# A non-numeric value would abort the `[ -gt ]` comparison below (and with
+# set -e absent, silently skip the heal), so keep a sane integer.
+case "$STALE_HEARTBEAT_SEC" in
+  ''|*[!0-9]*) STALE_HEARTBEAT_SEC=1200 ;;
+esac
 NO_DB_ACTIVITY_SEC=300       # pipeline must have an active query this often
 HEAL_LOCK=/tmp/telecrime-heal.lock
 
@@ -70,6 +75,12 @@ PIPELINE_PID=0
 if [[ -f "$DATA_DIR/pipeline.pid" ]]; then
   PIPELINE_PID=$(<"$DATA_DIR/pipeline.pid")
 fi
+# A truncated/garbage pid file must read as "no pid": an empty or non-numeric
+# value would otherwise be probed with `kill -0` and treated as a crashed
+# pipeline, force-recreating the worker.
+case "$PIPELINE_PID" in
+  ''|*[!0-9]*) PIPELINE_PID=0 ;;
+esac
 PIPELINE_ALIVE=0
 if [ "$PIPELINE_PID" != "0" ]; then
   WORKER_CONTAINER=$(compose ps -q worker 2>/dev/null)
@@ -92,6 +103,9 @@ except Exception:
     print(9999)
 " 2>/dev/null || echo 9999)
 fi
+case "$HEARTBEAT_AGE" in
+  ''|*[!0-9]*) HEARTBEAT_AGE=9999 ;;
+esac
 
 # --- 3. Progress signature (counters + current archive + download) --------
 # The heartbeat can stay fresh while the main loop is deadlocked, so we also
@@ -126,6 +140,11 @@ if [ -n "$SIG" ] && [ -f "$SNAP" ]; then
   PREV_SIG=$(sed -n '1p' "$SNAP")
   PREV_TS=$(sed -n '2p' "$SNAP")
   PREV_TS=${PREV_TS:-0}
+  # Arithmetic with a non-numeric value under `set -u` aborts the whole
+  # watchdog ("unbound variable"), including drive recovery below.
+  case "$PREV_TS" in
+    ''|*[!0-9]*) PREV_TS=0 ;;
+  esac
   # Two-consecutive-identical-signatures must be observed at least 9 minutes
   # apart. The cron watchdog (10-min) and the monitor loop (5-min) interleave,
   # so consecutive *invocations* can be ~2 seconds apart — without the time
@@ -209,9 +228,18 @@ DB_Q=$(timeout 20 docker compose -f "$COMPOSE_FILE" exec -T db psql -U telecrime
       )
     )
 " 2>/dev/null | tr -d ' ')
-if [ -n "$DB_Q" ] && [ "$DB_Q" != "9999" ] && [ "$DB_Q" -lt "$NO_DB_ACTIVITY_SEC" ]; then
-  DB_ACTIVE=1
-fi
+# Only a plain integer below the threshold counts as activity. Anything else
+# (psql error text on stdout, partial output) must not be coerced by `[ -lt ]`
+# — that used to yield DB_ACTIVE=0 and could heal a healthy pipeline.
+case "$DB_Q" in
+  ''|*[!0-9]*) ;;
+  9999) ;;
+  *)
+    if [ "$DB_Q" -lt "$NO_DB_ACTIVITY_SEC" ]; then
+      DB_ACTIVE=1
+    fi
+    ;;
+esac
 
 log "check: pipeline_pid=$PIPELINE_PID alive=$PIPELINE_ALIVE heartbeat_age=${HEARTBEAT_AGE}s db_active=$DB_ACTIVE dl_active=$DL_ACTIVE frozen=$FROZEN sig=$SIG"
 
@@ -349,6 +377,11 @@ for svc in db web worker; do
     NOW_TS=$(date +%s)
     PREV_TS=0
     [ -f "$LAST" ] && PREV_TS=$(cat "$LAST")
+    # Non-numeric marker (partial/truncated write) would abort the whole
+    # script in the arithmetic below under `set -u`.
+    case "$PREV_TS" in
+      ''|*[!0-9]*) PREV_TS=0 ;;
+    esac
     if [ $((NOW_TS - PREV_TS)) -lt 1800 ]; then
       log "HEAL skipped: '$svc' still unhealthy, last heal $((NOW_TS - PREV_TS))s ago (cooldown 30m)"
       continue

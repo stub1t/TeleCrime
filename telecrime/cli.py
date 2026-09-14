@@ -31,6 +31,104 @@ def get_config_and_engine(config_path: Path | None = None):
     return config, engine
 
 
+def _set_pg_statement_timeout(session, seconds: float) -> bool:
+    """Cap statement runtime on PostgreSQL so analytics cannot hang.
+
+    Uses SET LOCAL, so the cap disappears when the session's transaction ends
+    and can never leak onto a pooled connection. No-op for non-PostgreSQL
+    engines (SQLite fixtures) and mocked sessions.
+    """
+    try:
+        bind = session.get_bind()
+        if getattr(bind.dialect, "name", None) != "postgresql":
+            return False
+        from sqlalchemy import text
+
+        session.execute(text(f"SET LOCAL statement_timeout = '{int(seconds * 1000)}'"))
+        return True
+    except Exception:
+        return False
+
+
+def _pg_row_estimate(session, table_name: str) -> int | None:
+    """Instant pg_class.reltuples estimate; None when PostgreSQL is unavailable.
+
+    parsed_credentials has ~353M rows, where a real COUNT(*) is a multi-minute
+    seq scan competing with bulk INSERT I/O. reltuples is exact enough for
+    display tiles.
+    """
+    try:
+        bind = session.get_bind()
+        if getattr(bind.dialect, "name", None) != "postgresql":
+            return None
+        from sqlalchemy import text
+
+        row = session.execute(
+            text("SELECT reltuples::bigint FROM pg_class WHERE relname = :t"),
+            {"t": table_name},
+        ).scalar_one_or_none()
+    except Exception:
+        return None
+    if row is None or row < 0:
+        return None
+    return int(row)
+
+
+def _fast_count(session, model) -> tuple[int, bool]:
+    """Return (count, estimated) for a whole table.
+
+    Big PostgreSQL tables use the instant reltuples estimate; everything else
+    (SQLite fixtures, tiny tables, unknown relations) falls back to COUNT(*).
+    """
+    estimate = _pg_row_estimate(session, model.__tablename__)
+    if estimate is not None:
+        return estimate, True
+    return int(session.query(model).count()), False
+
+
+def _bounded_rows(session, query, *, timeout_seconds: float = 30.0):
+    """Run query.all() under a PG statement timeout; None when it times out."""
+    _set_pg_statement_timeout(session, timeout_seconds)
+    try:
+        return query.all()
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        return None
+
+
+def _bounded_distinct_count(
+    session, column, *, cap: int = 100_000, timeout_seconds: float = 30.0
+) -> int | None:
+    """COUNT(DISTINCT column) bounded by a row cap and a statement timeout.
+
+    Both stop conditions matter on parsed_credentials: exact distinct counts
+    over hundreds of millions of rows are not worth a five-minute table scan.
+    Returns None when the statement timed out.
+    """
+    from sqlalchemy import func
+
+    _set_pg_statement_timeout(session, timeout_seconds)
+    try:
+        inner = (
+            session.query(column)
+            .filter(column.isnot(None))
+            .distinct()
+            .limit(cap)
+            .subquery()
+        )
+        value = session.query(func.count()).select_from(inner).scalar()
+        return int(value) if value is not None else 0
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        return None
+
+
 @app.callback()
 def main(
     version: bool = typer.Option(False, "--version", "-v", help="Show version and exit"),
@@ -679,25 +777,35 @@ def status(
     )
 
     with get_session(engine) as session:
+        # Read-only counters: cap each statement so a missing index can't
+        # leave the CLI hanging on a huge table.
+        _set_pg_statement_timeout(session, 30)
+
         table = Table(title="Telecrime Status")
         table.add_column("Entity", style="cyan")
         table.add_column("Count", justify="right", style="green")
 
+        # Large tables (messages/attachments/artifacts/jobs/outputs) come from
+        # the instant reltuples estimate; COUNT(*) on them is a multi-minute
+        # seq scan on production data.
+        def _row(label: str, model, *, exact: bool = False) -> None:
+            if exact:
+                table.add_row(label, f"{int(session.query(model).count()):,}")
+                return
+            count, estimated = _fast_count(session, model)
+            table.add_row(label, f"{count:,}" + (" (est.)" if estimated else ""))
+
         table.add_row("Conversations", str(session.query(Conversation).count()))
-        table.add_row("Messages", str(session.query(Message).count()))
-        table.add_row("File Attachments", str(session.query(FileAttachment).count()))
+        _row("Messages", Message)
+        _row("File Attachments", FileAttachment)
         table.add_row(
             "Archive Candidates",
-            str(
-                session.query(FileAttachment)
-                .filter(FileAttachment.is_archive_candidate == True)
-                .count()
-            ),
+            f"{session.query(FileAttachment).filter(FileAttachment.is_archive_candidate == True).count():,}",
         )
-        table.add_row("Download Artifacts", str(session.query(DownloadArtifact).count()))
-        table.add_row("Archive Groups", str(session.query(ArchiveGroup).count()))
-        table.add_row("Extraction Jobs", str(session.query(ExtractionJob).count()))
-        table.add_row("Extracted Outputs", str(session.query(ExtractedOutput).count()))
+        _row("Download Artifacts", DownloadArtifact)
+        _row("Archive Groups", ArchiveGroup, exact=True)
+        _row("Extraction Jobs", ExtractionJob)
+        _row("Extracted Outputs", ExtractedOutput)
 
         console.print(table)
 
@@ -726,6 +834,10 @@ def diagnostics(
     _config, engine = get_config_and_engine(config_path)
 
     with get_session(engine) as session:
+        # Every statement below is a read-only diagnostic: cap each one so a
+        # cold cache or missing index can't leave the CLI hanging.
+        _set_pg_statement_timeout(session, 30)
+
         backlog = Table(title="Pipeline Diagnostics")
         backlog.add_column("Metric", style="cyan")
         backlog.add_column("Value", justify="right", style="green")
@@ -756,7 +868,11 @@ def diagnostics(
             "Pending extraction jobs",
             f"{session.query(ExtractionJob).filter(ExtractionJob.status == ExtractionStatus.PENDING).count():,}",
         )
-        backlog.add_row("Parsed credentials", f"{session.query(ParsedCredential).count():,}")
+        _creds_count, _creds_estimated = _fast_count(session, ParsedCredential)
+        backlog.add_row(
+            "Parsed credentials",
+            f"{_creds_count:,}" + (" (est.)" if _creds_estimated else ""),
+        )
         console.print(backlog)
 
         failure_table = Table(title="Failure Summary")
@@ -856,7 +972,9 @@ def retry(
     terminal: bool = typer.Option(False, "--terminal", help="Include terminal failures too"),
 ) -> None:
     """Retry failed jobs."""
-    from telecrime.models import DownloadArtifact, ExtractionJob
+    from sqlalchemy import select, update
+
+    from telecrime.models import ArchiveGroup, DownloadArtifact, ExtractionJob
     from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
 
     _, engine = get_config_and_engine(config_path)
@@ -865,44 +983,60 @@ def retry(
         reset_count = 0
 
         if downloads or (not downloads and not extractions):
-            # Reset failed downloads to pending
+            # Reset failed downloads to pending with one bulk UPDATE. The old
+            # ORM loop materialized every failed row (potentially millions)
+            # and issued one UPDATE per object.
             statuses = [DownloadStatus.FAILED]
             if terminal:
                 statuses.append(DownloadStatus.FAILED_TERMINAL)
-            failed_downloads = session.query(DownloadArtifact).filter(
-                DownloadArtifact.status.in_(statuses)
-            )
-
+            download_filter = [DownloadArtifact.status.in_(statuses)]
             if job_id:
-                failed_downloads = failed_downloads.filter(DownloadArtifact.id == job_id)
+                download_filter.append(DownloadArtifact.id == job_id)
 
-            for artifact in failed_downloads.all():
-                artifact.status = DownloadStatus.PENDING
-                artifact.error_message = None
-                reset_count += 1
+            result = session.execute(
+                update(DownloadArtifact)
+                .where(*download_filter)
+                .values(status=DownloadStatus.PENDING, error_message=None),
+                execution_options={"synchronize_session": False},
+            )
+            reset_count += int(result.rowcount or 0)
 
         if extractions or (not downloads and not extractions):
             # Reset failed extractions
             extraction_statuses = [ExtractionStatus.FAILED, ExtractionStatus.PASSWORD_NEEDED]
             if terminal:
                 extraction_statuses.append(ExtractionStatus.FAILED_TERMINAL)
-            failed_jobs = session.query(ExtractionJob).filter(
-                ExtractionJob.status.in_(extraction_statuses)
+            job_filter = [ExtractionJob.status.in_(extraction_statuses)]
+            if job_id:
+                job_filter.append(ExtractionJob.id == job_id)
+
+            # Reset the owning groups first: the subquery must still see the
+            # jobs in their failed state, and the old per-job lazy `job.group`
+            # access issued one SELECT per failed job (N+1).
+            session.execute(
+                update(ArchiveGroup)
+                .where(
+                    ArchiveGroup.id.in_(
+                        select(ExtractionJob.group_id)
+                        .where(*job_filter)
+                        .where(ExtractionJob.group_id.isnot(None))
+                    )
+                )
+                .values(status=GroupStatus.READY),
+                execution_options={"synchronize_session": False},
             )
 
-            if job_id:
-                failed_jobs = failed_jobs.filter(ExtractionJob.id == job_id)
-
-            for job in failed_jobs.all():
-                job.status = ExtractionStatus.PENDING
-                job.last_error_code = None
-                job.last_error_message = None
-
-                # Reset group status too
-                if job.group:
-                    job.group.status = GroupStatus.READY
-
-                reset_count += 1
+            result = session.execute(
+                update(ExtractionJob)
+                .where(*job_filter)
+                .values(
+                    status=ExtractionStatus.PENDING,
+                    last_error_code=None,
+                    last_error_message=None,
+                ),
+                execution_options={"synchronize_session": False},
+            )
+            reset_count += int(result.rowcount or 0)
 
         session.commit()
         console.print(f"[green]Reset {reset_count} jobs for retry[/green]")
@@ -1005,7 +1139,12 @@ def reprocess(
     stage: str = typer.Option("parse", "--stage", help="Stage to reset: parse or extract"),
 ) -> None:
     """Reset a specific archive group back to a pipeline stage."""
-    from telecrime.models import ArchiveGroup, ExtractedOutput, ParsedCredential
+    from telecrime.models import (
+        ArchiveGroup,
+        ExtractedOutput,
+        ExtractionJob,
+        ParsedCredential,
+    )
     from telecrime.states import ExtractionStatus, GroupStatus
 
     if not group_id and not archive_name:
@@ -1035,33 +1174,42 @@ def reprocess(
 
         for group in groups:
             jobs = list(group.extraction_jobs)
+            job_ids = [job.id for job in jobs]
+            # One IN-list DELETE per table per group instead of one DELETE
+            # statement per extraction job.
+            if job_ids:
+                deleted_credentials += (
+                    session.query(ParsedCredential)
+                    .filter(ParsedCredential.extraction_job_id.in_(job_ids))
+                    .delete(synchronize_session=False)
+                )
+
             if stage == "parse":
-                for job in jobs:
-                    deleted_credentials += (
-                        session.query(ParsedCredential)
-                        .filter(ParsedCredential.extraction_job_id == job.id)
-                        .delete(synchronize_session=False)
-                    )
                 group.status = GroupStatus.EXTRACTED
             else:
-                for job in jobs:
-                    deleted_credentials += (
-                        session.query(ParsedCredential)
-                        .filter(ParsedCredential.extraction_job_id == job.id)
-                        .delete(synchronize_session=False)
-                    )
+                if job_ids:
                     deleted_outputs += (
                         session.query(ExtractedOutput)
-                        .filter(ExtractedOutput.job_id == job.id)
+                        .filter(ExtractedOutput.job_id.in_(job_ids))
                         .delete(synchronize_session=False)
                     )
-                    job.status = ExtractionStatus.PENDING
-                    job.last_error_code = None
-                    job.last_error_message = None
-                    job.used_password_id = None
-                    job.password_attempts = 0
+                    session.query(ExtractionJob).filter(
+                        ExtractionJob.id.in_(job_ids)
+                    ).update(
+                        {
+                            ExtractionJob.status: ExtractionStatus.PENDING,
+                            ExtractionJob.last_error_code: None,
+                            ExtractionJob.last_error_message: None,
+                            ExtractionJob.used_password_id: None,
+                            ExtractionJob.password_attempts: 0,
+                        },
+                        synchronize_session=False,
+                    )
                 group.status = GroupStatus.READY
 
+            # The group's credentials were just deleted; the denormalized
+            # count would otherwise stay stale in the web UI until re-finalize.
+            group.credential_count = 0
             reset_groups += 1
 
         session.commit()
@@ -1110,57 +1258,73 @@ def creds(
     _, engine = get_config_and_engine(config_path)
 
     with get_session(engine) as session:
-        total = session.query(ParsedCredential).count()
-
-        if total == 0:
+        # Existence probe (LIMIT 1 on the pkey) instead of COUNT(*) so the
+        # empty check stays instant on 353M rows.
+        if session.query(ParsedCredential.id).limit(1).first() is None:
             console.print("[yellow]No credentials in database[/yellow]")
             console.print("Run the pipeline or use process_folder.py to extract credentials")
             raise typer.Exit()
 
-        unique_domains = session.query(func.count(func.distinct(ParsedCredential.domain))).scalar()
-        unique_users = session.query(func.count(func.distinct(ParsedCredential.username))).scalar()
+        total, total_estimated = _fast_count(session, ParsedCredential)
+        unique_domains = _bounded_distinct_count(session, ParsedCredential.domain)
+        unique_users = _bounded_distinct_count(session, ParsedCredential.username)
 
         table = Table(title="Credential Statistics")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", justify="right", style="green")
 
-        table.add_row("Total Credentials", f"{total:,}")
-        table.add_row("Unique Domains", f"{unique_domains:,}")
-        table.add_row("Unique Usernames", f"{unique_users:,}")
+        table.add_row(
+            "Total Credentials", f"{total:,}" + (" (est.)" if total_estimated else "")
+        )
+        table.add_row(
+            "Unique Domains",
+            f"{unique_domains:,}" if unique_domains is not None else "n/a (timed out)",
+        )
+        table.add_row(
+            "Unique Usernames",
+            f"{unique_users:,}" if unique_users is not None else "n/a (timed out)",
+        )
 
         console.print(table)
 
-        # Top domains
+        # Top domains — a full GROUP BY over parsed_credentials; cap it so the
+        # command degrades to "unavailable" instead of a multi-minute scan.
         console.print("\n[bold]Top 15 Domains:[/bold]")
-        top_domains = (
-            session.query(ParsedCredential.domain, func.count(ParsedCredential.id).label("count"))
+        top_domains = _bounded_rows(
+            session,
+            session.query(
+                ParsedCredential.domain, func.count(ParsedCredential.id).label("count")
+            )
             .group_by(ParsedCredential.domain)
             .order_by(func.count(ParsedCredential.id).desc())
-            .limit(15)
-            .all()
+            .limit(15),
         )
 
         domain_table = Table()
         domain_table.add_column("Domain", style="cyan")
         domain_table.add_column("Count", justify="right", style="green")
 
-        for domain, count in top_domains:
-            domain_table.add_row(domain or "(empty)", f"{count:,}")
-
-        console.print(domain_table)
+        if top_domains is None:
+            console.print("[yellow]Top domains unavailable (query exceeded 30s)[/yellow]")
+        else:
+            for domain, count in top_domains:
+                domain_table.add_row(domain or "(empty)", f"{count:,}")
+            console.print(domain_table)
 
         # Stealer types
         console.print("\n[bold]Stealer Types:[/bold]")
-        types = (
+        types = _bounded_rows(
+            session,
             session.query(
                 ParsedCredential.stealer_type, func.count(ParsedCredential.id).label("count")
-            )
-            .group_by(ParsedCredential.stealer_type)
-            .all()
+            ).group_by(ParsedCredential.stealer_type),
         )
 
-        for stype, count in types:
-            console.print(f"  {stype or 'unknown'}: {count:,}")
+        if types is None:
+            console.print("[yellow]Stealer breakdown unavailable (query exceeded 30s)[/yellow]")
+        else:
+            for stype, count in types:
+                console.print(f"  {stype or 'unknown'}: {count:,}")
 
 
 @app.command()
@@ -1241,6 +1405,13 @@ def search(
                     total = 0
                     results = []
             except Exception:
+                # A timed-out/failed FTS statement leaves the transaction
+                # aborted; without the rollback the ILIKE fallback below dies
+                # immediately with InFailedSqlTransaction.
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
                 has_fts = False  # fall through to ILIKE
 
         if not has_fts:
@@ -1264,17 +1435,31 @@ def search(
                     q = q.filter(ParsedCredential.email_domain.ilike(f"%{email_domain}%"))
                 if source:
                     q = q.filter(ParsedCredential.source_archive.ilike(f"%{source}%"))
-                total = q.count()
+                # Bound the fallback scan (no trigram indexes on production):
+                # a common token over 353M rows would otherwise run for
+                # minutes. The timeout applies to the statements below.
+                _set_pg_statement_timeout(session, 30)
                 results = soft_dedupe_credentials(q.limit(limit * 5).all(), limit=limit)
             except Exception as exc:
-                # Never hang the CLI on an unbounded ILIKE count over 319M
-                # rows (the FTS fallback path has no 30s statement_timeout).
+                # Never hang the CLI on an unbounded ILIKE scan over 353M
+                # rows; surface the failure instead.
                 try:
                     session.rollback()
                 except Exception:
                     pass
                 console.print(f"[yellow]Search failed: {exc}[/yellow]")
                 return
+
+            # An exact match count is best-effort: a timeout must not discard
+            # the rows already fetched above.
+            try:
+                total = q.count()
+            except Exception:
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                total = len(results)
 
         if not results:
             console.print(f"[yellow]No results for '{query}'[/yellow]")
@@ -1343,8 +1528,12 @@ def domains(
 
         q = q.order_by(func.count(ParsedCredential.id).desc()).limit(limit)
 
-        results = q.all()
+        # Full GROUP BY over parsed_credentials — bounded by a 30s timeout.
+        results = _bounded_rows(session, q)
 
+        if results is None:
+            console.print("[yellow]Domain aggregation timed out (30s)[/yellow]")
+            raise typer.Exit(1)
         if not results:
             console.print("[yellow]No domains found[/yellow]")
             raise typer.Exit()
@@ -1384,24 +1573,29 @@ def stats_stealers(
     _, engine = get_config_and_engine(config_path)
 
     with get_session(engine) as session:
-        total = session.query(ParsedCredential).count()
-
-        if total == 0:
+        # Existence probe instead of an unbounded COUNT(*) on 353M rows.
+        if session.query(ParsedCredential.id).limit(1).first() is None:
             console.print("[yellow]No credentials in database[/yellow]")
             raise typer.Exit()
 
+        total, total_estimated = _fast_count(session, ParsedCredential)
+
         # Basic stealer breakdown
         console.print("\n[bold]Stealer Type Distribution:[/bold]")
-        stealer_stats = (
+        stealer_stats = _bounded_rows(
+            session,
             session.query(
                 ParsedCredential.stealer_type,
                 func.count(ParsedCredential.id).label("count"),
                 func.count(func.distinct(ParsedCredential.domain)).label("unique_domains"),
             )
             .group_by(ParsedCredential.stealer_type)
-            .order_by(func.count(ParsedCredential.id).desc())
-            .all()
+            .order_by(func.count(ParsedCredential.id).desc()),
         )
+
+        if stealer_stats is None:
+            console.print("[yellow]Stealer stats unavailable (query exceeded 30s)[/yellow]")
+            stealer_stats = []
 
         table = Table()
         table.add_column("Stealer Type", style="cyan")
@@ -1410,7 +1604,7 @@ def stats_stealers(
         table.add_column("Unique Domains", justify="right", style="blue")
 
         for stype, count, domains in stealer_stats:
-            pct = (count / total) * 100
+            pct = (count / total) * 100 if total else 0.0
             table.add_row(
                 stype or "(unknown)",
                 f"{count:,}",
@@ -1419,6 +1613,8 @@ def stats_stealers(
             )
 
         console.print(table)
+        if total_estimated:
+            console.print("[dim]Totals are reltuples estimates[/dim]")
 
         # Top domains per stealer
         if top_domains:
@@ -1427,16 +1623,20 @@ def stats_stealers(
                 if stype is None:
                     continue
                 console.print(f"\n[cyan]{stype}:[/cyan]")
-                domains = (
+                domains = _bounded_rows(
+                    session,
                     session.query(
                         ParsedCredential.domain, func.count(ParsedCredential.id).label("count")
                     )
                     .filter(ParsedCredential.stealer_type == stype)
                     .group_by(ParsedCredential.domain)
                     .order_by(func.count(ParsedCredential.id).desc())
-                    .limit(top_domains)
-                    .all()
+                    .limit(top_domains),
                 )
+
+                if domains is None:
+                    console.print("  [yellow]unavailable (query exceeded 30s)[/yellow]")
+                    continue
 
                 for domain, count in domains:
                     console.print(f"  {domain or '(empty)'}: {count:,}")
@@ -1444,7 +1644,8 @@ def stats_stealers(
         # Distribution by channel
         if by_channel:
             console.print("\n[bold]Stealer Distribution by Source Channel:[/bold]")
-            channel_stats = (
+            channel_stats = _bounded_rows(
+                session,
                 session.query(
                     Conversation.title,
                     ParsedCredential.stealer_type,
@@ -1452,11 +1653,14 @@ def stats_stealers(
                 )
                 .join(ParsedCredential.source_conversation)
                 .group_by(Conversation.title, ParsedCredential.stealer_type)
-                .order_by(Conversation.title, func.count(ParsedCredential.id).desc())
-                .all()
+                .order_by(Conversation.title, func.count(ParsedCredential.id).desc()),
             )
 
-            if channel_stats:
+            if channel_stats is None:
+                console.print(
+                    "[yellow]Channel breakdown unavailable (query exceeded 30s)[/yellow]"
+                )
+            elif channel_stats:
                 table = Table()
                 table.add_column("Channel", style="cyan", max_width=40)
                 table.add_column("Stealer", style="magenta")
@@ -1476,7 +1680,8 @@ def stats_stealers(
         if timeline:
             console.print("\n[bold]Monthly Credential Timeline:[/bold]")
             _month_expr = func.to_char(ParsedCredential.created_at, "YYYY-MM")
-            monthly = (
+            monthly = _bounded_rows(
+                session,
                 session.query(
                     _month_expr.label("month"),
                     ParsedCredential.stealer_type,
@@ -1484,11 +1689,12 @@ def stats_stealers(
                 )
                 .group_by(_month_expr, ParsedCredential.stealer_type)
                 .order_by(_month_expr.desc())
-                .limit(100)
-                .all()
+                .limit(100),
             )
 
-            if monthly:
+            if monthly is None:
+                console.print("[yellow]Timeline unavailable (query exceeded 30s)[/yellow]")
+            elif monthly:
                 # Pivot data by month
                 months_data: dict[str, dict[str, int]] = {}
                 stealers_seen: set[str] = set()
@@ -1551,13 +1757,13 @@ def export(
         if limit:
             q = q.limit(limit)
 
-        total = q.count()
-
-        if total == 0:
+        # Cheap existence probe (LIMIT 1). The old COUNT(*) scanned every
+        # matching row on 353M-row tables before the export re-read them all.
+        if q.limit(1).first() is None:
             console.print("[yellow]No matching credentials to export[/yellow]")
             raise typer.Exit()
 
-        console.print(f"Exporting {total:,} credentials to {output}...")
+        console.print(f"Exporting credentials to {output}...")
 
         fieldnames = [
             "url",
@@ -1571,6 +1777,7 @@ def export(
             "stealer_type",
         ]
 
+        exported = 0
         with open(output, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -1589,8 +1796,9 @@ def export(
                         "stealer_type": cred.stealer_type,
                     }
                 )
+                exported += 1
 
-        console.print(f"[green]Exported {total:,} credentials to {output}[/green]")
+        console.print(f"[green]Exported {exported:,} credentials to {output}[/green]")
 
 
 @app.command()

@@ -76,6 +76,24 @@ class TestDownloadArtifact:
         assert artifact.status == DownloadStatus.COMPLETED
 
 
+class TestExtractedOutput:
+    def test_source_provenance_is_nullable(self, session):
+        """source_conversation_id/source_message_id are nullable FK SET NULL."""
+        from telecrime.models import ExtractedOutput
+
+        output = ExtractedOutput(
+            job_id=1,
+            output_path="/tmp/Passwords.txt",
+            output_filename="Passwords.txt",
+            output_hash="deadbeef" * 8,
+        )
+        session.add(output)
+        session.commit()
+
+        assert output.source_conversation_id is None
+        assert output.source_message_id is None
+
+
 class TestPasswordCandidate:
     def test_password_scopes(self, session):
         """Test different password scopes."""

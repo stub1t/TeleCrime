@@ -21,10 +21,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import fcntl
 import json
 import logging
 import os
 import shutil
+import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -35,22 +38,6 @@ LOGGER_NAME = "tg_command_bridge"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(LOGGER_NAME)
-
-# Also log to the repo data dir so commands are inspectable next to the
-# pipeline logs, not only in the systemd journal.
-try:
-    _data_dir = Path(
-        os.environ.get("TELECRIME_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data"))
-    )
-    _data_dir.mkdir(parents=True, exist_ok=True)
-    _log_path = _data_dir / "tg_bridge.log"
-    _fh = logging.FileHandler(_log_path)
-    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(_fh)
-except Exception:
-    pass
-
-_REPLY_LIMIT = 4000
 
 
 def _load_env() -> None:
@@ -66,11 +53,125 @@ def _load_env() -> None:
         os.environ.setdefault(key.strip(), value.strip())
 
 
+# Must run before the file handler below so TELECRIME_DATA_DIR from .env is
+# honored; main() calls it again for prompt-session env (idempotent).
+_load_env()
+
+# Also log to the configured data dir so commands are inspectable next to the
+# pipeline logs, not only in the systemd journal.
+try:
+    _data_dir = Path(os.environ.get("TELECRIME_DATA_DIR", str(REPO_DIR / "data")))
+    _data_dir.mkdir(parents=True, exist_ok=True)
+    _log_path = _data_dir / "tg_bridge.log"
+    _fh = logging.FileHandler(_log_path)
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_fh)
+except Exception:
+    pass
+
+_REPLY_LIMIT = 4000
+
+
+def _copy_session(live_path: Path, session_path: Path) -> None:
+    """Snapshot the live session without tearing it.
+
+    The pipeline container may be writing the session's SQLite file at any
+    moment; a byte-for-byte copy can capture a torn database. sqlite3's online
+    backup API reads a consistent snapshot under concurrent writers. Fall back
+    to a plain copy for non-SQLite/older files or if the backup fails.
+    """
+    try:
+        src = sqlite3.connect(f"file:{live_path}?mode=ro", uri=True, timeout=10)
+        try:
+            src.execute("PRAGMA busy_timeout=10000")
+            dst = sqlite3.connect(str(session_path), timeout=10)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        return
+    except Exception:
+        logger.warning("SQLite backup of %s failed; falling back to copy", live_path, exc_info=True)
+    shutil.copy2(live_path, session_path)
+
+
 async def _ensure_session_copy(session_path: Path, live_path: Path) -> None:
     """Copy the live session once so we never lock the container's file."""
     if not session_path.exists() and live_path.exists():
-        shutil.copy2(live_path, session_path)
+        await asyncio.to_thread(_copy_session, live_path, session_path)
         logger.info("Created bridge session copy from %s", live_path)
+
+
+def _acquire_instance_lock(data_dir: Path):
+    """Refuse to start a second bridge.
+
+    Two instances would share the session copy and both answer commands
+    (Telethon's SQLite file also only tolerates one writer per process).
+    """
+    lock_path = data_dir / "tg_bridge.lock"
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise SystemExit(f"another tg_command_bridge instance is already running ({lock_path})")
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+def _write_state(path: Path, state: dict) -> None:
+    """Atomically persist bridge state (a torn file would replay commands)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, path)
+
+
+async def _collect_messages(client, entity, min_id: int, cap: int = 1000) -> list:
+    """Collect up to `cap` messages newer than min_id (newest first)."""
+    msgs: list = []
+    async for msg in client.iter_messages(entity, limit=cap, min_id=min_id):
+        msgs.append(msg)
+        if len(msgs) >= cap:
+            break
+    return msgs
+
+
+async def _run_tg(adapter, operation: str, factory, *, timeout: float = 60.0, attempts: int = 2):
+    """Run one bounded Telegram operation with the adapter's reconnect logic.
+
+    The adapter is built with auto_reconnect=False, so a dropped connection
+    stays dead until _ensure_connected() is called. The bridge used to retry
+    the RAW client forever (observed: 20+ hours of "Cannot send requests while
+    disconnected"), so every call now goes through the adapter's bounded
+    reconnect path and each request has its own wall-clock budget.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            await adapter._ensure_connected(timeout=60, reason=operation)
+            # Resolve the client AFTER the reconnect: _ensure_connected builds
+            # a fresh TelegramClient, so a reference captured earlier would be
+            # a disconnected stale object.
+            client = adapter.client
+            assert client is not None
+            return await asyncio.wait_for(factory(client), timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError as exc:
+            adapter._connection_suspect = True
+            last_exc = exc
+        except Exception as exc:
+            if not adapter._is_retryable_connection_error(exc):
+                raise
+            adapter._connection_suspect = True
+            last_exc = exc
+        if attempt + 1 < attempts:
+            logger.warning("%s failed; reconnecting (attempt %d/%d): %r", operation, attempt + 1, attempts, last_exc)
+    assert last_exc is not None
+    raise last_exc
 
 
 async def _run_opencode(
@@ -106,14 +207,24 @@ async def _run_opencode(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # Own session so a timeout can reap the whole tree: opencode may
+            # spawn helper processes that otherwise survive, keep the session
+            # locked, and block later --continue runs.
+            start_new_session=True,
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
         except TimeoutError:
-            proc.kill()
             try:
-                out, _ = await proc.communicate()
-            except Exception:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            except TimeoutError:
                 out = b""
             return (
                 f"opencode run timed out after {timeout_seconds // 60} min:\n"
@@ -184,6 +295,8 @@ async def main() -> None:
     session_path = data_dir / "telecrime_bridge.session"
     live_path = data_dir / f"{config.telegram.session_name}.session"
     state_path = data_dir / "tg_bridge_state.json"
+    instance_lock = _acquire_instance_lock(data_dir)
+    assert instance_lock is not None
     await _ensure_session_copy(session_path, live_path)
 
     # Point the adapter at the bridge copy.
@@ -196,14 +309,12 @@ async def main() -> None:
     adapter = TelegramAdapter(bridge_config)
 
     await adapter.connect(timeout=60)
-    client = adapter.client
-    assert client is not None
     # get_me outside the loop's try: a transient network/auth failure at
     # startup must not kill the bridge permanently (no supervisor restarts it).
     me = None
     for _attempt in range(3):
         try:
-            me = await client.get_me()
+            me = await _run_tg(adapter, "get_me", lambda c: c.get_me(), timeout=60)
             break
         except Exception as exc:
             logger.warning("get_me failed (attempt %d/3): %s", _attempt + 1, exc)
@@ -212,15 +323,26 @@ async def main() -> None:
         raise ConnectionError("Could not reach Telegram after 3 attempts")
     logger.info("Bridge connected as %s (id=%s)", me.first_name, me.id)
 
-    state = {}
+    state: dict = {}
+    state_ok = True
     if state_path.exists():
         try:
             state = json.loads(state_path.read_text())
+            if not isinstance(state, dict):
+                raise ValueError("state must be a JSON object")
         except Exception:
+            logger.warning("bridge state %s is unreadable; skipping backlog instead of replaying it", state_path)
             state = {}
+            state_ok = False
+    else:
+        state_ok = False
     last_seen_id = state.get("last_seen_id", 0)
+    if not isinstance(last_seen_id, int) or last_seen_id < 0:
+        last_seen_id = 0
+        state_ok = False
 
     busy_until = 0.0
+    backoff = args.poll
     while True:
         try:
             # Paginate: iter_messages(limit=10) drops older unread messages
@@ -230,14 +352,21 @@ async def main() -> None:
             # between polls still dropped the oldest (incl. commands). Raise
             # the ceiling high enough to be effectively unbounded for a
             # human-scale Saved Messages backlog while keeping a safety cap.
-            new_msgs: list = []
-            async for page in client.iter_messages(me, limit=1000, min_id=last_seen_id):
-                new_msgs.append(page)
-                if len(new_msgs) >= 1000:
-                    break
+            new_msgs = await _run_tg(
+                adapter,
+                "fetch messages",
+                lambda c: _collect_messages(c, me, last_seen_id),
+                timeout=180,
+            )
             new_msgs.reverse()
             for msg in new_msgs:
                 last_seen_id = max(last_seen_id, msg.id)
+                if not state_ok:
+                    # Lost/corrupt state file: mark the current backlog as
+                    # seen WITHOUT executing it. Replaying historical !oc
+                    # commands after a crash is more dangerous than missing
+                    # them, and state_ok flips once the baseline is saved.
+                    continue
                 text = msg.text or ""
                 if not text.startswith(args.prefix):
                     continue
@@ -246,11 +375,18 @@ async def main() -> None:
                     continue
                 logger.info("Command from msg %d: %s", msg.id, prompt[:80])
                 if time.monotonic() < busy_until:
-                    await client.send_message(
-                        me,
-                        f"⏳ Busy — another command is still running. "
-                        f"Your command was ignored: {prompt[:100]}",
-                    )
+                    try:
+                        await _run_tg(
+                            adapter,
+                            "send busy reply",
+                            lambda c: c.send_message(
+                                me,
+                                f"⏳ Busy — another command is still running. "
+                                f"Your command was ignored: {prompt[:100]}",
+                            ),
+                        )
+                    except Exception:
+                        logger.exception("Failed to send busy reply")
                     continue
                 busy_until = time.monotonic() + args.timeout_min * 60 + 60
                 try:
@@ -261,20 +397,30 @@ async def main() -> None:
                     logger.exception("opencode run crashed")
                     reply = f"✘ bridge error: {exc}"
                 try:
-                    await client.send_message(me, reply)
+                    await _run_tg(
+                        adapter,
+                        "send reply",
+                        lambda c: c.send_message(me, reply),
+                        timeout=60,
+                    )
                 except Exception:
                     logger.exception("Failed to send reply")
                 busy_until = 0.0
             state["last_seen_id"] = last_seen_id
             try:
-                state_path.write_text(json.dumps(state))
+                _write_state(state_path, state)
+                state_ok = True
             except Exception:
-                pass
+                logger.exception("Failed to persist bridge state to %s", state_path)
+            backoff = args.poll
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.error("poll error: %r", exc)
-        await asyncio.sleep(args.poll)
+            # Capped exponential backoff: an outage must not hammer Telegram
+            # every 3 s, but recovery is still attempted on each iteration.
+            backoff = min(max(backoff * 2, args.poll), 60.0)
+        await asyncio.sleep(backoff)
 
 
 if __name__ == "__main__":

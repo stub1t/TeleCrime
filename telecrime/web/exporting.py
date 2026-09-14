@@ -1,8 +1,17 @@
 """Export and serialization helpers for the web dashboard."""
 
+import csv
+import io
 import re
+from collections.abc import Iterable
 from datetime import datetime
 from html import unescape
+
+# Characters openpyxl (and Excel) reject outright: C0 controls except TAB,
+# LF and CR. NUL also truncates CSV fields in several parsers. Values are
+# sanitized in _serialize_value so CSV, JSON, Markdown and XLSX exports all
+# stay valid for credentials containing control bytes.
+_ILLEGAL_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 def _serialize_value(value):
@@ -10,6 +19,8 @@ def _serialize_value(value):
         return None
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, str):
+        return _ILLEGAL_CONTROL_CHARS.sub("", value)
     return value
 
 
@@ -40,22 +51,43 @@ def _serialize_row(obj, fields: list[str], *, no_markdown: bool = False) -> dict
     return data
 
 
-def _csv_stream(headers: list[str], rows: list[list[object]], *, no_markdown: bool = False):
-    yield ",".join(headers) + "\n"
+def _csv_stream(
+    headers: list[str],
+    rows: Iterable[Iterable[object]],
+    *,
+    no_markdown: bool = False,
+):
+    """Stream an RFC 4180 CSV document (quoting handles commas/quotes/newlines).
+
+    The ``csv`` module is used instead of hand-rolled quoting so embedded
+    delimiters, quotes and line breaks can never desynchronize columns or
+    rows. ``rows`` may be any iterable (including a generator) so callers can
+    stream large result sets without materializing them.
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(headers)
+    yield buffer.getvalue()
     for row in rows:
-        escaped = []
-        for value in row:
-            text = "" if value is None else str(_export_value(value, no_markdown=no_markdown))
-            text = text.replace('"', '""')
-            escaped.append(f'"{text}"')
-        yield ",".join(escaped) + "\n"
+        buffer.seek(0)
+        buffer.truncate(0)
+        writer.writerow(
+            [
+                "" if value is None else str(_export_value(value, no_markdown=no_markdown))
+                for value in row
+            ]
+        )
+        yield buffer.getvalue()
 
 
 def _markdown_cell(value: object, *, no_markdown: bool) -> str:
     rendered = _export_value(value, no_markdown=no_markdown)
     text = "" if rendered is None else str(rendered)
+    # Escape backslashes first, otherwise an existing escape (e.g. "a\|b")
+    # would be double-escaped and the trailing "\|" still split the cell.
+    text = text.replace("\\", "\\\\")
     text = text.replace("|", r"\|")
-    text = text.replace("\r\n", "<br>").replace("\n", "<br>")
+    text = text.replace("\r\n", "<br>").replace("\n", "<br>").replace("\r", "<br>")
     return text
 
 

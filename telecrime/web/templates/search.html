@@ -230,7 +230,7 @@
         </div>
       </div>
       <div class="muted" style="margin-bottom:10px">
-        Showing {{ result_counts.credentials }} credential rows<span id="totalMatchMeta">{% if total_credentials is not none %} out of {{ "{:,}".format(total_credentials) }} total matches{% elif not regex %} · counting total matches...{% endif %}</span>.
+        Showing {{ result_counts.credentials }} credential rows<span id="totalMatchMeta">{% if total_credentials is not none %} out of {{ "{:,}".format(total_credentials) }} total matches{% elif not regex %} · total unavailable{% endif %}</span>.
       </div>
       {% if results.credentials %}
         <div class="table-wrap">
@@ -282,8 +282,17 @@
             <a class="page-btn" href="javascript:history.back()">← Prev</a>
           {% endif %}
           <span class="muted">Page {{ page }}</span>
-          {% if has_more %}
-            <a class="page-btn" href="/search?q={{ query }}&page={{ page + 1 }}&page_size={{ page_size }}&after_id={{ last_id }}&limit={{ limit }}&limit_messages={{ limit_messages }}&limit_attachments={{ limit_attachments }}&limit_archives={{ limit_archives }}&limit_extracted={{ limit_extracted }}&limit_conversations={{ limit_conversations }}&limit_channels={{ limit_channels }}{% if regex %}&regex=1{% endif %}{% if facets_enabled %}&facets=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}{% if source_conv %}&source_conv={{ source_conv }}{% endif %}">Next →</a>
+          {% if has_more and last_id and (not fts_used or page < 1000) %}
+            {#- One pagination mode per request: the FTS path paginates by
+                offset (page), the LIKE fallback by keyset (after_id). Sending
+                both in one URL let the two modes disagree and repeat or skip
+                rows, so each link now carries exactly one of them. -#}
+            {%- set page_params %}page_size={{ page_size }}&limit_messages={{ limit_messages }}&limit_attachments={{ limit_attachments }}&limit_archives={{ limit_archives }}&limit_extracted={{ limit_extracted }}&limit_conversations={{ limit_conversations }}&limit_channels={{ limit_channels }}{% if regex %}&regex=1{% endif %}{% if facets_enabled %}&facets=1{% endif %}{% if no_markdown %}&no_markdown=1{% endif %}{% if source_conv %}&source_conv={{ source_conv }}{% endif %}{% endset -%}
+            {% if fts_used %}
+            <a class="page-btn" href="/search?q={{ query }}&page={{ page + 1 }}&{{ page_params }}">Next →</a>
+            {% else %}
+            <a class="page-btn" href="/search?q={{ query }}&after_id={{ last_id }}&{{ page_params }}">Next →</a>
+            {% endif %}
           {% endif %}
         </div>
       {% else %}
@@ -517,46 +526,68 @@
       });
     })();
     {% endif %}
-    // Async facets loading
+    // Async facets loading. Cached per query for the session so paging
+    // through a result set does not re-run the expensive facet query on
+    // every request, and rendered via DOM nodes so facet values coming from
+    // credential data can never be interpreted as HTML.
     var facetPanel = document.getElementById('facetPanel');
     if (facetPanel) {
       var q = {{ query|tojson }};
-      fetch('/search/facets?q=' + encodeURIComponent(q))
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-          var html = '';
-          var titles = {domain: 'Domain', stealer_type: 'Stealer Type', application: 'Application'};
-          ['domain', 'stealer_type', 'application'].forEach(function(key) {
-            var items = data[key] || [];
-            html += '<div class="facet-group"><div class="facet-title">' + titles[key] + '</div>';
-            items.forEach(function(item) {
-              html += '<div class="facet-row"><a href="/search?q=' + encodeURIComponent(item.query) + '">' + item.value + '</a> <span class="muted">(' + item.count + ')</span></div>';
-            });
-            html += '</div>';
+      var facetContent = document.getElementById('facetContent');
+      var facetSpinner = document.getElementById('facetSpinner');
+      var facetCacheKey = 'telecrime:facets:' + q;
+      var renderFacets = function(data) {
+        var titles = {domain: 'Domain', stealer_type: 'Stealer Type', application: 'Application'};
+        facetContent.textContent = '';
+        ['domain', 'stealer_type', 'application'].forEach(function(key) {
+          var items = data[key] || [];
+          var group = document.createElement('div');
+          group.className = 'facet-group';
+          var title = document.createElement('div');
+          title.className = 'facet-title';
+          title.textContent = titles[key];
+          group.appendChild(title);
+          items.forEach(function(item) {
+            var row = document.createElement('div');
+            row.className = 'facet-row';
+            var link = document.createElement('a');
+            link.href = '/search?q=' + encodeURIComponent(item.query);
+            link.textContent = item.value;
+            row.appendChild(link);
+            var count = document.createElement('span');
+            count.className = 'muted';
+            count.textContent = ' (' + item.count + ')';
+            row.appendChild(count);
+            group.appendChild(row);
           });
-          document.getElementById('facetContent').innerHTML = html;
-          document.getElementById('facetSpinner').style.display = 'none';
-        })
-        .catch(function() {
-          document.getElementById('facetSpinner').textContent = '(failed)';
+          facetContent.appendChild(group);
         });
-    }
-    var totalMatchMeta = document.getElementById('totalMatchMeta');
-    if (totalMatchMeta && !{{ regex|tojson }} && {{ total_credentials is none|tojson }}) {
-      var q = {{ query|tojson }};
-      fetch('/search/count?q=' + encodeURIComponent(q))
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-          if (typeof data.total_credentials === 'number') {
-            var countStr = data.capped ? '10,000+' : data.total_credentials.toLocaleString();
-            totalMatchMeta.textContent = ' out of ' + countStr + ' total matches';
-          } else {
-            totalMatchMeta.textContent = '';
-          }
-        })
-        .catch(function() {
-          totalMatchMeta.textContent = '';
-        });
+        facetSpinner.style.display = 'none';
+      };
+      var cachedFacets = null;
+      try {
+        var cachedRaw = JSON.parse(sessionStorage.getItem(facetCacheKey) || 'null');
+        if (cachedRaw && Date.now() - cachedRaw.ts < 300000) {
+          cachedFacets = cachedRaw.data;
+        }
+      } catch (e) {
+        cachedFacets = null;
+      }
+      if (cachedFacets) {
+        renderFacets(cachedFacets);
+      } else {
+        fetch('/search/facets?q=' + encodeURIComponent(q))
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            try {
+              sessionStorage.setItem(facetCacheKey, JSON.stringify({ts: Date.now(), data: data}));
+            } catch (e) {}
+            renderFacets(data);
+          })
+          .catch(function() {
+            facetSpinner.textContent = '(failed)';
+          });
+      }
     }
   })();
   </script>

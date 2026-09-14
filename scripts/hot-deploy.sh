@@ -78,24 +78,50 @@ WORKER_RESTART=0
 WEB_RESTART=0
 PIPELINE_KICK=0
 
+# Deploy class for a repo-relative path:
+#   scheduler — the long-lived worker/CLI process imports it (directly or from
+#               a job); docker cp alone is invisible because Python caches
+#               modules in sys.modules, so the worker must be restarted.
+#   web       — only the web container imports it; an alembic migration also
+#               lands here because web's start command runs `alembic upgrade
+#               head` before serving.
+#   pipeline  — imported fresh by every pipeline subprocess; cp is enough.
+#
+# Only the extractor/grouping/pipeline packages are exclusively pipeline
+# subprocess code. Anything else under telecrime/ (models, config, database,
+# notify, channels, stealer, adapters, utils, states, ...) is imported by the
+# running worker or web too — treating it as pipeline-only silently deploys
+# stale code.
 classify() {
     case "$1" in
-        telecrime/scheduler.py|telecrime/cli.py|telecrime/__main__.py|telecrime/__init__.py)
-            echo "scheduler" ;;
-        telecrime/web/*)
+        telecrime/web/*|alembic/*)
             echo "web" ;;
-        telecrime/*|alembic/*)
+        # Imported by scheduler.py/CLI despite living under pipeline/.
+        telecrime/pipeline/progress.py|telecrime/pipeline/lock.py|telecrime/pipeline/acquire.py)
+            echo "scheduler" ;;
+        telecrime/pipeline/*|telecrime/extractor/*|telecrime/grouping/*)
             echo "pipeline" ;;
+        telecrime/*)
+            echo "scheduler" ;;
         *)
             echo "unknown" ;;
     esac
 }
 
+# Validate every input before touching any container: a bad path or an
+# unsupported file halfway through used to leave a partially-copied deploy.
 for rel in "$@"; do
     if [[ ! -f "$REPO/$rel" ]]; then
         echo "✗ missing: $REPO/$rel" >&2
         exit 1
     fi
+    if [[ "$(classify "$rel")" = "unknown" ]]; then
+        echo "✗ don't know how to deploy $rel" >&2
+        exit 1
+    fi
+done
+
+for rel in "$@"; do
     cls=$(classify "$rel")
     case "$cls" in
         scheduler)

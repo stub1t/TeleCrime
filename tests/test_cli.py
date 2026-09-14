@@ -143,6 +143,26 @@ class TestCliRetry:
 
         assert result.exit_code == 0
 
+    def test_retry_uses_bulk_updates(self):
+        """retry must issue bulk UPDATE statements instead of materializing
+        every failed row and updating it one by one."""
+        with patch("telecrime.cli.get_config_and_engine") as mock_get:
+            mock_get.return_value = (MagicMock(), MagicMock())
+
+            with patch("telecrime.cli.get_session") as mock_session:
+                mock_sess = MagicMock()
+                mock_sess.execute.return_value.rowcount = 2
+                mock_session.return_value.__enter__ = MagicMock(return_value=mock_sess)
+                mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+                result = runner.invoke(app, ["retry", "--downloads", "--extractions"])
+
+        assert result.exit_code == 0
+        # downloads UPDATE, archive_groups UPDATE, extraction_jobs UPDATE
+        assert mock_sess.execute.call_count == 3
+        mock_sess.query.assert_not_called()
+        assert "Reset 4 jobs for retry" in result.stdout
+
 
 class TestCliShutdownRequest:
     def test_shutdown_request_writes_file(self, tmp_path, monkeypatch):
@@ -292,6 +312,64 @@ class TestCliReprocess:
             group = session.query(ArchiveGroup).filter_by(id=1).one()
             assert group.status == GroupStatus.EXTRACTED
             assert session.query(ParsedCredential).count() == 0
+
+    def test_reprocess_batches_deletes_per_group(self):
+        """reprocess must use one IN-list DELETE per table per group instead
+        of one DELETE per extraction job."""
+        from telecrime.models import (
+            ArchiveGroup,
+            ExtractedOutput,
+            ExtractionJob,
+            ParsedCredential,
+        )
+
+        groups = []
+        for i in (1, 2):
+            group = MagicMock()
+            group.id = i
+            group.extraction_jobs = [MagicMock(id=i * 10), MagicMock(id=i * 10 + 1)]
+            groups.append(group)
+
+        group_query = MagicMock()
+        group_query.filter.return_value = group_query
+        group_query.all.return_value = groups
+        cred_query = MagicMock()
+        cred_query.filter.return_value = cred_query
+        cred_query.delete.return_value = 1
+        output_query = MagicMock()
+        output_query.filter.return_value = output_query
+        output_query.delete.return_value = 1
+        job_query = MagicMock()
+        job_query.filter.return_value = job_query
+        job_query.update.return_value = 2
+
+        session = MagicMock()
+        session.query.side_effect = lambda model: {
+            ArchiveGroup: group_query,
+            ParsedCredential: cred_query,
+            ExtractedOutput: output_query,
+            ExtractionJob: job_query,
+        }[model]
+
+        with patch("telecrime.cli.get_config_and_engine") as mock_get:
+            mock_get.return_value = (MagicMock(), MagicMock())
+            with patch("telecrime.cli.get_session") as mock_session:
+                mock_session.return_value.__enter__ = MagicMock(return_value=session)
+                mock_session.return_value.__exit__ = MagicMock(return_value=False)
+                result = runner.invoke(
+                    app, ["reprocess", "--group-id", "1", "--stage", "extract"]
+                )
+
+        assert result.exit_code == 0
+        # One credentials DELETE and one outputs DELETE per group (2 groups),
+        # plus one bulk job UPDATE per group — not one statement per job.
+        assert cred_query.filter.return_value.delete.call_count == 2
+        assert output_query.filter.return_value.delete.call_count == 2
+        assert job_query.filter.return_value.update.call_count == 2
+        for group in groups:
+            assert group.credential_count == 0
+        assert "Removed 2 parsed credential rows" in result.stdout
+        assert "Removed 2 extracted output rows" in result.stdout
 
 
 class TestCliClean:

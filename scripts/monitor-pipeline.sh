@@ -35,9 +35,14 @@ while true; do
   fi
 
   # Disk pressure: extraction/parse need headroom; finalize reclaims space.
-  free_gb=$(df -BG /mnt/telecrime 2>/dev/null | awk 'NR==2{gsub("G","",$4); print $4}')
-  if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt 20 ]; then
-    log "WARNING: low disk on /mnt/telecrime — ${free_gb} GB free"
+  # Only measure the LUKS drive while it is actually mounted: df on the
+  # unmounted mountpoint would silently report the ROOT filesystem and log a
+  # misleading "low disk on /mnt/telecrime" warning.
+  if mountpoint -q /mnt/telecrime; then
+    free_gb=$(df -BG /mnt/telecrime 2>/dev/null | awk 'NR==2{gsub("G","",$4); print $4}')
+    if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt 20 ]; then
+      log "WARNING: low disk on /mnt/telecrime — ${free_gb} GB free"
+    fi
   fi
 
   sleep "$INTERVAL"

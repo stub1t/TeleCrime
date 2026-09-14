@@ -1,5 +1,6 @@
 """Database session and engine management (PostgreSQL)."""
 
+import os
 import weakref
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -12,6 +13,24 @@ from sqlalchemy.orm import Session, sessionmaker
 from telecrime.models.base import Base
 
 _session_factories: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _pg_connect_args() -> dict[str, str]:
+    """libpq connect args shared by every PostgreSQL engine.
+
+    ``application_name`` mirrors the watchdog contract: the scheduler tags the
+    pipeline subprocess with ``PGAPPNAME=telecrime-pipeline`` and
+    ``scripts/unattended-watchdog.sh`` scopes its ``pg_stat_activity`` hang
+    probe to that name. Passing it through ``connect_args`` keeps the tag even
+    if a URL/launcher strips the environment, and gives every other process a
+    non-empty name (``telecrime``) instead of libpq's blank default.
+
+    ``statement_timeout`` is deliberately not set here: the compose Postgres
+    sets the 5-minute server default, and per-session ``SET``/``RESET`` in
+    ``web/app.py`` / ``pipeline/parse.py`` must remain the single source of
+    truth for bounded vs unbounded statements.
+    """
+    return {"application_name": os.environ.get("PGAPPNAME") or "telecrime"}
 
 
 def get_dialect_insert(session):
@@ -42,9 +61,17 @@ def get_engine(database_url: str | None = None):
     return create_engine(
         database_url,
         echo=False,
+        # Per-engine budget 5 + 10 overflow. The web process runs an app engine
+        # plus one shared cached engine for its three background workers
+        # (get_cached_engine); the worker runs one engine and the pipeline
+        # subprocess one more. The pipeline's peak is its main session plus up
+        # to 3 prefetch downloads plus TELECRIME_READY_GROUP_CONCURRENCY group
+        # tasks (~5-7), so 15/engine leaves headroom while keeping the
+        # cross-process total (<= ~60) below PG's default max_connections=100.
         pool_size=5,
         max_overflow=10,
         pool_pre_ping=True,
+        connect_args=_pg_connect_args(),
     )
 
 
@@ -75,7 +102,12 @@ def get_session(engine) -> Generator[Session, None, None]:
     try:
         yield session
         session.commit()
-    except Exception:
+    except BaseException:
+        # BaseException (not Exception) so KeyboardInterrupt / asyncio
+        # CancelledError also roll back explicitly before the connection is
+        # returned to the pool; close() in finally would roll back anyway, but
+        # this guarantees the pool never sees a checked out transaction even if
+        # close() itself fails.
         try:
             session.rollback()
         except Exception:

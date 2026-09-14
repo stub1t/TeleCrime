@@ -65,6 +65,9 @@ class Message(Base, TimestampMixin):
     is_processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
     # Relationships
+    # password_candidates is lazy: iterating messages and reading this per row
+    # is an N+1. Use selectinload(Message.password_candidates) if a list view
+    # ever needs them.
     conversation: Mapped["Conversation"] = relationship("Conversation", back_populates="messages")
     attachments: Mapped[list["FileAttachment"]] = relationship(
         "FileAttachment", back_populates="message", cascade="all, delete-orphan"

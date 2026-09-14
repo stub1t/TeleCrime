@@ -47,6 +47,14 @@ class TelegramChannel(Base):
     archives_seen: Mapped[int] = mapped_column(Integer, default=0)
     credentials_extracted: Mapped[int] = mapped_column(Integer, default=0)
 
+    # NOTE: ix_telegram_channels_username_lower is a plain btree on `username`
+    # (migration c3d7a8b9e1f2), i.e. a duplicate of ix_telegram_channels_username
+    # from `index=True` — the name says "lower" but no lower(username) expression
+    # is indexed, so lookups such as channels/discover.py's
+    # `func.lower(TelegramChannel.username).in_(...)` cannot use it. The table is
+    # small (thousands of rows) so this is documented rather than fixed with a
+    # migration: dropping/recreating indexes would need a new migration for
+    # negligible gain. Do not copy this pattern to a large table.
     __table_args__ = (Index("ix_telegram_channels_username_lower", "username"),)
 
     def __repr__(self) -> str:

@@ -6,12 +6,25 @@ import pytest
 from sqlalchemy import inspect, text
 
 from telecrime.database import (
+    _pg_connect_args,
     get_engine,
     get_session,
     get_session_factory,
     init_db,
 )
 from telecrime.models import Conversation
+
+
+class TestPgConnectArgs:
+    """application_name keeps the watchdog's PGAPPNAME contract intact."""
+
+    def test_default_application_name(self, monkeypatch):
+        monkeypatch.delenv("PGAPPNAME", raising=False)
+        assert _pg_connect_args() == {"application_name": "telecrime"}
+
+    def test_pipeline_tag_is_preserved(self, monkeypatch):
+        monkeypatch.setenv("PGAPPNAME", "telecrime-pipeline")
+        assert _pg_connect_args()["application_name"] == "telecrime-pipeline"
 
 
 class TestGetEngine:
@@ -56,6 +69,25 @@ class TestGetSession:
             pass
         with get_session(pg_engine) as session:
             assert session.query(Conversation).filter_by(platform_id=456).first() is None
+
+    def test_session_rollbacks_on_base_exception(self, tmp_path):
+        """KeyboardInterrupt/CancelledError must not leak a transaction."""
+        engine = get_engine(f"sqlite:///{tmp_path / 'baseexc.db'}")
+        init_db(engine)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                with get_session(engine) as session:
+                    session.add(
+                        Conversation(platform_id=789, conversation_type="channel")
+                    )
+                    raise KeyboardInterrupt
+        finally:
+            with get_session(engine) as session:
+                assert (
+                    session.query(Conversation).filter_by(platform_id=789).first()
+                    is None
+                )
+            engine.dispose()
 
 
 class TestInitDb:

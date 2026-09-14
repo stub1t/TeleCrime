@@ -19,13 +19,73 @@ except ImportError:
 
 def get_default_config_path() -> Path:
     """Get the default config file path."""
-    xdg_config = os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+    xdg_config = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
     return Path(xdg_config) / "telecrime" / "config.toml"
 
 
 def get_default_data_dir() -> Path:
     """Get the default data directory."""
     return Path(__file__).parent.parent / "data"
+
+
+def _coerce_int(value: Any, field: str) -> int:
+    """Coerce a TOML/env value to int, tolerating integral floats/strings.
+
+    Hand-written config files sometimes encode integers as floats
+    (``parallel_chunks = 4.0``) and env vars may arrive as ``"4.0"``. A bare
+    ``int()`` accepts neither, so normalize through float — but refuse
+    non-integral values instead of silently truncating them.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer, got boolean {value!r}")
+    try:
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            as_float = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be an integer, got {value!r}") from exc
+        if not as_float.is_integer():
+            raise ValueError(
+                f"{field} must be an integer, got non-integral value {value!r}"
+            )
+        return int(as_float)
+
+
+def _coerce_float(value: Any, field: str) -> float:
+    """Coerce a TOML/env value to float with a clear error on bad input."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a number, got boolean {value!r}")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a number, got {value!r}") from exc
+
+
+def _coerce_str_list(value: Any, field: str) -> list[str]:
+    """Coerce a TOML array / env string into a cleaned list of strings.
+
+    TOML files declare these as arrays; a bare string is a common mistake that
+    would otherwise iterate character-by-character ("dl2" -> ["d", "l", "2"]).
+    Empty entries are dropped so a trailing comma cannot inject an empty
+    extension/session name.
+    """
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"{field} must be a list of strings, got {type(value).__name__}"
+        )
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{field} entries must be strings, got {item!r}")
+        item = item.strip()
+        if item:
+            result.append(item)
+    return result
 
 
 def mask_database_url(database_url: str) -> str:
@@ -130,9 +190,10 @@ class Config:
         """Return a copy pointing at the (index)-th parallel download session.
 
         index 0 is the main session; 1..N map to download_session_names.
+        Out-of-range (including negative) indexes fall back to the main session.
         """
         names = self.telegram.download_session_names
-        if index == 0 or not names or index > len(names):
+        if index <= 0 or not names or index > len(names):
             return self
         new_telegram = dataclasses.replace(
             self.telegram, session_name=names[index - 1]
@@ -181,8 +242,10 @@ def _apply_config_dict(config: Config, data: ConfigDict) -> None:
 
     if "telegram" in data:
         tg = data["telegram"]
-        if "api_id" in tg:
-            config.telegram.api_id = tg["api_id"]
+        if "api_id" in tg and tg["api_id"] is not None:
+            config.telegram.api_id = _coerce_int(
+                tg["api_id"], "telegram.api_id"
+            )
         if "api_hash" in tg:
             config.telegram.api_hash = tg["api_hash"]
         if "session_name" in tg:
@@ -194,37 +257,54 @@ def _apply_config_dict(config: Config, data: ConfigDict) -> None:
         # Legacy location for download sessions (save_config now writes them
         # under [download]); honoured unless [download] overrides below.
         if "download_session_names" in tg:
-            config.telegram.download_session_names = [
-                s.strip() for s in tg["download_session_names"] if s.strip()
-            ]
+            config.telegram.download_session_names = _coerce_str_list(
+                tg["download_session_names"], "telegram.download_session_names"
+            )
 
     if "extraction" in data:
         ext = data["extraction"]
         if "target_extensions" in ext:
-            config.extraction.target_extensions = ext["target_extensions"]
+            config.extraction.target_extensions = _coerce_str_list(
+                ext["target_extensions"], "extraction.target_extensions"
+            )
         if "extractor_path" in ext:
             config.extraction.extractor_path = ext["extractor_path"]
         if "max_extraction_seconds" in ext:
-            config.extraction.max_extraction_seconds = ext["max_extraction_seconds"]
+            config.extraction.max_extraction_seconds = _coerce_int(
+                ext["max_extraction_seconds"], "extraction.max_extraction_seconds"
+            )
         if "min_free_disk_mb" in ext:
-            config.extraction.min_free_disk_mb = ext["min_free_disk_mb"]
+            config.extraction.min_free_disk_mb = _coerce_int(
+                ext["min_free_disk_mb"], "extraction.min_free_disk_mb"
+            )
         if "scheduler_min_free_disk_gb" in ext:
-            config.extraction.scheduler_min_free_disk_gb = ext["scheduler_min_free_disk_gb"]
+            config.extraction.scheduler_min_free_disk_gb = _coerce_float(
+                ext["scheduler_min_free_disk_gb"],
+                "extraction.scheduler_min_free_disk_gb",
+            )
 
     if "download" in data:
         dl = data["download"]
         if "max_retries" in dl:
-            config.download.max_retries = dl["max_retries"]
+            config.download.max_retries = _coerce_int(
+                dl["max_retries"], "download.max_retries"
+            )
         if "retry_delay_seconds" in dl:
-            config.download.retry_delay_seconds = dl["retry_delay_seconds"]
+            config.download.retry_delay_seconds = _coerce_int(
+                dl["retry_delay_seconds"], "download.retry_delay_seconds"
+            )
         if "parallel_chunks" in dl:
-            config.download.parallel_chunks = dl["parallel_chunks"]
+            config.download.parallel_chunks = _coerce_int(
+                dl["parallel_chunks"], "download.parallel_chunks"
+            )
         if "parallel_min_bytes" in dl:
-            config.download.parallel_min_bytes = dl["parallel_min_bytes"]
+            config.download.parallel_min_bytes = _coerce_int(
+                dl["parallel_min_bytes"], "download.parallel_min_bytes"
+            )
         if "download_session_names" in dl:
-            config.telegram.download_session_names = [
-                s.strip() for s in dl["download_session_names"] if s.strip()
-            ]
+            config.telegram.download_session_names = _coerce_str_list(
+                dl["download_session_names"], "download.download_session_names"
+            )
 
 
 def _apply_env_vars(config: Config) -> None:
@@ -234,7 +314,9 @@ def _apply_env_vars(config: Config) -> None:
     if data_dir := os.environ.get("TELECRIME_DATA_DIR"):
         _set_data_dir(config, Path(data_dir))
     if api_id := os.environ.get("TELECRIME_TELEGRAM_API_ID"):
-        config.telegram.api_id = int(api_id)
+        config.telegram.api_id = _coerce_int(
+            api_id, "TELECRIME_TELEGRAM_API_ID"
+        )
     if api_hash := os.environ.get("TELECRIME_TELEGRAM_API_HASH"):
         config.telegram.api_hash = api_hash
     if phone := os.environ.get("TELECRIME_TELEGRAM_PHONE"):
@@ -242,21 +324,35 @@ def _apply_env_vars(config: Config) -> None:
     if aux := os.environ.get("TELECRIME_TELEGRAM_AUX_SESSION_NAME"):
         config.telegram.aux_session_name = aux
     if sessions := os.environ.get("TELECRIME_DOWNLOAD_SESSIONS"):
-        config.telegram.download_session_names = [
-            s.strip() for s in sessions.split(",") if s.strip()
-        ]
+        config.telegram.download_session_names = _coerce_str_list(
+            sessions, "TELECRIME_DOWNLOAD_SESSIONS"
+        )
     if extensions := os.environ.get("TELECRIME_TARGET_EXTENSIONS"):
-        config.extraction.target_extensions = [e.strip() for e in extensions.split(",")]
+        # _coerce_str_list drops empty entries: a trailing comma used to inject
+        # "" and extractors used it to build a `*..` match-all mask.
+        config.extraction.target_extensions = _coerce_str_list(
+            extensions, "TELECRIME_TARGET_EXTENSIONS"
+        )
     if max_seconds := os.environ.get("TELECRIME_MAX_EXTRACTION_SECONDS"):
-        config.extraction.max_extraction_seconds = int(max_seconds)
+        config.extraction.max_extraction_seconds = _coerce_int(
+            max_seconds, "TELECRIME_MAX_EXTRACTION_SECONDS"
+        )
     if min_free := os.environ.get("TELECRIME_MIN_FREE_DISK_MB"):
-        config.extraction.min_free_disk_mb = int(min_free)
+        config.extraction.min_free_disk_mb = _coerce_int(
+            min_free, "TELECRIME_MIN_FREE_DISK_MB"
+        )
     if scheduler_min_free := os.environ.get("TELECRIME_SCHEDULER_MIN_FREE_DISK_GB"):
-        config.extraction.scheduler_min_free_disk_gb = float(scheduler_min_free)
+        config.extraction.scheduler_min_free_disk_gb = _coerce_float(
+            scheduler_min_free, "TELECRIME_SCHEDULER_MIN_FREE_DISK_GB"
+        )
     if parallel_chunks := os.environ.get("TELECRIME_PARALLEL_CHUNKS"):
-        config.download.parallel_chunks = int(parallel_chunks)
+        config.download.parallel_chunks = _coerce_int(
+            parallel_chunks, "TELECRIME_PARALLEL_CHUNKS"
+        )
     if parallel_min := os.environ.get("TELECRIME_PARALLEL_MIN_BYTES"):
-        config.download.parallel_min_bytes = int(parallel_min)
+        config.download.parallel_min_bytes = _coerce_int(
+            parallel_min, "TELECRIME_PARALLEL_MIN_BYTES"
+        )
 
 
 def _set_data_dir(config: Config, data_dir: Path) -> None:

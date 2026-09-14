@@ -1,6 +1,6 @@
 """Full-text search for parsed_credentials (PostgreSQL pg_trgm)."""
 
-from sqlalchemy import inspect, text
+from sqlalchemy import bindparam, inspect, text
 
 _PG_SEARCH_COLUMNS = ["domain", "username"]
 
@@ -11,6 +11,11 @@ _PG_TRGM_INDEXES = {
     "ix_pc_domain_trgm": "domain",
     "ix_pc_username_trgm": "username",
 }
+
+# Hard ceiling on rows a single fts_search may materialize. The CLI exposes
+# --limit; without a ceiling a large value turns the LIMIT into an unbounded
+# scan on a table with no usable index.
+_MAX_FTS_RESULTS = 5000
 
 # Schema introspection cache: (engine_url, table, column) -> bool.
 _column_cache: dict[tuple[str, str, str], bool] = {}
@@ -26,7 +31,10 @@ def _has_column(session, table: str, column: str) -> bool:
             col["name"] for col in inspect(engine).get_columns(table)
         }
     except Exception:
-        result = False
+        # Never cache introspection failures: a transient connection error
+        # would otherwise pin a False result for the process lifetime and
+        # silently change how counts are computed.
+        return False
     _column_cache[key] = result
     return result
 
@@ -42,13 +50,34 @@ def _soft_count_expr(alias: str = "pc", *, has_soft_hash: bool = True) -> str:
 
 
 def fts_available(engine) -> bool:
-    """Return True when pg_trgm is installed."""
+    """Return True when pg_trgm and the trigram search indexes are usable.
+
+    A pg_trgm extension without its GIN indexes is not an indexed search:
+    every ILIKE branch becomes a sequential scan over the whole table. The
+    storage migrations deliberately dropped several trigram indexes, so the
+    probe must verify the remaining ones backing ``_PG_SEARCH_COLUMNS``
+    instead of reporting "FTS available" whenever the extension is present.
+    """
     try:
         with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
-            ).fetchone()
-        return row is not None
+            has_extension = (
+                conn.execute(
+                    text("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
+                ).fetchone()
+                is not None
+            )
+            if not has_extension:
+                return False
+            names = list(_PG_TRGM_INDEXES)
+            rows = conn.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE tablename = 'parsed_credentials' "
+                    "AND indexname IN :names"
+                ).bindparams(bindparam("names", expanding=True)),
+                {"names": names},
+            ).fetchall()
+        return {row[0] for row in rows} >= set(names)
     except Exception:
         return False
 
@@ -94,6 +123,7 @@ def fts_search(
     tokens = query.split()
     if not tokens:
         return []
+    limit = max(0, min(limit, _MAX_FTS_RESULTS))
     _disable_pg_parallel_search(session)
     params: dict[str, object] = {"limit": limit, "branch_limit": max(500, limit)}
     if columns:
