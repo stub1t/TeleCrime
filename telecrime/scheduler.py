@@ -1561,10 +1561,23 @@ def _watchlist_count_matches(session, item, *, created_since=None) -> int:
     trigram indexes on the 319M-row table and degrades to a sequential scan,
     while each UNION branch can use its own index (UNION also dedups rows that
     match more than one column, matching the OR's semantics).
+
+    The statement timeout is armed HERE, not only by the incremental caller, so
+    every path that can run this ILIKE count (notify's pipeline scan included)
+    is hard-bounded by PostgreSQL and can never pin a backend past the
+    scheduler's budget.
     """
-    from sqlalchemy import func, select
+    from sqlalchemy import func, select, text
 
     from telecrime.models.credential import ParsedCredential
+
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(
+            text(
+                "SET LOCAL statement_timeout = "
+                f"'{_WATCHLIST_COUNT_STATEMENT_TIMEOUT}'"
+            )
+        )
 
     query = f"%{item.query}%"
 
@@ -1844,6 +1857,18 @@ def _collect_watchlist_alerts_unlocked(engine) -> list[dict]:
     return alerts
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Normalize a DB timestamp to UTC-aware for comparison.
+
+    PostgreSQL returns aware datetimes and SQLite (test fixture) naive ones;
+    comparing the two directly raises TypeError and would abort the whole
+    watermark advance.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
 def _advance_watchlist_alerts(engine, alerts: list[dict]) -> None:
     """Advance the alerted window ONLY after a notification was confirmed sent.
 
@@ -1852,6 +1877,11 @@ def _advance_watchlist_alerts(engine, alerts: list[dict]) -> None:
     (the window had already moved past them). The window advances to the
     collection timestamp (not send time) so credentials created during the
     send surface on the next interval.
+
+    The watermark is monotonic: the scheduler job and the pipeline flusher can
+    both collect the same window, and a slow sender's stale advance must not
+    move it backwards — that would re-alert the overlap on every interval
+    (an unbounded duplicate loop).
     """
     if not alerts:
         return
@@ -1864,7 +1894,11 @@ def _advance_watchlist_alerts(engine, alerts: list[dict]) -> None:
                 item = session.get(WatchlistItem, alert["id"])
                 if item is None:
                     continue
-                item.last_alerted_at = alert.get("collected_at") or datetime.now(UTC)
+                collected_at = alert.get("collected_at") or datetime.now(UTC)
+                current = item.last_alerted_at
+                if current is not None and _as_utc(collected_at) <= _as_utc(current):
+                    continue
+                item.last_alerted_at = collected_at
                 item.last_alerted_count = int(alert.get("total_matches") or 0)
             session.commit()
     except Exception as exc:
@@ -1975,10 +2009,18 @@ def _run_summary_job(config, engine, hours: int) -> str:
         return "no new unique credentials in last hour"
 
     label = "Last hour" if hours == 1 else f"Last {hours} hours"
-    _send_telegram_notification(
-        config,
-        lambda notifier: notifier.activity_summary(label, count),
-    )
+    # Capture the notifier's send result: send() swallows failures internally
+    # (returns False) rather than raising, so "ok" alone is not proof of
+    # delivery. Without this the job reported "sent" for skipped/failed sends.
+    _sent = False
+
+    async def _send(notifier) -> None:
+        nonlocal _sent
+        _sent = await notifier.activity_summary(label, count)
+
+    result = _send_telegram_notification(config, _send)
+    if result != "ok" or not _sent:
+        return result if result != "ok" else "summary send failed (will retry next interval)"
     return f"sent {label.lower()} summary: {count:,} new unique credentials"
 
 

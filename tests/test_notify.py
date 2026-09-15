@@ -698,3 +698,137 @@ async def test_flusher_loop_continues_after_tick_error(monkeypatch):
 
     # The first tick raised; the loop kept ticking and called the provider again.
     assert calls["n"] >= 2
+
+
+# ---------------------------------------------------------------------------
+# digest retention on cancellation + watchlist message bounding/escaping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_flush_cancellation_retains_digest():
+    """A cancelled flush (shutdown, stall monitor) must not discard the window
+    that was detached from the accumulator before the network await."""
+    import asyncio
+
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def _hang(*args, **kwargs):
+        started.set()
+        await never.wait()
+
+    client.send_message = _hang
+    n = TelegramNotifier(client=client, enabled=True)
+    await n.archive_parsed("a.zip", 10, 2, 1, [("example.com", 3)])
+
+    task = asyncio.create_task(n.flush())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert n._digest_archives == 1
+    assert n._digest_new == 10
+    assert n._digest_dups == 2
+    assert n._digest_domains["example.com"] == 3
+    assert n._digest_last_archive == "a.zip"
+    assert n._digest_since is not None
+
+
+def test_chunk_lines_splits_at_line_boundaries():
+    from telecrime.notify import _chunk_lines
+
+    lines = [f"line-{i}" for i in range(10)]
+    messages = _chunk_lines(lines, 20)
+    assert all(len(m) <= 20 for m in messages)
+    assert "\n".join(messages).splitlines() == lines
+
+
+def _big_watchlist_alerts(items: int = 8, hits: int = 5) -> list[dict]:
+    return [
+        {
+            "label": f"item & <{i}>",
+            "query": "owlmail<&>",
+            "new_matches": hits,
+            "hits": [
+                {
+                    "url": (
+                        "https://user&x=1.example.com/login?next="
+                        + "a" * 80
+                    ),
+                    "username": f"u{j}&<b>",
+                    "password": f"p{j}&secret",
+                    "source_archive": f"dump{j} & <x>.zip",
+                }
+                for j in range(hits)
+            ],
+        }
+        for i in range(items)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_watchlist_alerts_split_under_telegram_limit():
+    """A busy interval must still deliver: messages are split so none exceeds
+    Telegram's 4096-char hard limit (an oversized one failed every retry and
+    kept the alert window frozen forever)."""
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    sent: list[str] = []
+
+    async def _send(*args, **kwargs):
+        sent.append(args[1])
+
+    client.send_message = _send
+    n = TelegramNotifier(client=client, enabled=True)
+
+    assert await n.watchlist_alerts(_big_watchlist_alerts()) is True
+    assert len(sent) > 1
+    assert all(len(message) <= 4096 for message in sent)
+    # Every raw value is HTML-escaped exactly once and no tag is injected.
+    joined = "\n".join(sent)
+    assert "u0&amp;&lt;b&gt;" in joined
+    assert "u0&amp;amp;" not in joined
+    assert "&lt;b&gt;" in joined  # escaped, never a live tag
+
+
+@pytest.mark.asyncio
+async def test_watchlist_alerts_stop_at_first_failed_part():
+    """If any part fails, the call returns False (window stays put and the
+    batch is re-alerted) and no further parts are attempted against a down
+    link."""
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    calls = {"n": 0}
+
+    async def _send(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("telegram down")
+
+    client.send_message = _send
+    n = TelegramNotifier(client=client, enabled=True)
+
+    assert await n.watchlist_alerts(_big_watchlist_alerts()) is False
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_activity_summary_returns_send_result():
+    """The summary send result must be observable so the scheduler job does
+    not report 'sent' for a failed send."""
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock(side_effect=RuntimeError("down"))
+    n = TelegramNotifier(client=client, enabled=True)
+    assert await n.activity_summary("Last hour", 5) is False
+
+    client.send_message = AsyncMock()
+    assert await n.activity_summary("Last hour", 5) is True

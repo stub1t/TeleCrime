@@ -427,6 +427,51 @@ class TestUnrarExtractor:
         assert result.error_code == "WRONG_PASSWORD"
 
     @pytest.mark.asyncio
+    async def test_crc_failed_with_recovered_members_is_partial(self, tmp_path):
+        """Member-level CRC failures must salvage the clean members instead of
+        terminalizing CORRUPTED and discarding their credentials."""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "good.txt").write_text(
+            "https://example.com;alice;secret\n", encoding="utf-8"
+        )
+
+        extractor = UnrarExtractor()
+        result = await extractor._parse_result(
+            return_code=3,
+            stdout="Extracting  good.txt\nCRC failed in broken.txt\n",
+            stderr="",
+            output_dir=output_dir,
+            target_extensions=["txt"],
+        )
+
+        assert result.success is True
+        assert result.error_code == "PARTIAL_INTEGRITY"
+        assert [p.name for p in result.extracted_files] == ["good.txt"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_bad_archive_and_crc_stays_corrupted(self, tmp_path):
+        """Archive-level corruption taints every member: a CRC line alongside
+        "Bad archive" must stay terminal even with files on disk."""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "good.txt").write_text(
+            "https://example.com;alice;secret\n", encoding="utf-8"
+        )
+
+        extractor = UnrarExtractor()
+        result = await extractor._parse_result(
+            return_code=3,
+            stdout="Bad archive\nCRC failed in broken.txt\n",
+            stderr="",
+            output_dir=output_dir,
+            target_extensions=["txt"],
+        )
+
+        assert result.success is False
+        assert result.error_code == "CORRUPTED"
+
+    @pytest.mark.asyncio
     async def test_extract_masks_include_case_variants(self, tmp_path):
         """unrar masks are case-sensitive on Linux: `*.txt` alone skipped an
         uppercase member and the archive was deleted after an empty extract."""

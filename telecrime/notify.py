@@ -25,6 +25,17 @@ Rules:
 - Watchlist alert hits include the full url, username and password — the
   feed is Saved Messages (message-to-self), private by construction, and the
   dashboard shows the same record. HTML-escaped via `_esc`.
+
+Delivery semantics
+------------------
+- Digest counters are in-memory and best-effort: a process restart (crash,
+  redeploy) loses whatever window had not been flushed yet. A send that fails
+  is retained in memory and retried; a send that times out but actually
+  reached Telegram is retried too (at-least-once, duplicate possible).
+- Watchlist alerts are at-least-once and never silently dropped: the alerted
+  watermark (`last_alerted_at`/`last_alerted_count`) advances only after a
+  confirmed send, so a crash between send and advance re-alerts the same hits
+  on the next interval instead of losing them.
 """
 
 import asyncio
@@ -85,6 +96,36 @@ def _trunc(value: str, limit: int = 64) -> str:
     if not value:
         return ""
     return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+# Telegram rejects messages longer than 4096 characters. Keep a margin for the
+# parts we do not control (escaped entities expand raw text).
+_TELEGRAM_MAX_MESSAGE_CHARS = 4000
+
+
+def _chunk_lines(lines: list[str], limit: int) -> list[str]:
+    """Split pre-rendered lines into messages of at most `limit` characters.
+
+    Every line produced by the notifier is independently balanced HTML, so
+    splitting at line boundaries cannot corrupt an entity or a tag. An
+    oversized watchlist batch used to make every send fail forever (the alert
+    window never advanced, so the same batch was retried every interval).
+    """
+    messages: list[str] = []
+    current: list[str] = []
+    length = 0
+    for line in lines:
+        addition = len(line) + (1 if current else 0)
+        if current and length + addition > limit:
+            messages.append("\n".join(current))
+            current = [line]
+            length = len(line)
+        else:
+            current.append(line)
+            length += addition
+    if current:
+        messages.append("\n".join(current))
+    return messages
 
 
 def _fmt_int(n: Any) -> str:
@@ -591,21 +632,29 @@ class TelegramNotifier:
                     f"• <b>Last archive:</b> {_code(_trunc(last_archive, 60))}"
                 )
 
-            # Live status section: what the pipeline is doing right now. The
-            # provider is called with a short budget — a wedged drive or slow
-            # query must not stall the digest.
-            status_lines = await self._status_lines()
-            if status_lines:
-                lines.extend(status_lines)
+            try:
+                # Live status section: what the pipeline is doing right now.
+                # The provider is called with a short budget — a wedged drive
+                # or slow query must not stall the digest.
+                status_lines = await self._status_lines()
+                if status_lines:
+                    lines.extend(status_lines)
 
-            if domains:
-                top = domains.most_common(5)
-                lines.append("")
-                lines.append("<b>Top domains</b>")
-                for domain, count in top:
-                    lines.append(f"• {_esc(_trunc(domain, 48))} — {_fmt_int(count)}")
+                if domains:
+                    top = domains.most_common(5)
+                    lines.append("")
+                    lines.append("<b>Top domains</b>")
+                    for domain, count in top:
+                        lines.append(f"• {_esc(_trunc(domain, 48))} — {_fmt_int(count)}")
 
-            sent = await self.send("\n".join(lines))
+                sent = await self.send("\n".join(lines))
+            except BaseException:
+                # Cancellation (shutdown, stall monitor) or a formatting error
+                # must not discard the window that was already detached from
+                # the accumulator: merge it back, then let the exception
+                # propagate to the caller.
+                self._restore_digest(archives, new, dups, domains, last_archive, since)
+                raise
             if not sent:
                 # Restore the failed snapshot, merged with anything that
                 # accumulated while the send was in flight: a failed send
@@ -613,16 +662,7 @@ class TelegramNotifier:
                 # window's news — the next flusher tick retries it. Back off
                 # before archive_parsed may try again so a down Telegram link
                 # doesn't block the parse hot path on every archive.
-                self._digest_archives += archives
-                self._digest_new += new
-                self._digest_dups += dups
-                self._digest_domains.update(domains)
-                if last_archive and self._digest_last_archive is None:
-                    self._digest_last_archive = last_archive
-                if since is not None and (
-                    self._digest_since is None or since < self._digest_since
-                ):
-                    self._digest_since = since
+                self._restore_digest(archives, new, dups, domains, last_archive, since)
                 self._digest_retry_after = (
                     asyncio.get_event_loop().time() + self._digest_retry_seconds
                 )
@@ -635,6 +675,31 @@ class TelegramNotifier:
             self._last_status_sent = asyncio.get_event_loop().time()
             # Keep _reported_archives: a digest flush mid-run must not
             # re-report archives already counted once this run.
+
+    def _restore_digest(
+        self,
+        archives: int,
+        new: int,
+        dups: int,
+        domains: Counter[str],
+        last_archive: str | None,
+        since: float | None,
+    ) -> None:
+        """Merge a detached digest snapshot back into the accumulator.
+
+        A window must be either delivered or retained — never dropped — so
+        both the failed-send path and the cancellation path funnel here.
+        """
+        self._digest_archives += archives
+        self._digest_new += new
+        self._digest_dups += dups
+        self._digest_domains.update(domains)
+        if last_archive and self._digest_last_archive is None:
+            self._digest_last_archive = last_archive
+        if since is not None and (
+            self._digest_since is None or since < self._digest_since
+        ):
+            self._digest_since = since
 
     # ------------------------------------------------------------------ stages
 
@@ -762,21 +827,30 @@ class TelegramNotifier:
             lines.append(f"• <b>{_esc(key)}:</b> {_esc(stats[key])}")
         await self.send("\n".join(lines))
 
-    async def activity_summary(self, window_label: str, new_unique_credentials: int):
-        """Hourly/daily summary of new unique credentials."""
+    async def activity_summary(
+        self, window_label: str, new_unique_credentials: int
+    ) -> bool:
+        """Hourly/daily summary of new unique credentials.
+
+        Returns the delivery result so the caller's job status can report a
+        skipped/failed send instead of claiming the summary was sent.
+        """
         msg = (
             f"{_header('📊', f'{_esc(window_label)} summary')}\n"
             f"• <b>New unique credentials:</b> {_fmt_int(new_unique_credentials)}"
         )
-        await self.send(msg)
+        return await self.send(msg)
 
     # ------------------------------------------------------------- watchlist
 
     async def watchlist_alerts(self, alerts: list[dict]) -> bool:
         """Watchlist hits — full url/username/password included.
 
-        Returns True when delivered (or nothing to send), False on a failed
-        send — the caller must only advance the alerted window on True.
+        Returns True when every message part was delivered (or there is
+        nothing to send), False when any part failed — the caller must only
+        advance the alerted window on True. Large batches are split at line
+        boundaries so a busy interval can never exceed Telegram's 4096-char
+        limit; an oversized message used to fail every retry forever.
         """
         if not alerts:
             return True
@@ -792,14 +866,20 @@ class TelegramNotifier:
 
             hits = alert.get("hits") or []
             for hit in hits[:5]:
-                source = _esc(_trunc(
+                # Truncate BEFORE escaping: slicing escaped text can cut an
+                # entity in half ("&amp" → parse error, permanently-failing
+                # message). Never pre-escape a value that _code() escapes
+                # again, or the user sees "&amp;amp;".
+                source = _trunc(
                     str(hit.get("source_archive") or hit.get("source_file") or "—"), 60
+                )
+                url = _esc(_trunc(
+                    str(hit.get("url") or hit.get("domain") or "—"), 120
                 ))
-                url = _esc(str(hit.get("url") or hit.get("domain") or "—"))
-                username = _esc(str(hit.get("username") or "—"))
-                pwd = _esc(str(hit.get("password") or "—"))
+                username = str(hit.get("username") or "—")
+                pwd = str(hit.get("password") or "—")
                 lines.append(
-                    f"  • <b>{_trunc(url, 120)}</b>\n"
+                    f"  • <b>{url}</b>\n"
                     f"    user: {_code(username)}\n"
                     f"    pwd:  {_code(pwd)}\n"
                     f"    src:  {_code(source)}"
@@ -809,4 +889,11 @@ class TelegramNotifier:
                 lines.append(f"  …and {_fmt_int(hidden)} more new hits")
         if len(alerts) > 8:
             lines.append(f"\n…and {len(alerts) - 8} more watchlist items")
-        return await self.send("\n".join(lines))
+
+        for message in _chunk_lines(lines, _TELEGRAM_MAX_MESSAGE_CHARS):
+            if not await self.send(message):
+                # Stop at the first failed part; returning False keeps the
+                # alert window in place so the whole batch is re-alerted next
+                # interval (at-least-once) rather than silently dropped.
+                return False
+        return True

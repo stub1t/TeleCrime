@@ -924,6 +924,113 @@ class TestExtractStageNestedFailureRetryable:
         # output rows would otherwise duplicate on the next attempt).
         assert session.query(ExtractedOutput).filter_by(job_id=job_id).count() == 0
 
+    @pytest.mark.asyncio
+    async def test_partial_integrity_group_is_parsed_not_failed(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """A PARTIAL_INTEGRITY extraction must leave the group EXTRACTED and
+        the job COMPLETED so the parse stage consumes the recovered members.
+
+        Marking the group FAILED (the previous behaviour) made finalize treat
+        it as terminal and never parse the extracted .txt files.
+        """
+        from sqlalchemy.orm import joinedload
+
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            ExtractedOutput,
+            ExtractionJob,
+            FileAttachment,
+            Message,
+        )
+
+        conv = Conversation(platform_id=499, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=1,
+            platform_timestamp=datetime.now(UTC),
+            text="corrupt dump",
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id,
+            platform_file_id="corrupt-rar",
+            filename="dump.rar",
+            archive_type="rar",
+        )
+        session.add(attachment)
+        session.flush()
+
+        dl_path = tmp_path / "downloads" / "dump.rar"
+        dl_path.parent.mkdir(parents=True, exist_ok=True)
+        dl_path.write_bytes(b"Rar!\x1a\x07\x00 corrupt")
+
+        artifact = DownloadArtifact(attachment_id=attachment.id, local_path=str(dl_path))
+        session.add(artifact)
+        session.flush()
+        group = ArchiveGroup(
+            fingerprint="partial-group",
+            base_name="dump.rar",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.READY,
+        )
+        session.add(group)
+        session.flush()
+        session.add(ArchiveGroupPart(group_id=group.id, artifact_id=artifact.id, part_index=0))
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.PENDING)
+        session.add(job)
+        session.flush()
+        session.commit()
+
+        group = session.get(
+            ArchiveGroup,
+            group.id,
+            options=[
+                joinedload(ArchiveGroup.parts)
+                .joinedload(ArchiveGroupPart.artifact)
+                .joinedload(DownloadArtifact.attachment)
+            ],
+        )
+        job_id = job.id
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        stage = ExtractStage()
+        monkeypatch.setattr(stage, "_has_sufficient_disk", lambda _ctx: True)
+        monkeypatch.setattr(
+            stage, "_get_password_candidates", AsyncMock(return_value=[])
+        )
+
+        extractor = SevenZipExtractor()
+
+        async def _fake_extract(archive, dest, **kwargs):
+            dest.mkdir(parents=True, exist_ok=True)
+            out = dest / "recovered.txt"
+            out.write_text("https://example.com;user;pass\n", encoding="utf-8")
+            return ExtractionResult(
+                success=True,
+                extracted_files=[out],
+                error_code="PARTIAL_INTEGRITY",
+                error_message="CRC errors; recovered members only",
+            )
+
+        extractor.extract = AsyncMock(side_effect=_fake_extract)
+
+        result = await stage._extract_group(ctx, group, extractor)
+
+        assert result is True
+        assert session.get(ArchiveGroup, group.id).status == GroupStatus.EXTRACTED
+        reloaded_job = session.get(ExtractionJob, job_id)
+        assert reloaded_job.status == ExtractionStatus.COMPLETED
+        assert reloaded_job.last_error_code == "PARTIAL_INTEGRITY"
+        assert session.query(ExtractedOutput).filter_by(job_id=job_id).count() == 1
+
 
 class TestEnrichStageOriginRetry:
     """Transient origin-resolution failures must not permanently skip messages."""
@@ -2353,16 +2460,32 @@ class TestParseParallelChunking:
         assert sum(len(c) for c in chunks) == raw_line_count
 
     def test_iter_line_chunks_hard_cut_on_unbounded_combo_list(self, tmp_path):
-        """A combo list with no blank lines still gets chunked (hard cut) and
-        keeps every line (combo lines are line-independent)."""
-        from telecrime.pipeline.parse import _iter_line_chunks
+        """A combo list with no blank lines still gets chunked and keeps every
+        line (combo lines are line-independent).
+
+        The fallback overlaps the trailing carry lines into the next chunk so
+        a record whose head ends one chunk is completed by the next one; the
+        duplicate overlap is absorbed by credential_hash dedup."""
+        from telecrime.pipeline.parse import (
+            _HARD_CUT_CARRY_LINES,
+            _iter_line_chunks,
+        )
 
         lines = [f"https://site{i}.com;u{i};p{i}" for i in range(150)]
         fh = StringIO("\n".join(lines))
         chunks = list(_iter_line_chunks(fh, chunk_lines=10))
         # Hard-cut fallback kicks in at 4×chunk_lines; 150 lines → 4+ chunks.
         assert len(chunks) >= 4
-        assert sum(len(c) for c in chunks) == len(lines)
+        # Every source line is covered (overlap may repeat carry lines).
+        seen: set[str] = set()
+        for chunk in chunks:
+            seen.update(chunk)
+        assert seen == set(lines)
+        # Consecutive chunks overlap by the carry so a straddling record's
+        # head is present again with its tail.
+        for prev, nxt in zip(chunks, chunks[1:]):
+            carry = prev[-_HARD_CUT_CARRY_LINES:]
+            assert nxt[: len(carry)] == carry
 
     def test_parse_lines_chunk_worker_matches_sequential(self, tmp_path):
         """Parsing a chunk through the worker yields the same credentials as the
@@ -3016,7 +3139,7 @@ class TestFinalizeFirstSeenUpsert:
 
         output = ExtractedOutput(
             output_path="/tmp/dup.txt",
-            output_filename="dup.txt",
+            output_filename="Passwords.txt",
             output_hash="a" * 64,
         )
         stage = FinalizeStage()
@@ -3461,6 +3584,132 @@ class TestParseEarlyDupSkip:
         group, ctx, _counts = await self._run_early_skip(
             session, test_config, tmp_path, monkeypatch
         )
+
+        assert group.id in ctx.parse_failed_group_ids
+
+    @pytest.mark.asyncio
+    async def test_early_skip_persists_marker_and_next_run_parses_fully(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """The early-skip point is deterministic; without a persisted marker
+        every retry re-skips at the same place (deleting the rows again) and
+        the tail is never parsed. The marker forces the next run to parse the
+        whole file."""
+        from telecrime.models import ExtractionJob, ParsedCredential
+        from telecrime.pipeline import parse as parse_mod
+
+        group, _ctx, counts = await self._run_early_skip(
+            session, test_config, tmp_path, monkeypatch
+        )
+        job = session.query(ExtractionJob).filter_by(group_id=group.id).one()
+        assert job.last_error_code == "EARLY_SKIP"
+        assert counts == (0, 12)
+
+        stage = parse_mod.ParseStage()
+        ctx2 = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        counts2 = await stage.run_group(ctx2, group.id)
+
+        assert counts2 == (2, 12)
+        session.expire_all()
+        reloaded = session.get(ExtractionJob, job.id)
+        assert reloaded.last_error_code is None
+        assert group.id not in ctx2.parse_failed_group_ids
+        assert session.query(ParsedCredential).count() == 3
+
+    @pytest.mark.asyncio
+    async def test_complete_sibling_job_keeps_incomplete_group_retryable(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """A later fully-parsed job must not clear the incomplete flag set by
+        an early-skipped sibling job in the same group (multi-job groups)."""
+        from telecrime.models import (
+            ArchiveGroup,
+            ExtractedOutput,
+            ExtractionJob,
+            ParsedCredential,
+        )
+        from telecrime.pipeline import parse as parse_mod
+
+        dup_file = tmp_path / "Passwords.txt"
+        clean_file = tmp_path / "Combo.txt"
+        dup_file.write_text("placeholder")
+        clean_file.write_text("placeholder")
+
+        group = ArchiveGroup(
+            fingerprint="multi-job",
+            base_name="multi.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.EXTRACTED,
+        )
+        session.add(group)
+        session.flush()
+        dup_job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+        clean_job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+        session.add_all([dup_job, clean_job])
+        session.flush()
+        session.add_all(
+            [
+                ExtractedOutput(
+                    job_id=dup_job.id,
+                    output_path=str(dup_file),
+                    output_filename="Passwords.txt",
+                    output_hash="d" * 64,
+                ),
+                ExtractedOutput(
+                    job_id=clean_job.id,
+                    output_path=str(clean_file),
+                    output_filename="Combo.txt",
+                    output_hash="e" * 64,
+                ),
+            ]
+        )
+        dup = SimpleNamespace(
+            url="https://dup.example/login",
+            domain="dup.example",
+            username="dupe",
+            password="secret",
+            email_domain=None,
+            application=None,
+            profile=None,
+        )
+        session.add(
+            ParsedCredential(
+                url=dup.url,
+                domain=dup.domain,
+                username=dup.username,
+                password=dup.password,
+                credential_hash=ParsedCredential.compute_hash(
+                    dup.domain, dup.username, dup.password
+                ),
+                source_file="/tmp/another-file.txt",
+            )
+        )
+        session.commit()
+
+        def _creds(path):
+            if str(path).endswith("Passwords.txt"):
+                for _ in range(12):  # 3 consecutive all-dup batches of 4
+                    yield dup
+            else:
+                yield SimpleNamespace(
+                    url="https://clean.example/login",
+                    domain="clean.example",
+                    username="clean",
+                    password="secret",
+                    email_domain=None,
+                    application=None,
+                    profile=None,
+                )
+
+        monkeypatch.setattr(parse_mod, "iter_credentials_file", _creds)
+        monkeypatch.setattr(parse_mod, "_BATCH_SIZE", 4)
+        monkeypatch.setattr(parse_mod, "_apply_pg_bulk_settings", lambda _session: None)
+        monkeypatch.setattr(parse_mod, "_reset_pg_bulk_settings", lambda _session: None)
+
+        stage = parse_mod.ParseStage()
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        await stage.run_group(ctx, group.id)
 
         assert group.id in ctx.parse_failed_group_ids
 

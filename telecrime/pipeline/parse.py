@@ -51,6 +51,10 @@ _CHUNK_BOUNDARY_RE = re.compile(r"^(?:---+|===+|_{3,})\s*$")
 # cut. Carrying the trailing lines into the next chunk would re-parse complete
 # records (harmless: ON CONFLICT dedups) but never loses a straddling one.
 _HARD_CUT_CARRY_LINES = 5
+# Persisted on the job when a file was early-skipped so the next run forces a
+# full parse of that file instead of early-skipping at the same point forever
+# (the duplicate-heavy prefix is deterministic).
+_EARLY_SKIP_CODE = "EARLY_SKIP"
 
 
 def _iter_line_chunks(
@@ -78,9 +82,13 @@ def _iter_line_chunks(
             yield buf
             buf = []
         elif len(buf) >= chunk_lines * 4:
-            carry = buf[-_HARD_CUT_CARRY_LINES:]
-            yield buf[:-_HARD_CUT_CARRY_LINES]
-            buf = list(carry)
+            # Overlap the trailing lines into the next chunk: a record whose
+            # head is at the end of this chunk is then complete in the next one
+            # (the previous non-overlapping carry split it and lost it). Any
+            # complete record re-parsed by the overlap is deduplicated by
+            # credential_hash.
+            yield buf
+            buf = list(buf[-_HARD_CUT_CARRY_LINES:])
     if buf:
         yield buf
 
@@ -640,6 +648,9 @@ class ParseStage(PipelineStage):
         _ensure_hash64_index(ctx.session.get_bind())
 
         try:
+            # Groups marked incomplete earlier in this run: a sibling job that
+            # parses fully must not clear its group's flag (multi-job groups).
+            incomplete_groups: set[int] = set()
             for job in jobs:
                 try:
                     creds_found, dups_found, incomplete = (
@@ -656,8 +667,9 @@ class ParseStage(PipelineStage):
                     # keeps its archive for the next run.
                     if job.group_id is not None:
                         if incomplete:
+                            incomplete_groups.add(job.group_id)
                             ctx.parse_failed_group_ids.add(job.group_id)
-                        else:
+                        elif job.group_id not in incomplete_groups:
                             ctx.parse_failed_group_ids.discard(job.group_id)
                 except Exception as e:
                     try:
@@ -677,6 +689,7 @@ class ParseStage(PipelineStage):
                     # disk. Tell finalize to leave the group EXTRACTED so the
                     # next run re-parses it instead of deleting the files.
                     if job.group_id is not None:
+                        incomplete_groups.add(job.group_id)
                         ctx.parse_failed_group_ids.add(job.group_id)
                     # CRITICAL partial-loss edge: the next run's per-file
                     # pre-skip (parsed_source_files) skips a file as soon as
@@ -742,6 +755,9 @@ class ParseStage(PipelineStage):
         total_credentials = 0
         total_duplicates = 0
         try:
+            # See ParseStage.run: a later complete job must not clear an
+            # incomplete sibling's group flag.
+            incomplete_groups: set[int] = set()
             for job in jobs:
                 job_id = job.id
                 try:
@@ -756,8 +772,9 @@ class ParseStage(PipelineStage):
                     ctx.duplicates_skipped += dups_found
                     if job.group_id is not None:
                         if incomplete:
+                            incomplete_groups.add(job.group_id)
                             ctx.parse_failed_group_ids.add(job.group_id)
-                        else:
+                        elif job.group_id not in incomplete_groups:
                             ctx.parse_failed_group_ids.discard(job.group_id)
                 except Exception as e:
                     # Same failure semantics as ParseStage.run: without this,
@@ -782,6 +799,7 @@ class ParseStage(PipelineStage):
                     # The un-parsed remainder is only on disk — tell finalize
                     # to leave the group EXTRACTED so the next run re-parses it
                     # instead of reclaiming the files.
+                    incomplete_groups.add(group_id)
                     ctx.parse_failed_group_ids.add(group_id)
                     # Delete the job's already-inserted rows so the next run
                     # re-parses the whole job cleanly (ON CONFLICT dedups).
@@ -867,6 +885,9 @@ class ParseStage(PipelineStage):
         credentials_found = 0
         duplicates_found = 0
         incomplete = False
+        # A previous run early-skipped a file of this job: parse every file
+        # fully this time so the never-parsed tail cannot be skipped forever.
+        force_full = job.last_error_code == _EARLY_SKIP_CODE
 
         # Get the extracted output files
         outputs = job.outputs
@@ -967,8 +988,9 @@ class ParseStage(PipelineStage):
                 logger.warning("Credential file missing: %s", file_path)
                 continue
 
-            # Check if we've already parsed this file
-            if str(file_path) in parsed_source_files:
+            # Check if we've already parsed this file (bypassed when a previous
+            # early-skip means the file's tail is still unparsed)
+            if not force_full and str(file_path) in parsed_source_files:
                 logger.debug("Already parsed: %s", file_path)
                 continue
 
@@ -1171,7 +1193,7 @@ class ParseStage(PipelineStage):
                             ctx.session.commit()
                             batches_since_commit = 0
                         await asyncio.sleep(0)
-                        if _is_dup_batch(new, dups, _BATCH_SIZE):
+                        if not force_full and _is_dup_batch(new, dups, _BATCH_SIZE):
                             dup_batches_seen += 1
                             if dup_batches_seen >= dup_confirm_batches:
                                 file_skipped_as_dup = True
@@ -1215,7 +1237,7 @@ class ParseStage(PipelineStage):
                                 ctx.session.commit()
                                 batches_since_commit = 0
                             await asyncio.sleep(0)
-                            if _is_dup_batch(new, dups, _BATCH_SIZE):
+                            if not force_full and _is_dup_batch(new, dups, _BATCH_SIZE):
                                 dup_batches_seen += 1
                                 if dup_batches_seen >= dup_confirm_batches:
                                     file_skipped_as_dup = True
@@ -1284,13 +1306,35 @@ class ParseStage(PipelineStage):
                         exc,
                     )
                 incomplete = True
+                # Persist a marker so the next run parses this job's files
+                # fully (force_full) — otherwise the deterministic duplicate
+                # prefix makes every retry early-skip at the same point,
+                # deleting the rows again and never parsing the tail.
+                job.last_error_code = _EARLY_SKIP_CODE
+                try:
+                    ctx.session.commit()
+                except Exception as exc:
+                    try:
+                        ctx.session.rollback()
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "Could not persist early-skip marker for %s: %s",
+                        file_path.name,
+                        exc,
+                    )
                 logger.warning(
                     "Early-skip left %s incompletely parsed (%d partial rows removed); "
-                    "group %s kept for re-parse",
+                    "group %s kept for re-parse (next run parses fully)",
                     file_path.name,
                     removed or 0,
                     job.group_id,
                 )
+            elif force_full and job.last_error_code == _EARLY_SKIP_CODE:
+                # Full parse of this job completed; the early-skip retry
+                # marker served its purpose.
+                job.last_error_code = None
+                ctx.session.commit()
 
             if file_cred_count:
                 logger.info(

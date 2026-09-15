@@ -490,20 +490,22 @@ class ExtractStage(PipelineStage):
                 main_archive.name,
             )
             if result.error_code == "PARTIAL_INTEGRITY":
-                # The recovered members are recorded and will be parsed, but
-                # the archive still holds unextracted/corrupt members. Keep
-                # the group retryable so finalize does not delete the source.
-                job.status = ExtractionStatus.FAILED
+                # The recovered members are recorded and the group stays
+                # EXTRACTED/COMPLETED so the parse stage actually consumes them
+                # this run. The unreadable members cannot be recovered from a
+                # CRC-corrupt archive, so reclaiming it after parsing is the
+                # best available outcome (terminalizing CORRUPTED instead
+                # deleted these credentials unparsed).
                 job.last_error_code = "PARTIAL_INTEGRITY"
                 job.last_error_message = (
                     result.error_message or "partial extraction (integrity errors)"
                 )
-                group.status = GroupStatus.FAILED
                 logger.warning(
-                    "Partial extraction of %s recorded — group kept retryable",
+                    "Partial extraction of %s: %d member(s) parsed; "
+                    "unreadable members are lost with the archive",
                     main_archive.name,
+                    len(txt_files),
                 )
-                return False
             return True
 
         elif result.requires_password:

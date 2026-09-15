@@ -758,6 +758,38 @@ def test_collect_watchlist_alerts_only_returns_new_matches(pg_engine):
         assert item.last_alerted_at.replace(tzinfo=UTC) > watermarked_at
 
 
+def test_watchlist_count_arms_statement_timeout(pg_engine):
+    """The ILIKE COUNT helper itself arms the finite statement_timeout, so no
+    caller (notify's pipeline scan included) can run it unbounded."""
+    from sqlalchemy import event
+
+    from telecrime.database import get_session
+    from telecrime.models.watchlist import WatchlistItem
+    from telecrime.scheduler import (
+        _WATCHLIST_COUNT_STATEMENT_TIMEOUT,
+        _watchlist_count_matches,
+    )
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(pg_engine, "before_cursor_execute", _record)
+    try:
+        with get_session(pg_engine) as session:
+            item = WatchlistItem(
+                label="bounded", query="bounded", match_type="domain", enabled=True
+            )
+            session.add(item)
+            session.flush()
+            assert _watchlist_count_matches(session, item) == 0
+    finally:
+        event.remove(pg_engine, "before_cursor_execute", _record)
+
+    assert _WATCHLIST_COUNT_STATEMENT_TIMEOUT in " ".join(statements).lower()
+
+
 def test_check_disk_status_uses_config_threshold(tmp_path, monkeypatch):
     """Disk check respects the configurable scheduler threshold."""
     from telecrime.scheduler import _check_disk_status
@@ -1151,6 +1183,140 @@ def test_run_summary_job_skips_when_count_times_out(monkeypatch):
     )
     result = _run_summary_job(MagicMock(), MagicMock(), hours=1)
     assert "timed out" in result
+
+
+def test_run_summary_job_reports_skipped_send(monkeypatch):
+    """A send deferred while the pipeline holds the session must be reported
+    as skipped, not as 'sent'."""
+    from telecrime.scheduler import _run_summary_job
+
+    monkeypatch.setattr(
+        "telecrime.scheduler._count_recent_unique_credentials",
+        lambda engine, hours: 5,
+    )
+    monkeypatch.setattr(
+        "telecrime.scheduler._send_telegram_notification",
+        lambda config, callback: "skipped: pipeline running (session in use)",
+    )
+    result = _run_summary_job(MagicMock(), MagicMock(), hours=1)
+    assert "skipped" in result
+    assert "sent" not in result
+
+
+def test_run_summary_job_reports_failed_send(monkeypatch):
+    """send() returning False must surface as a failed summary even when the
+    transport callback itself returned 'ok'."""
+    import asyncio
+
+    from telecrime.scheduler import _run_summary_job
+
+    class _Notifier:
+        async def activity_summary(self, label, count):
+            return False
+
+    def _fake_send(config, callback):
+        asyncio.run(callback(_Notifier()))
+        return "ok"
+
+    monkeypatch.setattr(
+        "telecrime.scheduler._count_recent_unique_credentials",
+        lambda engine, hours: 7,
+    )
+    monkeypatch.setattr(
+        "telecrime.scheduler._send_telegram_notification", _fake_send
+    )
+    result = _run_summary_job(MagicMock(), MagicMock(), hours=1)
+    assert "send failed" in result
+    assert "sent" not in result
+
+
+def test_run_summary_job_reports_sent_on_delivery(monkeypatch):
+    """The happy path still reports the count as sent."""
+    import asyncio
+
+    from telecrime.scheduler import _run_summary_job
+
+    class _Notifier:
+        async def activity_summary(self, label, count):
+            return True
+
+    def _fake_send(config, callback):
+        asyncio.run(callback(_Notifier()))
+        return "ok"
+
+    monkeypatch.setattr(
+        "telecrime.scheduler._count_recent_unique_credentials",
+        lambda engine, hours: 7,
+    )
+    monkeypatch.setattr(
+        "telecrime.scheduler._send_telegram_notification", _fake_send
+    )
+    result = _run_summary_job(MagicMock(), MagicMock(), hours=1)
+    assert result.startswith("sent last hour summary: 7")
+
+
+def test_advance_watchlist_alerts_is_monotonic(in_memory_engine):
+    """A stale advance (slow sender vs the scheduler job) must not move the
+    watermark backwards — that would re-alert the same hits every interval."""
+    from telecrime.database import get_session
+    from telecrime.models.watchlist import WatchlistItem
+    from telecrime.scheduler import _advance_watchlist_alerts
+
+    newer = datetime.now(UTC)
+    with get_session(in_memory_engine) as session:
+        item = WatchlistItem(
+            label="mono",
+            query="mono",
+            match_type="any",
+            enabled=True,
+            last_alerted_at=newer,
+            last_alerted_count=10,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    _advance_watchlist_alerts(
+        in_memory_engine,
+        [{"id": item_id, "collected_at": newer - timedelta(minutes=5), "total_matches": 3}],
+    )
+
+    with get_session(in_memory_engine) as session:
+        item = session.query(WatchlistItem).one()
+        assert item.last_alerted_count == 10
+        assert item.last_alerted_at.replace(tzinfo=UTC) == newer
+
+
+def test_advance_watchlist_alerts_moves_forward(in_memory_engine):
+    """A genuinely newer collection still advances the watermark and count."""
+    from telecrime.database import get_session
+    from telecrime.models.watchlist import WatchlistItem
+    from telecrime.scheduler import _advance_watchlist_alerts
+
+    older = datetime.now(UTC) - timedelta(hours=1)
+    with get_session(in_memory_engine) as session:
+        item = WatchlistItem(
+            label="fwd",
+            query="fwd",
+            match_type="any",
+            enabled=True,
+            last_alerted_at=older,
+            last_alerted_count=1,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    collected = datetime.now(UTC)
+    _advance_watchlist_alerts(
+        in_memory_engine,
+        [{"id": item_id, "collected_at": collected, "total_matches": 4}],
+    )
+
+    with get_session(in_memory_engine) as session:
+        item = session.query(WatchlistItem).one()
+        assert item.last_alerted_count == 4
+        assert item.last_alerted_at.replace(tzinfo=UTC) == collected
 
 
 def test_reparse_job_reports_timeout_instead_of_failing(monkeypatch):

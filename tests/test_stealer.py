@@ -769,6 +769,17 @@ Password: pass123
         assert any(c.username == "late" and c.password == "latepw" for c in dropped)
         assert _COMBO_CLASS_CACHE.get(src) is True
 
+    def test_combo_cache_is_empty_at_test_start(self):
+        """Regression guard for full-suite ordering: the autouse cache-reset
+        fixture must clear process-global caches left by earlier tests.
+
+        Placed last in this class, so without the fixture the entries added by
+        the parsing tests above would still be present and this fails.
+        """
+        from telecrime.stealer.parser import _COMBO_CLASS_CACHE
+
+        assert _COMBO_CLASS_CACHE == {}
+
 
 class TestSpaceSeparatedComboFormats:
     """Round-14 fix 1: ``URL user:pass`` / ``URL user pass`` combo rows were

@@ -74,6 +74,20 @@ def pg_engine():
     finally:
         admin.dispose()
     Base.metadata.create_all(bind=engine)
+    # The trigram GIN indexes live in migration i9j0k1l2m3n4, not in the
+    # models, so create_all leaves them out and fts_available() (correctly)
+    # reports FTS as unavailable. Recreate them on the empty schema so the
+    # PG-backed FTS tests exercise the production search path.
+    from telecrime.fts import _PG_TRGM_INDEXES
+
+    with engine.begin() as conn:
+        for name, column in _PG_TRGM_INDEXES.items():
+            conn.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS {name} ON parsed_credentials "
+                    f"USING GIN ({column} gin_trgm_ops)"
+                )
+            )
     yield engine
     engine.dispose()
 
@@ -88,18 +102,77 @@ def pg_session(pg_engine) -> Session:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_shutdown_request_file(tmp_path, monkeypatch):
-    """Point the shutdown-request file at a per-test temp path.
+def _isolate_runtime_state_files(tmp_path, monkeypatch):
+    """Point runtime state files at per-test temp paths.
 
     Without this, scheduler tests read the developer's real
     ``data/pipeline_shutdown_request.json``; ``_pipeline_lock_is_held()`` then
     probes a MagicMock ``data_dir`` and ``Path`` coercion creates
-    ``MagicMock/mock.data_dir/<id>/`` junk dirs in the repo root.
+    ``MagicMock/mock.data_dir/<id>/`` junk dirs in the repo root. The progress
+    file is isolated symmetrically: a live host pipeline can leave
+    ``data/pipeline_progress.json`` with ``running: true``, which would make
+    tests that read it depend on host state instead of their own fixtures.
     """
     monkeypatch.setenv(
         "TELECRIME_SHUTDOWN_REQUEST_FILE",
         str(tmp_path / "pipeline_shutdown_request.json"),
     )
+    monkeypatch.setenv(
+        "TELECRIME_PROGRESS_FILE",
+        str(tmp_path / "pipeline_progress.json"),
+    )
+
+
+def _reset_module_caches() -> None:
+    """Clear process-global module caches so tests cannot leak state.
+
+    Telecrime keeps a few path/URL-keyed caches at module scope (parser
+    classification, schema introspection, password files). In one pytest
+    process those survive across tests, so whether a test sees a cache hit
+    depends on which tests ran before it. This is only cleared for modules
+    that are already imported: a module imported for the first time by the
+    current test starts with empty caches by construction.
+    """
+    import sys
+
+    parser = sys.modules.get("telecrime.stealer.parser")
+    if parser is not None:
+        parser._COMBO_CLASS_CACHE.clear()
+
+    parse_mod = sys.modules.get("telecrime.pipeline.parse")
+    if parse_mod is not None:
+        # Tri-state hash64 probe; a stale True/False from an earlier test's
+        # engine must not decide the dedup path for this test's engine.
+        parse_mod._HAS_HASH64 = None
+        parse_mod._HAS_HASH64_RETRY_AT = 0.0
+
+    extractor = sys.modules.get("telecrime.passwords.extractor")
+    if extractor is not None:
+        extractor._password_file_cache.clear()
+
+    fts = sys.modules.get("telecrime.fts")
+    if fts is not None:
+        fts._column_cache.clear()
+
+    scheduler = sys.modules.get("telecrime.scheduler")
+    if scheduler is not None:
+        scheduler._soft_hash_col_cache.clear()
+
+    web_app = sys.modules.get("telecrime.web.app")
+    if web_app is not None:
+        web_app._db_column_cache.clear()
+
+    progress = sys.modules.get("telecrime.pipeline.progress")
+    if progress is not None:
+        progress._NOTE_OVERRIDES.clear()
+        progress._last_progress_write_warn.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_module_caches():
+    """Reset process-global caches before each test (no ordering coupling)."""
+    _reset_module_caches()
+    yield
 
 
 @pytest.fixture

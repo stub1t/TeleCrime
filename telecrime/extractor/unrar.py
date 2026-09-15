@@ -228,8 +228,13 @@ class UnrarExtractor(ArchiveExtractor):
                 # that did come out cleanly: terminalizing CORRUPTED here threw
                 # away credentials recoverable from the non-corrupt members.
                 # Archive/header corruption ("Bad archive", "checksum error")
-                # taints every byte and stays terminal.
-                if "crc failed" in combined_lower:
+                # taints every byte and stays terminal even when a CRC line is
+                # also present.
+                _archive_level = (
+                    "bad archive" in combined_lower
+                    or "checksum error" in combined_lower
+                )
+                if not _archive_level and "crc failed" in combined_lower:
                     partial = await asyncio.to_thread(
                         self._find_extracted_files, output_dir, target_extensions
                     )
@@ -292,8 +297,12 @@ class UnrarExtractor(ArchiveExtractor):
                     wrong_password=True,
                 )
             # See the non-zero-exit branch: only member-level CRC failures
-            # allow salvaging the clean members.
-            if "crc failed" in combined_lower:
+            # allow salvaging the clean members; archive-level corruption
+            # stays terminal even when a CRC line is also present.
+            _archive_level = (
+                "bad archive" in combined_lower or "checksum error" in combined_lower
+            )
+            if not _archive_level and "crc failed" in combined_lower:
                 partial = await asyncio.to_thread(
                     self._find_extracted_files, output_dir, target_extensions
                 )
