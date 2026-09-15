@@ -224,6 +224,26 @@ class UnrarExtractor(ArchiveExtractor):
                         error_message="Wrong password (integrity failure in encrypted file)",
                         wrong_password=True,
                     )
+                # Only member-level CRC failures allow salvaging the members
+                # that did come out cleanly: terminalizing CORRUPTED here threw
+                # away credentials recoverable from the non-corrupt members.
+                # Archive/header corruption ("Bad archive", "checksum error")
+                # taints every byte and stays terminal.
+                if "crc failed" in combined_lower:
+                    partial = await asyncio.to_thread(
+                        self._find_extracted_files, output_dir, target_extensions
+                    )
+                    if partial:
+                        logger.warning(
+                            "unrar CRC failure but %d member(s) recovered",
+                            len(partial),
+                        )
+                        return ExtractionResult(
+                            success=True,
+                            extracted_files=partial,
+                            error_code="PARTIAL_INTEGRITY",
+                            error_message="Archive has CRC errors; parsed recovered members only",
+                        )
                 return ExtractionResult(
                     success=False,
                     error_code="CORRUPTED",
@@ -271,6 +291,23 @@ class UnrarExtractor(ArchiveExtractor):
                     error_message="Wrong password (integrity failure in encrypted file)",
                     wrong_password=True,
                 )
+            # See the non-zero-exit branch: only member-level CRC failures
+            # allow salvaging the clean members.
+            if "crc failed" in combined_lower:
+                partial = await asyncio.to_thread(
+                    self._find_extracted_files, output_dir, target_extensions
+                )
+                if partial:
+                    logger.warning(
+                        "unrar CRC failure but %d member(s) recovered",
+                        len(partial),
+                    )
+                    return ExtractionResult(
+                        success=True,
+                        extracted_files=partial,
+                        error_code="PARTIAL_INTEGRITY",
+                        error_message="Archive has CRC errors; parsed recovered members only",
+                    )
             return ExtractionResult(
                 success=False,
                 error_code="CORRUPTED",

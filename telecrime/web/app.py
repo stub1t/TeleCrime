@@ -398,6 +398,20 @@ def _pg_bounded_candidate_ids(
 
 _COUNT_CAP = 10_001  # Stop counting after this many rows; display as "10,000+"
 
+# Finite bound for the final COUNT(DISTINCT ...) over the bounded candidate-id
+# pool. The candidate fetch has its own per-branch timeouts, but the count still
+# hits parsed_credentials (and any structured filter columns) and must never
+# run unbounded on a pooled session.
+_SEARCH_COUNT_STATEMENT_TIMEOUT = "20s"
+
+# Finite bound for the facet GROUP BY queries; the candidate pool is bounded,
+# but a structured-filter + GROUP BY can still be slow on a busy table.
+_SEARCH_FACETS_STATEMENT_TIMEOUT = "20s"
+
+# Finite bound for the ops-fragment live credential count (10-minute window on
+# the 357M-row parsed_credentials table), polled by HTMX every few seconds.
+_OPS_FRAGMENT_STATEMENT_TIMEOUT = "20s"
+
 
 def _credential_match_count(
     session, *, terms: str, filters: dict[str, list[str]], exclude_conversation_ids: set[int]
@@ -406,6 +420,9 @@ def _credential_match_count(
         return 0
 
     if session.get_bind().dialect.name == "postgresql":
+        session.execute(
+            text(f"SET LOCAL statement_timeout = '{_SEARCH_COUNT_STATEMENT_TIMEOUT}'")
+        )
         candidate_ids = _pg_bounded_candidate_ids(
             session,
             terms=terms,
@@ -1334,6 +1351,8 @@ def _check_watchlist(engine, *, incremental_only: bool = False) -> None:
                 # Bound (not disable) the per-item timeout: a pathological item
                 # (e.g. match_type "any" with a single-char query) would otherwise
                 # hold a backend indefinitely with no external watchdog to cancel.
+                # If the SET itself fails, skip the sweep rather than run
+                # unbounded ILIKE scans — the next interval retries.
                 try:
                     conn.execute(
                         text(
@@ -1341,8 +1360,12 @@ def _check_watchlist(engine, *, incremental_only: bool = False) -> None:
                             f"'{_WATCHLIST_WEB_STATEMENT_TIMEOUT}'"
                         )
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "Watchlist sweep skipped — could not set statement_timeout: %s",
+                        exc,
+                    )
+                    return
                 try:
                     for item in items:
                         try:
@@ -2316,6 +2339,12 @@ def _normalize_password_scope(scope: str) -> PasswordScope | None:
         return None
 
 
+# A refresh claim older than this is presumed dead (e.g. Thread.start() raised
+# before the worker could run its finally). Without reclaiming, a single stale
+# ``refreshing=True`` flag would wedge credential-count updates forever.
+_CRED_COUNTS_REFRESH_STALE_SECONDS = 300.0
+
+
 def _claim_cred_counts_refresh(cache: dict, ttl: float) -> bool:
     """Single-flight claim for the background credential-count refresh.
 
@@ -2323,15 +2352,24 @@ def _claim_cred_counts_refresh(cache: dict, ttl: float) -> bool:
     and stamping the cache fresh so concurrent HTMX polls can't spawn
     duplicate COUNT/JOIN threads (the query itself is bounded by
     ``_CRED_COUNTS_STATEMENT_TIMEOUT``). The caller must clear
-    ``cache["refreshing"]`` when the refresh finishes.
+    ``cache["refreshing"]`` when the refresh finishes. A claim older than
+    ``_CRED_COUNTS_REFRESH_STALE_SECONDS`` is reclaimed so a dead in-flight
+    worker cannot block updates permanently.
     """
     with cache["lock"]:
-        if cache["refreshing"]:
-            return False
         now = time.monotonic()
+        if cache["refreshing"]:
+            claimed_at = cache.get("claimed_at")
+            if claimed_at is not None and now - claimed_at <= _CRED_COUNTS_REFRESH_STALE_SECONDS:
+                return False
+            logger.warning(
+                "Credential-count refresh claim stale (%.0fs) — reclaiming",
+                0.0 if claimed_at is None else now - claimed_at,
+            )
         if now - cache["ts"] <= ttl:
             return False
         cache["refreshing"] = True
+        cache["claimed_at"] = now
         cache["ts"] = now
         return True
 
@@ -2508,7 +2546,20 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
             daily_credentials_14d: list[dict[str, object]] = []
             if excluded_conversations:
-                daily_credentials_14d = _daily_credentials(session, excluded_conversations)
+                # 14-day GROUP BY on parsed_credentials; bound it and degrade to
+                # an empty chart instead of failing the request (the cached
+                # path below is only used without exclusions).
+                try:
+                    if session.get_bind().dialect.name == "postgresql":
+                        session.execute(text("SET LOCAL statement_timeout = '30s'"))
+                    daily_credentials_14d = _daily_credentials(session, excluded_conversations)
+                except SQLAlchemyError as exc:
+                    try:
+                        session.rollback()
+                    except Exception:
+                        pass
+                    logger.warning("home: daily credential chart failed: %r", exc)
+                    daily_credentials_14d = []
             elif cached_home and isinstance(cached_home.get("daily_credentials_14d"), list):
                 daily_credentials_14d = cast(
                     list[dict[str, object]], cached_home["daily_credentials_14d"]
@@ -2640,18 +2691,37 @@ def create_app(database_url: str | None = None) -> FastAPI:
             live_creds_10m = 0
             latest_credential_at = None
             if progress_stale or progress_counter_stale:
-                live_row = session.execute(
-                    select(
-                        func.count(ParsedCredential.id),
-                        func.max(ParsedCredential.created_at),
-                    ).where(
-                        ParsedCredential.created_at
-                        >= datetime.now(UTC) - timedelta(minutes=10)
-                    )
-                ).first()
-                if live_row:
-                    live_creds_10m = int(live_row[0] or 0)
-                    latest_credential_at = live_row[1]
+                try:
+                    if session.get_bind().dialect.name == "postgresql":
+                        session.execute(
+                            text(
+                                "SET LOCAL statement_timeout = "
+                                f"'{_OPS_FRAGMENT_STATEMENT_TIMEOUT}'"
+                            )
+                        )
+                    live_row = session.execute(
+                        select(
+                            func.count(ParsedCredential.id),
+                            func.max(ParsedCredential.created_at),
+                        ).where(
+                            ParsedCredential.created_at
+                            >= datetime.now(UTC) - timedelta(minutes=10)
+                        )
+                    ).first()
+                    if live_row:
+                        live_creds_10m = int(live_row[0] or 0)
+                        latest_credential_at = live_row[1]
+                except SQLAlchemyError as exc:
+                    # A timeout aborts the transaction; roll back so the rest
+                    # of the fragment's queries can run, and degrade the live
+                    # counter to zero instead of failing the HTMX poll.
+                    try:
+                        session.rollback()
+                    except Exception:
+                        pass
+                    logger.warning("ops-fragment live credential count failed: %r", exc)
+                    live_creds_10m = 0
+                    latest_credential_at = None
 
             # Recent CLEANED groups — credential_count is denormalized at finalize time,
             # so no JOIN needed. Groups cleaned before this feature was added show 0
@@ -3395,73 +3465,89 @@ def create_app(database_url: str | None = None) -> FastAPI:
         }
 
         with get_session(engine) as session:
-            if session.get_bind().dialect.name == "postgresql":
-                # Bounded-candidate facets: group the search terms' candidate
-                # id pool instead of GROUP BY scans over the whole table (the
-                # parsed_credentials_fts table only exists on SQLite).
-                candidate_ids = _pg_bounded_candidate_ids(
-                    session,
-                    terms=terms,
-                    limit=5000,
-                    timeout_ms=2500,
-                )
-                if candidate_ids:
-                    params: dict[str, object] = {
-                        **{f"candidate_{idx}": row_id for idx, row_id in enumerate(candidate_ids)},
-                    }
-                    candidate_params = ", ".join(
-                        f":candidate_{idx}" for idx in range(len(candidate_ids))
+            try:
+                if session.get_bind().dialect.name == "postgresql":
+                    session.execute(
+                        text(
+                            "SET LOCAL statement_timeout = "
+                            f"'{_SEARCH_FACETS_STATEMENT_TIMEOUT}'"
+                        )
                     )
-                    for facet_key, col_name in facet_columns.items():
-                        rows = session.execute(
-                            text(
-                                f"SELECT pc.{col_name}, count(*) as cnt "
-                                f"FROM parsed_credentials pc "
-                                f"WHERE pc.{col_name} IS NOT NULL "
-                                f"AND pc.id IN ({candidate_params}) "
-                                f"GROUP BY pc.{col_name} ORDER BY cnt DESC LIMIT 10"
-                            ),
-                            params,
-                        ).fetchall()
-                        facet_counts[facet_key] = [(row[0], row[1]) for row in rows]
-                return JSONResponse(_decorate_facets(facet_counts, terms, filters))
+                    # Bounded-candidate facets: group the search terms' candidate
+                    # id pool instead of GROUP BY scans over the whole table (the
+                    # parsed_credentials_fts table only exists on SQLite).
+                    candidate_ids = _pg_bounded_candidate_ids(
+                        session,
+                        terms=terms,
+                        limit=5000,
+                        timeout_ms=2500,
+                    )
+                    if candidate_ids:
+                        params: dict[str, object] = {
+                            **{f"candidate_{idx}": row_id for idx, row_id in enumerate(candidate_ids)},
+                        }
+                        candidate_params = ", ".join(
+                            f":candidate_{idx}" for idx in range(len(candidate_ids))
+                        )
+                        for facet_key, col_name in facet_columns.items():
+                            rows = session.execute(
+                                text(
+                                    f"SELECT pc.{col_name}, count(*) as cnt "
+                                    f"FROM parsed_credentials pc "
+                                    f"WHERE pc.{col_name} IS NOT NULL "
+                                    f"AND pc.id IN ({candidate_params}) "
+                                    f"GROUP BY pc.{col_name} ORDER BY cnt DESC LIMIT 10"
+                                ),
+                                params,
+                            ).fetchall()
+                            facet_counts[facet_key] = [(row[0], row[1]) for row in rows]
+                    return JSONResponse(_decorate_facets(facet_counts, terms, filters))
 
-            for facet_key, col_name in facet_columns.items():
-                if app.state.fts_enabled:
-                    try:
-                        rows = session.execute(
-                            text(
-                                f"SELECT pc.{col_name}, count(*) as cnt "
-                                f"FROM parsed_credentials pc "
-                                f"WHERE pc.{col_name} IS NOT NULL "
-                                f"AND pc.id IN ("
-                                f"  SELECT rowid FROM parsed_credentials_fts "
-                                f"  WHERE parsed_credentials_fts MATCH :q"
-                                f") "
-                                f"GROUP BY pc.{col_name} ORDER BY cnt DESC LIMIT 10"
-                            ),
-                            {"q": _fts_escape(terms)},
-                        ).fetchall()
-                        facet_counts[facet_key] = [(row[0], row[1]) for row in rows]
-                        continue
-                    except Exception:
-                        pass
-                # LIKE fallback
-                pattern = f"%{terms.lower()}%"
-                rows = session.execute(
-                    text(
-                        f"SELECT pc.{col_name}, count(*) as cnt "
-                        f"FROM parsed_credentials pc "
-                        f"WHERE pc.{col_name} IS NOT NULL "
-                        f"AND (lower(pc.url) LIKE :p OR lower(pc.domain) LIKE :p "
-                        f"  OR lower(pc.username) LIKE :p OR lower(pc.email_domain) LIKE :p "
-                        f"  OR lower(pc.application) LIKE :p OR lower(pc.source_archive) LIKE :p "
-                        f"  OR lower(pc.source_file) LIKE :p OR lower(pc.stealer_type) LIKE :p) "
-                        f"GROUP BY pc.{col_name} ORDER BY cnt DESC LIMIT 10"
-                    ),
-                    {"p": pattern},
-                ).fetchall()
-                facet_counts[facet_key] = [(row[0], row[1]) for row in rows]
+                for facet_key, col_name in facet_columns.items():
+                    if app.state.fts_enabled:
+                        try:
+                            rows = session.execute(
+                                text(
+                                    f"SELECT pc.{col_name}, count(*) as cnt "
+                                    f"FROM parsed_credentials pc "
+                                    f"WHERE pc.{col_name} IS NOT NULL "
+                                    f"AND pc.id IN ("
+                                    f"  SELECT rowid FROM parsed_credentials_fts "
+                                    f"  WHERE parsed_credentials_fts MATCH :q"
+                                    f") "
+                                    f"GROUP BY pc.{col_name} ORDER BY cnt DESC LIMIT 10"
+                                ),
+                                {"q": _fts_escape(terms)},
+                            ).fetchall()
+                            facet_counts[facet_key] = [(row[0], row[1]) for row in rows]
+                            continue
+                        except Exception:
+                            pass
+                    # LIKE fallback
+                    pattern = f"%{terms.lower()}%"
+                    rows = session.execute(
+                        text(
+                            f"SELECT pc.{col_name}, count(*) as cnt "
+                            f"FROM parsed_credentials pc "
+                            f"WHERE pc.{col_name} IS NOT NULL "
+                            f"AND (lower(pc.url) LIKE :p OR lower(pc.domain) LIKE :p "
+                            f"  OR lower(pc.username) LIKE :p OR lower(pc.email_domain) LIKE :p "
+                            f"  OR lower(pc.application) LIKE :p OR lower(pc.source_archive) LIKE :p "
+                            f"  OR lower(pc.source_file) LIKE :p OR lower(pc.stealer_type) LIKE :p) "
+                            f"GROUP BY pc.{col_name} ORDER BY cnt DESC LIMIT 10"
+                        ),
+                        {"p": pattern},
+                    ).fetchall()
+                    facet_counts[facet_key] = [(row[0], row[1]) for row in rows]
+            except SQLAlchemyError as exc:
+                # A timeout aborts the transaction; roll back and return empty
+                # facets so the search page still renders.
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                logger.warning("search facets failed, returning empty facets: %r", exc)
+                facet_counts = {key: [] for key in facet_columns}
 
         return JSONResponse(_decorate_facets(facet_counts, terms, filters))
 
@@ -3473,13 +3559,25 @@ def create_app(database_url: str | None = None) -> FastAPI:
             return JSONResponse({"query": query, "total_credentials": None})
 
         with get_session(engine) as session:
-            excluded_conversations, _excluded_channels = _get_exclusions(session)
-            total_credentials = _credential_match_count(
-                session,
-                terms=terms,
-                filters=filters,
-                exclude_conversation_ids=excluded_conversations,
-            )
+            try:
+                excluded_conversations, _excluded_channels = _get_exclusions(session)
+                total_credentials = _credential_match_count(
+                    session,
+                    terms=terms,
+                    filters=filters,
+                    exclude_conversation_ids=excluded_conversations,
+                )
+            except SQLAlchemyError as exc:
+                # Timeout/connection failure leaves the transaction aborted;
+                # roll back before returning the graceful "unknown" fallback.
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                logger.warning("search count failed, reporting unknown total: %r", exc)
+                return JSONResponse(
+                    {"query": query, "total_credentials": None, "capped": False}
+                )
 
         capped = total_credentials >= _COUNT_CAP
         if capped:
@@ -5112,26 +5210,50 @@ def create_app(database_url: str | None = None) -> FastAPI:
         msg_limit: int = Query(50, ge=1, le=500),
     ):
         with get_session(engine) as session:
-            if session.get_bind().dialect.name == "postgresql":
-                # Exact COUNT(*) / recent-credential scans on the unindexed
-                # source_conversation_id column can run for minutes over
-                # hundreds of millions of rows; bound every query here.
-                session.execute(text("SET LOCAL statement_timeout = '12s'"))
+            is_postgres = session.get_bind().dialect.name == "postgresql"
+
+            def _arm_timeout() -> None:
+                # SET LOCAL is transaction-scoped: after a rollback the bound
+                # is gone, so re-arm it before running any further query.
+                if is_postgres:
+                    session.execute(text("SET LOCAL statement_timeout = '12s'"))
+
+            # Exact COUNT(*) / recent-credential scans on the unindexed
+            # source_conversation_id column can run for minutes over
+            # hundreds of millions of rows; bound every query here.
+            _arm_timeout()
             conv = session.get(Conversation, conversation_id)
             if not conv:
                 return HTMLResponse("<h1>Not found</h1>", status_code=404)
 
-            msg_count = (
-                session.query(func.count(Message.id))
-                .filter(Message.conversation_id == conversation_id)
-                .scalar() or 0
-            )
-            attachment_count = (
-                session.query(func.count(FileAttachment.id))
-                .join(Message, Message.id == FileAttachment.message_id)
-                .filter(Message.conversation_id == conversation_id)
-                .scalar() or 0
-            )
+            msg_count = 0
+            attachment_count = 0
+            try:
+                msg_count = (
+                    session.query(func.count(Message.id))
+                    .filter(Message.conversation_id == conversation_id)
+                    .scalar() or 0
+                )
+                attachment_count = (
+                    session.query(func.count(FileAttachment.id))
+                    .join(Message, Message.id == FileAttachment.message_id)
+                    .filter(Message.conversation_id == conversation_id)
+                    .scalar() or 0
+                )
+            except SQLAlchemyError as exc:
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                logger.warning(
+                    "conversation %s message/attachment counts timed out: %s",
+                    conversation_id,
+                    exc,
+                )
+                msg_count = 0
+                attachment_count = 0
+                _arm_timeout()
+
             cred_count_raw = 0
             recent_creds: list[ParsedCredential] = []
             try:
@@ -5165,19 +5287,34 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 )
                 cred_count_raw = 0
                 recent_creds = []
+                _arm_timeout()
 
             if cred_count_raw >= _COUNT_CAP:
                 cred_count = f"{_COUNT_CAP - 1:,}+"
             else:
                 cred_count = f"{cred_count_raw:,}"
 
-            recent_messages = (
-                session.query(Message)
-                .filter(Message.conversation_id == conversation_id)
-                .order_by(Message.platform_timestamp.desc())
-                .limit(msg_limit)
-                .all()
-            )
+            recent_messages = []
+            try:
+                recent_messages = (
+                    session.query(Message)
+                    .filter(Message.conversation_id == conversation_id)
+                    .order_by(Message.platform_timestamp.desc())
+                    .limit(msg_limit)
+                    .all()
+                )
+            except SQLAlchemyError as exc:
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                logger.warning(
+                    "conversation %s recent messages timed out: %s",
+                    conversation_id,
+                    exc,
+                )
+                recent_messages = []
+                _arm_timeout()
 
             return templates.TemplateResponse(
                 "conversation.html",

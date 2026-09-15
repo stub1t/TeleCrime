@@ -71,6 +71,22 @@ def _is_rar5(path: Path) -> bool:
         return False
 
 
+def _hash_file(path: Path) -> tuple[str, int]:
+    """Return (sha256 hex digest, byte size) for a file.
+
+    Module-level so _record_outputs can run it in a thread: extracted files can
+    be multi-GB ULPs, and hashing them inline stalled the event loop (and with
+    it the concurrent prefetch downloads) for the whole read.
+    """
+    sha256 = hashlib.sha256()
+    file_size = 0
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            file_size += len(chunk)
+            sha256.update(chunk)
+    return sha256.hexdigest(), file_size
+
+
 def _get_group_message_text(group) -> str | None:
     """Return the Telegram message text/caption for the first part of a group."""
     try:
@@ -290,7 +306,22 @@ class ExtractStage(PipelineStage):
         # group is retried on a later run; do NOT mark it FAILED (that would feed
         # it to QuarantineStage and silently remove a healthy group from the
         # backlog over long disk-pressured unattended runs).
-        if not self._has_sufficient_disk(ctx):
+        # statvfs on a wedged drive can block in D-state forever and would
+        # freeze the whole event loop, so the check runs in a worker thread
+        # with a hard cap; a timeout counts as insufficient space (leave READY).
+        try:
+            enough_disk = await asyncio.wait_for(
+                asyncio.to_thread(self._has_sufficient_disk, ctx),
+                timeout=10,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Disk usage check for %s did not return within 10s (wedged "
+                "drive?) — treating as insufficient space",
+                group.base_name,
+            )
+            enough_disk = False
+        if not enough_disk:
             logger.warning(
                 "Skipping extraction of group %s — less than %d MB free disk. "
                 "Group stays READY for retry once space is reclaimed.",
@@ -458,6 +489,21 @@ class ExtractStage(PipelineStage):
                 len(txt_files),
                 main_archive.name,
             )
+            if result.error_code == "PARTIAL_INTEGRITY":
+                # The recovered members are recorded and will be parsed, but
+                # the archive still holds unextracted/corrupt members. Keep
+                # the group retryable so finalize does not delete the source.
+                job.status = ExtractionStatus.FAILED
+                job.last_error_code = "PARTIAL_INTEGRITY"
+                job.last_error_message = (
+                    result.error_message or "partial extraction (integrity errors)"
+                )
+                group.status = GroupStatus.FAILED
+                logger.warning(
+                    "Partial extraction of %s recorded — group kept retryable",
+                    main_archive.name,
+                )
+                return False
             return True
 
         elif result.requires_password:
@@ -929,13 +975,7 @@ class ExtractStage(PipelineStage):
             if path_str in existing_paths:
                 logger.debug("Output already recorded, skipping: %s", file_path.name)
                 continue
-            sha256 = hashlib.sha256()
-            file_size = 0
-            with open(file_path, "rb") as f:
-                while chunk := f.read(65536):
-                    file_size += len(chunk)
-                    sha256.update(chunk)
-            file_hash = sha256.hexdigest()
+            file_hash, file_size = await asyncio.to_thread(_hash_file, file_path)
 
             output = ExtractedOutput(
                 job_id=job.id,

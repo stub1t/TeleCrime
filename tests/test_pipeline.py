@@ -1996,7 +1996,7 @@ class TestParseStage:
         ]
 
         with patch("telecrime.pipeline.parse.iter_credentials_file", return_value=iter(creds)):
-            new_count, dup_count = await stage._parse_job_outputs(ctx, job, False)
+            new_count, dup_count, _incomplete = await stage._parse_job_outputs(ctx, job, False)
 
         stored = session.query(ParsedCredential).filter_by(extraction_job_id=job.id).all()
         assert new_count == 1
@@ -2148,6 +2148,178 @@ def test_postgres_bulk_insert_uses_copy_and_exact_dedup(pg_session, test_config)
 
     assert len(inserted) == 2
     assert pg_session.query(ParsedCredential).count() == 2
+
+
+class TestParseFailureCompensation:
+    """A failed job must not leave partial rows behind.
+
+    The next run's per-file pre-skip treats a file as already parsed as soon as
+    ANY of its rows exist (parsed_source_files). A mid-file failure that leaves
+    earlier chunks committed would therefore make the whole job unparseable and
+    finalize would delete the unparsed remainder (data loss). The failure path
+    deletes the job's rows and flags the group as parse-failed.
+    """
+
+    @staticmethod
+    def _cred(i: int):
+        return SimpleNamespace(
+            url=f"https://site{i}.example/login",
+            domain=f"site{i}.example",
+            username=f"user{i}",
+            password="secret",
+            email_domain=None,
+            application=None,
+            profile=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_group_failure_deletes_partial_rows_and_marks_retryable(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """run_group() deletes the job's partial rows and re-parses the file
+        cleanly on the next run instead of pre-skipping it as complete."""
+        from telecrime.models import (
+            ArchiveGroup,
+            ExtractedOutput,
+            ExtractionJob,
+            ParsedCredential,
+        )
+        from telecrime.pipeline import parse as parse_mod
+
+        credential_file = tmp_path / "Passwords.txt"
+        credential_file.write_text("placeholder")
+
+        group = ArchiveGroup(
+            fingerprint="parse-partial",
+            base_name="parse-partial.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.EXTRACTED,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+        session.add(job)
+        session.flush()
+        session.add(
+            ExtractedOutput(
+                job_id=job.id,
+                output_path=str(credential_file),
+                output_filename="Passwords.txt",
+                output_hash="a" * 64,
+            )
+        )
+        session.commit()
+
+        def _fail_mid_file(_path):
+            # 4 credentials are flushed (2 batches) and committed, then the
+            # parser raises — the wedge-straddled double chunk failure shape.
+            for i in range(5):
+                yield self._cred(i)
+                if i == 3:
+                    raise RuntimeError("simulated credential chunk failure")
+
+        monkeypatch.setattr(parse_mod, "iter_credentials_file", _fail_mid_file)
+        monkeypatch.setattr(parse_mod, "_BATCH_SIZE", 2)
+        monkeypatch.setattr(parse_mod, "_apply_pg_bulk_settings", lambda _session: None)
+        monkeypatch.setattr(parse_mod, "_reset_pg_bulk_settings", lambda _session: None)
+
+        stage = parse_mod.ParseStage()
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        await stage.run_group(ctx, group.id)
+
+        assert (
+            session.query(ParsedCredential)
+            .filter_by(extraction_job_id=job.id)
+            .count()
+            == 0
+        ), "partial rows must be deleted so the next run re-parses the file"
+        assert group.id in ctx.parse_failed_group_ids
+        assert any(f"Parse error for job {job.id}" in e for e in ctx.errors)
+        # _iter_jobs expunges loaded instances, so re-query the group status.
+        status = session.query(ArchiveGroup).filter_by(id=group.id).one().status
+        assert status == GroupStatus.EXTRACTED
+
+        # Next run: the whole file is parsed (no pre-skip from stale rows).
+        monkeypatch.setattr(
+            parse_mod,
+            "iter_credentials_file",
+            lambda _path: iter([self._cred(i) for i in range(4)]),
+        )
+        creds, dups = await stage.run_group(ctx, group.id)
+
+        assert (creds, dups) == (4, 0)
+        assert group.id not in ctx.parse_failed_group_ids
+        assert (
+            session.query(ParsedCredential)
+            .filter_by(extraction_job_id=job.id)
+            .count()
+            == 4
+        )
+
+    @pytest.mark.asyncio
+    async def test_preskip_treats_any_existing_row_as_fully_parsed(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """Unit-level hazard: the pre-skip criterion is row existence only, so
+        compensation must remove partial rows rather than rely on the check."""
+        from telecrime.models import (
+            ArchiveGroup,
+            ExtractedOutput,
+            ExtractionJob,
+            ParsedCredential,
+        )
+        from telecrime.pipeline import parse as parse_mod
+
+        credential_file = tmp_path / "Passwords.txt"
+        credential_file.write_text("placeholder")
+
+        group = ArchiveGroup(
+            fingerprint="parse-preskip",
+            base_name="parse-preskip.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.EXTRACTED,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+        session.add(job)
+        session.flush()
+        session.add(
+            ExtractedOutput(
+                job_id=job.id,
+                output_path=str(credential_file),
+                output_filename="Passwords.txt",
+                output_hash="b" * 64,
+            )
+        )
+        session.add(
+            ParsedCredential(
+                url="https://partial.example/login",
+                domain="partial.example",
+                username="stale",
+                password="row",
+                credential_hash=ParsedCredential.compute_hash(
+                    "partial.example", "stale", "row"
+                ),
+                extraction_job_id=job.id,
+                source_file=str(credential_file),
+            )
+        )
+        session.commit()
+
+        def _unexpected(_path):
+            raise AssertionError("pre-skipped file must not be parsed again")
+
+        monkeypatch.setattr(parse_mod, "iter_credentials_file", _unexpected)
+
+        job = session.get(ExtractionJob, job.id)
+        stage = parse_mod.ParseStage()
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        creds, dups, _incomplete = await stage._parse_job_outputs(ctx, job, False)
+
+        assert (creds, dups) == (0, 0)
 
 
 class TestParseParallelChunking:
@@ -2325,7 +2497,9 @@ def test_has_hash64_probe_does_not_cache_transient_failure(monkeypatch):
         def connect(self):
             return _FailingConn()
 
-    assert parse_mod._has_hash64_index(_FailingEngine()) is False
+    # Unresolved (None), never a false "index absent" verdict: callers must
+    # not treat a transient probe failure as a repair signal.
+    assert parse_mod._has_hash64_index(_FailingEngine()) is None
     # The failure must NOT be cached as a permanent False.
     assert parse_mod._HAS_HASH64 is None
     assert parse_mod._HAS_HASH64_RETRY_AT > 0.0
@@ -2352,6 +2526,108 @@ def test_has_hash64_probe_does_not_cache_transient_failure(monkeypatch):
     monkeypatch.setattr(parse_mod, "_HAS_HASH64_RETRY_AT", 0.0)
     assert parse_mod._has_hash64_index(_OkEngine()) is True
     assert parse_mod._HAS_HASH64 is True
+
+
+def test_has_hash64_no_index_probe_caches_false(monkeypatch):
+    """A successful probe that finds no index is cached permanently (the
+    third tri-state value) so the slow dedup fallback is not re-probed."""
+    from telecrime.pipeline import parse as parse_mod
+
+    monkeypatch.setattr(parse_mod, "_HAS_HASH64", None)
+    monkeypatch.setattr(parse_mod, "_HAS_HASH64_RETRY_AT", 0.0)
+
+    probes = {"n": 0}
+
+    class _EmptyResult:
+        def fetchone(self):
+            return None
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, _stmt):
+            probes["n"] += 1
+            return _EmptyResult()
+
+    class _Engine:
+        def connect(self):
+            return _Conn()
+
+    assert parse_mod._has_hash64_index(_Engine()) is False
+    assert parse_mod._HAS_HASH64 is False
+
+    # Even with the backoff gate open, a cached False must not re-probe.
+    monkeypatch.setattr(parse_mod, "_HAS_HASH64_RETRY_AT", 0.0)
+    assert parse_mod._has_hash64_index(_Engine()) is False
+    assert probes["n"] == 1
+
+
+def test_has_hash64_backoff_gate_skips_probe_then_recovers(monkeypatch):
+    """Inside the retry window the probe is not attempted; after it, a
+    transient failure resolves and True stays cached without re-probing."""
+    from telecrime.pipeline import parse as parse_mod
+
+    monkeypatch.setattr(parse_mod, "_HAS_HASH64", None)
+    monkeypatch.setattr(parse_mod, "_HAS_HASH64_RETRY_AT", 0.0)
+
+    connects = {"n": 0}
+
+    class _FailingEngine:
+        def connect(self):
+            connects["n"] += 1
+            raise OSError("connection reset")
+
+    assert parse_mod._has_hash64_index(_FailingEngine()) is None
+    assert parse_mod._HAS_HASH64 is None
+    assert connects["n"] == 1
+
+    # Second call inside the backoff window is unresolved without probing, and
+    # an unresolved probe must never trigger the repair DROP/CREATE path.
+    assert parse_mod._has_hash64_index(_FailingEngine()) is None
+    assert connects["n"] == 1
+    assert parse_mod._HAS_HASH64 is None
+
+    class _Dialect:
+        name = "postgresql"
+
+    class _RepairEngine:
+        dialect = _Dialect()
+
+        def connect(self):
+            raise AssertionError("unresolved probe must not attempt repair")
+
+    parse_mod._ensure_hash64_index(_RepairEngine())
+
+    class _OkResult:
+        def fetchone(self):
+            return (1,)
+
+    class _OkConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, _stmt):
+            return _OkResult()
+
+    class _OkEngine:
+        def connect(self):
+            return _OkConn()
+
+    monkeypatch.setattr(parse_mod, "_HAS_HASH64_RETRY_AT", 0.0)
+    assert parse_mod._has_hash64_index(_OkEngine()) is True
+
+    class _BoomEngine:
+        def connect(self):
+            raise AssertionError("resolved True must never be re-probed")
+
+    assert parse_mod._has_hash64_index(_BoomEngine()) is True
 
 
 def test_shutdown_parse_pool_force_terminates_wedged_workers():
@@ -2910,6 +3186,55 @@ class TestFinalizeFirstSeenUpsert:
         assert row.duplicate_count == 2
         assert row.first_seen_timestamp.replace(tzinfo=UTC) == datetime(2024, 1, 1, tzinfo=UTC)
 
+    def test_two_finalize_connections_increment_once_per_occurrence(self, test_config):
+        """Concurrent-style finalize (two connections on a file-backed SQLite
+        DB) upserts the same content_hash without IntegrityError, and every
+        extra occurrence bumps duplicate_count exactly once."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from telecrime.models import Base, ExtractedOutput, FirstSeenIndex
+        from telecrime.pipeline.finalize import FinalizeStage
+
+        engine = create_engine(test_config.database_url)
+        Base.metadata.create_all(bind=engine)
+        session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+        first, second = session_factory(), session_factory()
+        try:
+            output = ExtractedOutput(
+                output_path="/tmp/concurrent.txt",
+                output_filename="concurrent.txt",
+                output_hash="f" * 64,
+            )
+            stage = FinalizeStage()
+            now = datetime.now(UTC)
+
+            stage._upsert_first_seen(first, output=output, msg=None, first_seen_ts=now)
+            first.commit()
+            # A different connection (a concurrent finalize run) hits the
+            # ON CONFLICT branch instead of raising a unique violation.
+            stage._upsert_first_seen(second, output=output, msg=None, first_seen_ts=now)
+            second.commit()
+
+            first.expire_all()
+            rows = first.query(FirstSeenIndex).filter_by(content_hash="f" * 64).all()
+            assert len(rows) == 1
+            assert rows[0].duplicate_count == 1
+
+            # Two more occurrences via alternating connections -> exactly +2.
+            stage._upsert_first_seen(first, output=output, msg=None, first_seen_ts=now)
+            first.commit()
+            stage._upsert_first_seen(second, output=output, msg=None, first_seen_ts=now)
+            second.commit()
+
+            first.expire_all()
+            row = first.query(FirstSeenIndex).filter_by(content_hash="f" * 64).one()
+            assert row.duplicate_count == 3
+        finally:
+            first.close()
+            second.close()
+            engine.dispose()
+
 
 class TestFinalizeSweepOrphanedDownloads:
     """The orphan sweep must batch local_path lookups across the directory."""
@@ -3023,6 +3348,121 @@ class TestParseEarlyDupSkip:
         assert _is_dup_batch(1000, 19000, 20000) is True
         # 94% does not.
         assert _is_dup_batch(1200, 18800, 20000) is False
+
+    async def _run_early_skip(self, session, test_config, tmp_path, monkeypatch):
+        """Drive a job whose credential file is 12 already-seen rows followed
+        by 2 unique rows, with batches of 4, so early-skip fires after 3
+        consecutive all-duplicate batches. Returns (group, ctx, counts)."""
+        from telecrime.models import (
+            ArchiveGroup,
+            ExtractedOutput,
+            ExtractionJob,
+            ParsedCredential,
+        )
+        from telecrime.pipeline import parse as parse_mod
+
+        credential_file = tmp_path / "Passwords.txt"
+        credential_file.write_text("placeholder")
+
+        group = ArchiveGroup(
+            fingerprint="early-skip",
+            base_name="early-skip.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.EXTRACTED,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+        session.add(job)
+        session.flush()
+        session.add(
+            ExtractedOutput(
+                job_id=job.id,
+                output_path=str(credential_file),
+                output_filename="Passwords.txt",
+                output_hash="c" * 64,
+            )
+        )
+        # The repeated credential is already in the DB, from another file, so
+        # every early batch is all-duplicate. source_file must differ or the
+        # file-level pre-skip would skip it without exercising early-skip.
+        dup = SimpleNamespace(
+            url="https://dup.example/login",
+            domain="dup.example",
+            username="dupe",
+            password="secret",
+            email_domain=None,
+            application=None,
+            profile=None,
+        )
+        session.add(
+            ParsedCredential(
+                url=dup.url,
+                domain=dup.domain,
+                username=dup.username,
+                password=dup.password,
+                credential_hash=ParsedCredential.compute_hash(
+                    dup.domain, dup.username, dup.password
+                ),
+                source_file="/tmp/another-file.txt",
+            )
+        )
+        session.commit()
+
+        def _cred(i: int):
+            return SimpleNamespace(
+                url=f"https://tail{i}.example/login",
+                domain=f"tail{i}.example",
+                username=f"tail{i}",
+                password="secret",
+                email_domain=None,
+                application=None,
+                profile=None,
+            )
+
+        def _dup_then_tail(_path):
+            for _ in range(12):  # 3 consecutive all-dup batches of 4
+                yield dup
+            yield _cred(0)
+            yield _cred(1)
+
+        monkeypatch.setattr(parse_mod, "iter_credentials_file", _dup_then_tail)
+        monkeypatch.setattr(parse_mod, "_BATCH_SIZE", 4)
+        monkeypatch.setattr(parse_mod, "_apply_pg_bulk_settings", lambda _session: None)
+        monkeypatch.setattr(parse_mod, "_reset_pg_bulk_settings", lambda _session: None)
+
+        stage = parse_mod.ParseStage()
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        counts = await stage.run_group(ctx, group.id)
+        return group, ctx, counts
+
+    @pytest.mark.asyncio
+    async def test_early_skip_skips_unparsed_remainder(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """Three consecutive >=95%-duplicate batches abort the file early: the
+        unique tail credentials are never parsed."""
+        from telecrime.models import ParsedCredential
+
+        _group, _ctx, counts = await self._run_early_skip(
+            session, test_config, tmp_path, monkeypatch
+        )
+
+        assert counts == (0, 12)
+        assert session.query(ParsedCredential).count() == 1
+
+    @pytest.mark.asyncio
+    async def test_early_skip_marks_group_incomplete_for_finalize(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """An early-skipped file keeps the group retryable so finalize does
+        not delete the never-parsed tail."""
+        group, ctx, _counts = await self._run_early_skip(
+            session, test_config, tmp_path, monkeypatch
+        )
+
+        assert group.id in ctx.parse_failed_group_ids
 
 
 class TestFinalizeStageNoDeleteRetryable:

@@ -407,6 +407,24 @@ class PlanStage(PipelineStage):
                 .scalars()
                 .all()
             )
+            # Candidate-independent inputs: derived part numbers and physical
+            # file ids of the new attachments. Computed once — the old code
+            # rebuilt these (re-running extract_base_and_part per filename) for
+            # every same-name candidate group in the loop below.
+            _new_part_numbers = {
+                a.id: extract_base_and_part(a.filename or "")[1]
+                for a in unique_attachments
+                if a.filename
+            }
+            _new_ids = {
+                a.platform_file_unique_id
+                for a in unique_attachments
+                if a.platform_file_unique_id
+            }
+            _new_indexes = {
+                _new_part_numbers.get(a.id) if _new_part_numbers.get(a.id) is not None else idx
+                for idx, a in enumerate(unique_attachments)
+            }
             for _candidate in _by_name:
                 _cand_base = _derived_base(_candidate.base_name or "")
                 if _cand_base is None or _cand_base not in _new_bases:
@@ -433,20 +451,12 @@ class PlanStage(PipelineStage):
                 # lone part's GroupingResult always carries part_numbers={0},
                 # which would both collide with the existing group's part 0
                 # (blocking the merge) and assign the wrong part_index.
-                _new_part_numbers = {
-                    a.id: extract_base_and_part(a.filename or "")[1]
-                    for a in unique_attachments
-                    if a.filename
-                }
+                # _new_part_numbers/_new_ids/_new_indexes are hoisted above the
+                # candidate loop.
                 _cand_used_indexes = {
                     p.part_index
                     for p in _candidate.parts
                     if p.part_index is not None
-                }
-                _new_ids = {
-                    a.platform_file_unique_id
-                    for a in unique_attachments
-                    if a.platform_file_unique_id
                 }
                 _cand_ids = {
                     p.artifact.attachment.platform_file_unique_id
@@ -456,10 +466,6 @@ class PlanStage(PipelineStage):
                     and p.artifact.attachment.platform_file_unique_id
                 }
                 _same_archive = bool(_new_ids & _cand_ids)
-                _new_indexes = {
-                    _new_part_numbers.get(a.id) if _new_part_numbers.get(a.id) is not None else idx
-                    for idx, a in enumerate(unique_attachments)
-                }
                 if not _same_archive and (_new_indexes & _cand_used_indexes):
                     continue  # different archive occupying the same part slot
                 _linked_late = False

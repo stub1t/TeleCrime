@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import selectinload
 
@@ -410,10 +410,35 @@ class FinalizeStage(PipelineStage):
             first_seen_message_platform_id=msg.platform_id if msg else None,
             duplicate_count=0,
         )
+        # Concurrent finalize runs can insert the same content_hash with
+        # different sighting timestamps. Increment atomically and keep the
+        # earliest sighting (timestamp + provenance) rather than whichever
+        # transaction happened to commit second.
+        earlier = (
+            FirstSeenIndex.first_seen_timestamp > insert_stmt.excluded.first_seen_timestamp
+        )
         session.execute(
             insert_stmt.on_conflict_do_update(
                 index_elements=[FirstSeenIndex.content_hash],
-                set_={"duplicate_count": FirstSeenIndex.duplicate_count + 1},
+                set_={
+                    "duplicate_count": FirstSeenIndex.duplicate_count + 1,
+                    "first_seen_timestamp": case(
+                        (earlier, insert_stmt.excluded.first_seen_timestamp),
+                        else_=FirstSeenIndex.first_seen_timestamp,
+                    ),
+                    "first_seen_conversation_id": case(
+                        (earlier, insert_stmt.excluded.first_seen_conversation_id),
+                        else_=FirstSeenIndex.first_seen_conversation_id,
+                    ),
+                    "first_seen_message_id": case(
+                        (earlier, insert_stmt.excluded.first_seen_message_id),
+                        else_=FirstSeenIndex.first_seen_message_id,
+                    ),
+                    "first_seen_message_platform_id": case(
+                        (earlier, insert_stmt.excluded.first_seen_message_platform_id),
+                        else_=FirstSeenIndex.first_seen_message_platform_id,
+                    ),
+                },
             )
         )
 
@@ -589,7 +614,10 @@ class FinalizeStage(PipelineStage):
                         # run's cleanup) reclaims the file. Retry once with a
                         # short backoff to avoid relying on that backstop.
                         try:
-                            time.sleep(1.0)
+                            # async sleep: this runs inside an async stage — a
+                            # blocking sleep would stall the event loop (and
+                            # concurrent prefetch downloads) for a second.
+                            await asyncio.sleep(1.0)
                             archive_path.unlink()
                             artifact.is_deleted = True
                             logger.warning("Deleted %s after retry: %s", archive_path, e)

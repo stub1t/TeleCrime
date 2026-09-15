@@ -18,6 +18,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 from sqlalchemy.engine import CursorResult
@@ -1050,6 +1051,13 @@ def _cancel_parse_competing_queries(engine) -> int:
         return 0
 
 
+# Finite hard bound for VACUUM ANALYZE. Generous enough for this database's
+# observed runtimes, but bounded so a wedged VACUUM cannot hold a scheduler
+# slot indefinitely (statement_timeout=0 is forbidden outside the pipeline's
+# explicit bulk-write session).
+_VACUUM_STATEMENT_TIMEOUT = "6h"
+
+
 def _run_vacuum_job(engine) -> str:
     """Run VACUUM ANALYZE to reclaim space (PostgreSQL).
 
@@ -1098,10 +1106,14 @@ def _run_vacuum_job(engine) -> str:
     # VACUUM cannot run inside a transaction block on PostgreSQL, and the DB's
     # statement_timeout (5 min) would cancel a full-table VACUUM ANALYZE on
     # this 240GB database mid-flight (verified: "canceling statement due to
-    # statement timeout while vacuuming first_seen_index"). Disable the
-    # timeout on this connection only.
+    # statement timeout while vacuuming first_seen_index"). Raise the bound on
+    # this connection only, but keep it FINITE: statement_timeout=0 would let a
+    # wedged VACUUM hold its worker backend (and one of the scheduler's
+    # single-threaded job slots) forever.
     with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
-        conn.execute(_sa.text("SET statement_timeout = 0"))
+        conn.execute(
+            _sa.text(f"SET statement_timeout = '{_VACUUM_STATEMENT_TIMEOUT}'")
+        )
         conn.execute(_sa.text("VACUUM ANALYZE"))
     return f"VACUUM completed, pruned {pruned:,} stale extracted_output rows"
 
@@ -1112,6 +1124,7 @@ def _reparse_stealers_impl(
     dry_run: bool = False,
     *,
     return_counts: bool = False,
+    statement_timeout: str | None = None,
 ) -> str | tuple[int, int, int]:
     """Backfill stealer_type on ParsedCredential rows where it is NULL.
 
@@ -1128,6 +1141,11 @@ def _reparse_stealers_impl(
         return_counts: When True, return ``(updated, selected, processed)``
             instead of the summary string so callers can drain in bounded
             batches.
+        statement_timeout: Optional PostgreSQL ``SET LOCAL`` bound applied to
+            every statement in the session (re-armed after each batch commit).
+            The scheduler's periodic drain sets this so a near-empty NULL
+            backlog can't turn the DISTINCT scan into an unbounded full-table
+            walk during parse. The CLI backfill leaves it None deliberately.
 
     Returns:
         Summary string (or the counts tuple when ``return_counts`` is set).
@@ -1144,8 +1162,19 @@ def _reparse_stealers_impl(
 
     updated_total = 0
     jobs_processed = 0
+    is_pg = engine.dialect.name == "postgresql"
 
     with get_session(engine) as session:
+        def _arm_timeout() -> None:
+            # SET LOCAL is transaction-scoped: re-arm after every commit so
+            # later batches stay bounded too.
+            if statement_timeout is not None and is_pg:
+                session.execute(
+                    _sa.text(f"SET LOCAL statement_timeout = '{statement_timeout}'")
+                )
+
+        _arm_timeout()
+
         # Find distinct jobs that have at least one NULL stealer_type credential
         q = (
             _sa.select(_sa.func.distinct(ParsedCredential.extraction_job_id))
@@ -1232,6 +1261,7 @@ def _reparse_stealers_impl(
             # the write lock so other processes can write between batches.
             if jobs_processed % 100 == 0:
                 session.commit()
+                _arm_timeout()
 
         session.commit()
 
@@ -1245,6 +1275,17 @@ def _reparse_stealers_impl(
 # 319M-row parsed_credentials table per run.
 _REPARSE_STEALERS_BATCH_LIMIT = 500
 
+# Finite per-statement bound for the scheduler drain. When the NULL-stealer
+# backlog is nearly exhausted, the DISTINCT extraction_job_id scan has to walk
+# a lot of the 319M-row table before finding `limit` candidates; 5 minutes per
+# statement keeps that from competing with bulk INSERT I/O indefinitely.
+_REPARSE_STEALERS_STATEMENT_TIMEOUT = "300s"
+
+
+def _reparse_timeout_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "statement timeout" in message or "canceling statement" in message
+
 
 def _run_reparse_stealers_job(config, engine) -> str:
     """Scheduler entry point for reparse_stealers job.
@@ -1253,26 +1294,39 @@ def _run_reparse_stealers_job(config, engine) -> str:
     them. Stops when a batch selects fewer jobs than the limit (the backlog is
     exhausted) or makes no progress (the remaining jobs have no detectable
     stealer type), so a batch of permanently-undetectable jobs can't loop
-    forever.
+    forever. A per-statement timeout is reported as a partial result instead of
+    a hard job failure so the next interval resumes where this one stopped.
     """
+    from sqlalchemy.exc import OperationalError
+
     total_updated = 0
     total_jobs = 0
+    timed_out = False
     while True:
-        updated, selected, processed = cast(
-            tuple[int, int, int],
-            _reparse_stealers_impl(
-                engine,
-                limit=_REPARSE_STEALERS_BATCH_LIMIT,
-                return_counts=True,
-            ),
-        )
+        try:
+            updated, selected, processed = cast(
+                tuple[int, int, int],
+                _reparse_stealers_impl(
+                    engine,
+                    limit=_REPARSE_STEALERS_BATCH_LIMIT,
+                    return_counts=True,
+                    statement_timeout=_REPARSE_STEALERS_STATEMENT_TIMEOUT,
+                ),
+            )
+        except OperationalError as exc:
+            if not _reparse_timeout_error(exc):
+                raise
+            logger.warning("reparse_stealers batch timed out: %s", exc)
+            timed_out = True
+            break
         total_updated += updated
         total_jobs += processed
         if selected < _REPARSE_STEALERS_BATCH_LIMIT or updated == 0:
             break
+    suffix = " (batch timed out; will resume next interval)" if timed_out else ""
     return (
         f"backfilled stealer_type on {total_updated:,} credentials "
-        f"across {total_jobs} jobs"
+        f"across {total_jobs} jobs{suffix}"
     )
 
 
@@ -1427,8 +1481,16 @@ def _credential_identity_expr(engine):
     )
 
 
-def _count_recent_unique_credentials(engine, hours: int) -> int:
-    from sqlalchemy import func
+# Bound for the hourly/daily summary COUNT(DISTINCT ...) over
+# parsed_credentials. The created_at index keeps the 1h window cheap, but the
+# 24h window can still be large during parse; a timeout degrades to a skipped
+# summary instead of marking the job failed.
+_SUMMARY_COUNT_STATEMENT_TIMEOUT = "60s"
+
+
+def _count_recent_unique_credentials(engine, hours: int) -> int | None:
+    from sqlalchemy import func, text
+    from sqlalchemy.exc import SQLAlchemyError
 
     from telecrime.database import get_session
     from telecrime.models.credential import ParsedCredential
@@ -1437,11 +1499,25 @@ def _count_recent_unique_credentials(engine, hours: int) -> int:
     identity = _credential_identity_expr(engine)
 
     with get_session(engine) as session:
-        count = (
-            session.query(func.count(func.distinct(identity)))
-            .filter(ParsedCredential.created_at >= since)
-            .scalar()
-        )
+        if engine.dialect.name == "postgresql":
+            session.execute(
+                text(f"SET LOCAL statement_timeout = '{_SUMMARY_COUNT_STATEMENT_TIMEOUT}'")
+            )
+        try:
+            count = (
+                session.query(func.count(func.distinct(identity)))
+                .filter(ParsedCredential.created_at >= since)
+                .scalar()
+            )
+        except SQLAlchemyError as exc:
+            # Roll back before returning: a canceled statement leaves the
+            # transaction aborted for the session teardown commit.
+            try:
+                session.rollback()
+            except Exception:
+                pass
+            logger.warning("Recent unique-credential count timed out: %s", exc)
+            return None
     return int(count or 0)
 
 
@@ -1651,33 +1727,54 @@ def _collect_watchlist_alerts_unlocked(engine) -> list[dict]:
 
     now = datetime.now(UTC)
     alerts: list[dict] = []
-    # Load item IDs in a short-lived session to avoid a long-held transaction.
+    # One batched read of the enabled items (no pkey SELECT per item). Each
+    # item is then processed in its own session so a rollback on one item
+    # (e.g. statement_timeout on a large ILIKE scan) doesn't cascade.
     with get_session(engine) as session:
-        item_ids = [
-            row[0]
-            for row in session.query(WatchlistItem.id)
+        item_rows = [
+            (
+                row.id,
+                row.label,
+                row.query,
+                row.match_type,
+                row.last_alerted_at,
+                int(row.last_alerted_count or 0),
+            )
+            for row in session.query(WatchlistItem)
             .filter(WatchlistItem.enabled == True)
             .order_by(WatchlistItem.id.asc())
             .all()
         ]
 
-    # Process each item in its own session so a rollback on one item
-    # (e.g. statement_timeout on a large ILIKE scan) doesn't cascade.
-    for item_id in item_ids:
+    is_pg = engine.dialect.name == "postgresql"
+
+    for (
+        item_id,
+        item_label,
+        item_query,
+        item_match_type,
+        last_alerted_at,
+        last_alerted_count,
+    ) in item_rows:
+        item = SimpleNamespace(
+            id=item_id,
+            label=item_label,
+            query=item_query,
+            match_type=item_match_type,
+            last_alerted_at=last_alerted_at,
+            last_alerted_count=last_alerted_count,
+        )
         try:
             with get_session(engine) as session:
-                item = session.get(WatchlistItem, item_id)
-                if item is None or not item.enabled:
-                    continue
-
-                is_pg = session.get_bind().dialect.name == "postgresql"
-
                 if item.last_alerted_at is None:
                     if is_pg:
                         # First run on PostgreSQL: skip the full scan (would time out on
                         # 100M+ rows).  Set last_alerted_at = now so the next run is
                         # incremental.  On SQLite (tests) the full count is fast enough.
-                        item.last_alerted_at = now
+                        db_item = session.get(WatchlistItem, item_id)
+                        if db_item is None or not db_item.enabled:
+                            continue
+                        db_item.last_alerted_at = now
                         session.commit()
                         continue
                     # First run on SQLite / small DB: full count to catch pre-existing matches.
@@ -1872,6 +1969,8 @@ def _run_watchlist_notify_job(config, engine) -> str:
 
 def _run_summary_job(config, engine, hours: int) -> str:
     count = _count_recent_unique_credentials(engine, hours)
+    if count is None:
+        return "skipped: unique-credential count timed out"
     if hours == 1 and count <= 0:
         return "no new unique credentials in last hour"
 

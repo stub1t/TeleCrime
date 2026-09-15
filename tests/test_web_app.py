@@ -4,10 +4,14 @@ import asyncio
 import json
 import threading
 import time
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from urllib.parse import urlencode
 
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.requests import Request
 
 from telecrime.database import get_engine, get_session, init_db
@@ -1251,3 +1255,79 @@ def test_watchlist_add_defers_count_when_scan_in_flight(tmp_path, monkeypatch):
     with get_session(seed_engine) as session:
         item = session.query(WatchlistItem).one()
         assert item.last_known_count == -1
+
+
+def test_search_count_degrades_gracefully_on_timeout(tmp_path, monkeypatch):
+    """A canceled COUNT on parsed_credentials must not 500 /search/count."""
+    from telecrime.web import app as web_app
+
+    def _boom(*args, **kwargs):
+        raise SQLAlchemyError("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(web_app, "_credential_match_count", _boom)
+    app, _ = _sqlite_app(tmp_path)
+
+    response = _route(app, "/search/count").endpoint(q="needle", regex=False)
+
+    assert response.status_code == 200
+    payload = json.loads(response.body)
+    assert payload["total_credentials"] is None
+    assert payload["capped"] is False
+
+
+def test_search_facets_degrades_gracefully_on_timeout(tmp_path, monkeypatch):
+    """A canceled facet GROUP BY must return empty facets, not a 500."""
+    from telecrime.web import app as web_app
+
+    class _BoomSession:
+        rolled_back = False
+
+        def get_bind(self):
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        def execute(self, *args, **kwargs):
+            raise SQLAlchemyError("canceling statement due to statement timeout")
+
+        def rollback(self):
+            self.rolled_back = True
+
+    boom = _BoomSession()
+
+    @contextmanager
+    def _fake_session(engine):
+        yield boom
+
+    app, _ = _sqlite_app(tmp_path)
+    monkeypatch.setattr(web_app, "get_session", _fake_session)
+
+    response = _route(app, "/search/facets").endpoint(q="needle")
+
+    assert response.status_code == 200
+    payload = json.loads(response.body)
+    assert payload["domain"] == []
+    assert payload["stealer_type"] == []
+    assert payload["application"] == []
+    # The aborted transaction must be rolled back before the fallback returns.
+    assert boom.rolled_back is True
+
+
+def test_claim_cred_counts_refresh_reclaims_stale_claim():
+    """A dead in-flight refresh must not wedge credential-count updates forever."""
+    cache: dict = {
+        "ts": 0.0,
+        "data": {},
+        "refreshing": True,
+        "claimed_at": 0.0,  # ancient claim: presumed dead
+        "lock": threading.Lock(),
+    }
+    assert _claim_cred_counts_refresh(cache, 90) is True
+    assert cache["refreshing"] is True
+
+
+def test_no_unbounded_statement_timeout_in_web_or_scheduler():
+    """statement_timeout=0 lives only in the pipeline's bulk-write session."""
+    root = Path(__file__).resolve().parent.parent / "telecrime"
+    for rel in ("web/app.py", "scheduler.py"):
+        source = (root / rel).read_text()
+        assert "SET statement_timeout = 0" not in source
+        assert "SET statement_timeout=0" not in source

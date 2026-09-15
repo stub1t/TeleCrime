@@ -47,6 +47,10 @@ _PARALLEL_CHUNK_LINES = 100_000
 # Labeled-block credentials are separated by blank/separator lines. Chunks are
 # cut at those boundaries so a block is never split across two workers.
 _CHUNK_BOUNDARY_RE = re.compile(r"^(?:---+|===+|_{3,})\s*$")
+# Back-to-back labeled records (no blank line between them) can straddle a hard
+# cut. Carrying the trailing lines into the next chunk would re-parse complete
+# records (harmless: ON CONFLICT dedups) but never loses a straddling one.
+_HARD_CUT_CARRY_LINES = 5
 
 
 def _iter_line_chunks(
@@ -59,8 +63,11 @@ def _iter_line_chunks(
     and be lost. We accumulate lines and only cut once we have at least
     `chunk_lines` buffered AND the current line is a blank or
     ``---``/``===``/``___`` separator. If no boundary appears before 4×
-    `chunk_lines` the file is a line-independent combo list (or degenerate), so
-    a hard cut there is safe.
+    `chunk_lines` the file is mostly line-independent, but back-to-back labeled
+    records still exist: the trailing ``_HARD_CUT_CARRY_LINES`` lines are
+    carried into the next chunk so a record straddling the cut is completed by
+    the following worker instead of being lost. Complete carried records are
+    re-parsed and deduplicated by credential_hash, which is harmless.
     """
     buf: list[str] = []
     for raw in fh:
@@ -71,8 +78,9 @@ def _iter_line_chunks(
             yield buf
             buf = []
         elif len(buf) >= chunk_lines * 4:
-            yield buf
-            buf = []
+            carry = buf[-_HARD_CUT_CARRY_LINES:]
+            yield buf[:-_HARD_CUT_CARRY_LINES]
+            buf = list(carry)
     if buf:
         yield buf
 
@@ -127,9 +135,10 @@ def _parse_lines_chunk_worker(args: tuple[list[str], str, bool | None]) -> list:
         if "\x00" in pw:
             pw = pw.replace("\x00", "")
         pass_val = pw[:255]
-        domain_or_url = c.domain or c.url or ""
-        if "\x00" in domain_or_url:
-            domain_or_url = domain_or_url.replace("\x00", "")
+        # `d` is the NUL-stripped domain (or its falsy original) and `url` the
+        # NUL-stripped url, so reusing them is identical to re-reading the
+        # attributes and re-scanning for NULs on every line.
+        domain_or_url = d or url
         hash_input = domain_or_url[:255]
         _ed = c.email_domain
         if _ed:
@@ -271,7 +280,7 @@ _HAS_HASH64_RETRY_AT: float = 0.0
 _HAS_HASH64_PROBE_BACKOFF_SECONDS = 60.0
 
 
-def _has_hash64_index(engine) -> bool:
+def _has_hash64_index(engine) -> bool | None:
     """True when a *valid* ix_pc_hash64 (compact dedup index) exists.
 
     pg_indexes lists indexes left invalid by an interrupted CREATE INDEX
@@ -279,17 +288,17 @@ def _has_hash64_index(engine) -> bool:
     present made every dedup INSERT fall back to a per-row full index scan of
     parsed_credentials (minutes per 50K chunk instead of milliseconds).
 
-    Tri-state: True is cached permanently; a successful probe that finds no
-    index caches False; probe *exceptions* leave the result unresolved and
-    retry after a short backoff, so a transient connection error never disables
-    the fast path for the rest of the process.
+    Tri-state: True/False are cached probe results. ``None`` means the probe
+    itself could not run (transient connection error) or is inside its backoff
+    window — callers must treat that as "unknown", never as "absent", or they
+    would drop and rebuild a perfectly valid index.
     """
     global _HAS_HASH64, _HAS_HASH64_RETRY_AT
     if _HAS_HASH64 is not None:
         return _HAS_HASH64
     now = time.monotonic()
     if now < _HAS_HASH64_RETRY_AT:
-        return False
+        return None
     try:
         with engine.connect() as conn:
             row = conn.execute(
@@ -301,6 +310,7 @@ def _has_hash64_index(engine) -> bool:
             ).fetchone()
         _HAS_HASH64 = row is not None
         _HAS_HASH64_RETRY_AT = 0.0
+        return _HAS_HASH64
     except Exception as exc:
         logger.warning(
             "Could not probe ix_pc_hash64 (%s) — will retry in %.0fs",
@@ -309,7 +319,7 @@ def _has_hash64_index(engine) -> bool:
         )
         _HAS_HASH64 = None
         _HAS_HASH64_RETRY_AT = now + _HAS_HASH64_PROBE_BACKOFF_SECONDS
-    return bool(_HAS_HASH64)
+        return None
 
 
 def _ensure_hash64_index(engine) -> None:
@@ -319,10 +329,15 @@ def _ensure_hash64_index(engine) -> None:
     the full credential_hash index and can time out. Repairs an invalid
     leftover from an interrupted build as well as a missing index.
     CONCURRENTLY needs autocommit, so a fresh connection is used.
+
+    Only acts on a positively resolved "absent/invalid" probe: an unresolved
+    probe (transient error/backoff) must never trigger the DROP boundary, or a
+    connection blip would tear down and rebuild a valid multi-GB index.
     """
     if engine.dialect.name != "postgresql":
         return
-    if _has_hash64_index(engine):
+    resolved = _has_hash64_index(engine)
+    if resolved is None or resolved:
         return
     global _HAS_HASH64, _HAS_HASH64_RETRY_AT
     try:
@@ -339,6 +354,7 @@ def _ensure_hash64_index(engine) -> None:
                 )
             )
         _HAS_HASH64 = None  # re-resolve against the live schema
+        _HAS_HASH64_RETRY_AT = 0.0
     except Exception as exc:
         logger.warning("Could not create ix_pc_hash64 index: %s", exc)
         # Do not permanently cache False after a failed repair: the index may be
@@ -388,6 +404,12 @@ def _shutdown_parse_pool(pool: ProcessPoolExecutor, *, force: bool) -> None:
                 proc.kill()
         except Exception:
             pass
+
+
+# Most COPY fields contain no control characters; one C-level scan per value
+# (no allocation) avoids 4 str.replace dispatches per field. Module-level (not
+# a class attribute) so the per-field hot path does no attribute lookup.
+_COPY_ESCAPE_RE = re.compile(r"[\\\t\n\r]")
 
 
 class ParseStage(PipelineStage):
@@ -620,19 +642,23 @@ class ParseStage(PipelineStage):
         try:
             for job in jobs:
                 try:
-                    creds_found, dups_found = await self._parse_job_outputs(
-                        ctx, job, ctx.has_soft_hash_column
+                    creds_found, dups_found, incomplete = (
+                        await self._parse_job_outputs(
+                            ctx, job, ctx.has_soft_hash_column
+                        )
                     )
                     total_credentials += creds_found
                     total_duplicates += dups_found
                     ctx.credentials_parsed += creds_found
                     ctx.duplicates_skipped += dups_found
-                    # Success: the group's files are fully parsed — finalize
-                    # may clean it. (Never clearing this set meant a
-                    # once-failed group was re-parsed before every download
-                    # and NEVER finalized, even after success.)
+                    # Fully parsed: finalize may clean the group. An early-skipped
+                    # file marks the group incomplete instead, so finalize
+                    # keeps its archive for the next run.
                     if job.group_id is not None:
-                        ctx.parse_failed_group_ids.discard(job.group_id)
+                        if incomplete:
+                            ctx.parse_failed_group_ids.add(job.group_id)
+                        else:
+                            ctx.parse_failed_group_ids.discard(job.group_id)
                 except Exception as e:
                     try:
                         ctx.session.rollback()
@@ -719,15 +745,20 @@ class ParseStage(PipelineStage):
             for job in jobs:
                 job_id = job.id
                 try:
-                    creds_found, dups_found = await self._parse_job_outputs(
-                        ctx, job, ctx.has_soft_hash_column
+                    creds_found, dups_found, incomplete = (
+                        await self._parse_job_outputs(
+                            ctx, job, ctx.has_soft_hash_column
+                        )
                     )
                     total_credentials += creds_found
                     total_duplicates += dups_found
                     ctx.credentials_parsed += creds_found
                     ctx.duplicates_skipped += dups_found
                     if job.group_id is not None:
-                        ctx.parse_failed_group_ids.discard(job.group_id)
+                        if incomplete:
+                            ctx.parse_failed_group_ids.add(job.group_id)
+                        else:
+                            ctx.parse_failed_group_ids.discard(job.group_id)
                 except Exception as e:
                     # Same failure semantics as ParseStage.run: without this,
                     # an exception mid-file left partial rows committed, the
@@ -821,17 +852,21 @@ class ParseStage(PipelineStage):
         ctx: PipelineContext,
         job: ExtractionJob,
         has_soft_hash_column: bool,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, bool]:
         """Parse credential files from a single extraction job.
 
         Processes credentials in batches of BATCH_SIZE to keep memory usage
         bounded regardless of individual file size.
 
         Returns:
-            Tuple of (new_credentials, duplicates_skipped).
+            Tuple of (new_credentials, duplicates_skipped, incomplete) where
+            ``incomplete`` is True when at least one file was early-skipped as
+            duplicate-heavy — its tail was never parsed, so the caller must
+            keep the group retryable and delete the file's partial rows.
         """
         credentials_found = 0
         duplicates_found = 0
+        incomplete = False
 
         # Get the extracted output files
         outputs = job.outputs
@@ -844,7 +879,7 @@ class ParseStage(PipelineStage):
         )
 
         if not credential_outputs:
-            return 0, 0
+            return 0, 0, False
 
         logger.debug(
             "Found %d credential files in job %d",
@@ -1220,6 +1255,43 @@ class ParseStage(PipelineStage):
             # Commit after each file to release lock promptly
             ctx.session.commit()
 
+            if file_skipped_as_dup:
+                # The confidence heuristic stopped early; the file's tail may
+                # hold first-seen credentials. Finalize must not delete the
+                # group, and the next run must re-parse the whole file: drop
+                # this file's rows so the per-file pre-skip does not treat it
+                # as complete (any existing row otherwise skips the file).
+                removed = 0
+                try:
+                    removed = cast(
+                        CursorResult,
+                        ctx.session.execute(
+                            delete(ParsedCredential).where(
+                                ParsedCredential.extraction_job_id == job.id,
+                                ParsedCredential.source_file == str(file_path),
+                            )
+                        ),
+                    ).rowcount
+                    ctx.session.commit()
+                except Exception as exc:
+                    try:
+                        ctx.session.rollback()
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "Could not clear partial rows for early-skipped %s: %s",
+                        file_path.name,
+                        exc,
+                    )
+                incomplete = True
+                logger.warning(
+                    "Early-skip left %s incompletely parsed (%d partial rows removed); "
+                    "group %s kept for re-parse",
+                    file_path.name,
+                    removed or 0,
+                    job.group_id,
+                )
+
             if file_cred_count:
                 logger.info(
                     "Parsed %d credentials from %s (%d new, %d dups)",
@@ -1243,7 +1315,7 @@ class ParseStage(PipelineStage):
                 top_domains=top_domains,
             )
 
-        return credentials_found, duplicates_found
+        return credentials_found, duplicates_found, incomplete
 
     def _bulk_insert_credentials(
         self,
@@ -1280,17 +1352,13 @@ class ParseStage(PipelineStage):
         "stealer_type", "credential_hash",
     )
 
-    # Most fields contain no control characters; one C-level scan per value
-    # (no allocation) avoids 4 str.replace dispatches per field.
-    _COPY_ESCAPE_NEEDED = re.compile(r"[\\\t\n\r]")
-
     @staticmethod
     def _copy_escape(value: object) -> str:
         """Escape a single field for PostgreSQL COPY text format."""
         if value is None:
             return "\\N"
         s = str(value)
-        if not ParseStage._COPY_ESCAPE_NEEDED.search(s):
+        if not _COPY_ESCAPE_RE.search(s):
             return s
         # COPY text-mode requires escaping these control bytes.
         return (

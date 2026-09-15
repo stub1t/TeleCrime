@@ -114,6 +114,11 @@ class DiscoverStage(PipelineStage):
 
     name = "discover"
 
+    # Keyset page size. Bounds the ORM objects materialized and the transaction
+    # size when a re-ingest backlog leaves millions of unclassified attachments
+    # (same rationale as PlanStage._BATCH_SIZE).
+    _BATCH_SIZE = 10_000
+
     async def run(self, ctx: PipelineContext) -> bool:
         """Run the discover stage."""
         logger.info("Starting archive discovery")
@@ -143,43 +148,61 @@ class DiscoverStage(PipelineStage):
                 _reset,
             )
 
-        # Find all unprocessed attachments
-        attachments = ctx.session.execute(
-            select(FileAttachment).where(
-                FileAttachment.is_archive_candidate == False,
-                FileAttachment.archive_type == None,
-            )
-        ).scalars().all()
-
+        # Find all unprocessed attachments, keyset-paged by id so a re-ingest
+        # backlog is never materialized at once. Every scanned row is marked
+        # (archive_type set or ""), so each page's commit also keeps the ORM
+        # identity map and transaction bounded.
         candidates_found = 0
-
-        for attachment in attachments:
-            is_archive, archive_type, part_info = self._classify_attachment(attachment)
-
-            if is_archive:
-                attachment.is_archive_candidate = True
-                attachment.archive_type = archive_type
-
-                if part_info:
-                    attachment.detected_base_name = part_info[0]
-                    attachment.detected_part_number = part_info[1]
-
-                candidates_found += 1
-                logger.debug(
-                    "Found archive candidate: %s (type=%s, part=%s)",
-                    attachment.filename,
-                    archive_type,
-                    part_info[1] if part_info else None,
+        scanned = 0
+        last_id = 0
+        while True:
+            attachments = (
+                ctx.session.execute(
+                    select(FileAttachment)
+                    .where(
+                        FileAttachment.is_archive_candidate == False,
+                        FileAttachment.archive_type == None,
+                        FileAttachment.id > last_id,
+                    )
+                    .order_by(FileAttachment.id)
+                    .limit(self._BATCH_SIZE)
                 )
-            else:
-                # Mark as checked (non-archive) so it isn't re-scanned next run.
-                # Empty string distinguishes "checked, not an archive" from None
-                # ("not yet checked"), which the query filters on.
-                attachment.archive_type = ""
+                .scalars()
+                .all()
+            )
+            if not attachments:
+                break
+            last_id = attachments[-1].id
+            scanned += len(attachments)
 
-        ctx.session.commit()
+            for attachment in attachments:
+                is_archive, archive_type, part_info = self._classify_attachment(attachment)
+
+                if is_archive:
+                    attachment.is_archive_candidate = True
+                    attachment.archive_type = archive_type
+
+                    if part_info:
+                        attachment.detected_base_name = part_info[0]
+                        attachment.detected_part_number = part_info[1]
+
+                    candidates_found += 1
+                    logger.debug(
+                        "Found archive candidate: %s (type=%s, part=%s)",
+                        attachment.filename,
+                        archive_type,
+                        part_info[1] if part_info else None,
+                    )
+                else:
+                    # Mark as checked (non-archive) so it isn't re-scanned next
+                    # run. Empty string distinguishes "checked, not an archive"
+                    # from None ("not yet checked"), which the query filters on.
+                    attachment.archive_type = ""
+
+            ctx.session.commit()
+
         logger.info("Discovered %d archive candidates from %d attachments",
-                   candidates_found, len(attachments))
+                   candidates_found, scanned)
 
         return True
 
@@ -229,12 +252,9 @@ class DiscoverStage(PipelineStage):
         if filename_lower.endswith(".txt") and is_credential_file(filename):
             return True, "txt", None
 
-        # Check MIME type
+        # Check MIME type. Any archive extension was already returned by the
+        # extension loop above, so only MIME-only matches reach this point.
         if mime_type in ARCHIVE_MIME_TYPES:
-            # Try to infer type from extension anyway
-            for ext, archive_type in ARCHIVE_EXTENSIONS.items():
-                if filename_lower.endswith(ext):
-                    return True, archive_type, None
             # Generic archive based on MIME. application/octet-stream is the
             # catch-all MIME type — only trust it for reasonably sized files
             # (1MB-500MB); small octet-stream files are usually not archives.

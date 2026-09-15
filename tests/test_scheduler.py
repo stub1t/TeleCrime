@@ -1104,3 +1104,80 @@ def test_unattended_watchdog_script_is_valid_bash():
         ["bash", "-n", str(script)], capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_collect_watchlist_alerts_first_run_sqlite(in_memory_engine):
+    """The batched item load keeps the SQLite first-run full-count path."""
+    from telecrime.database import get_session
+    from telecrime.models.credential import ParsedCredential
+    from telecrime.models.watchlist import WatchlistItem
+
+    with get_session(in_memory_engine) as session:
+        session.add(
+            WatchlistItem(label="first", query="firstrun", match_type="any", enabled=True)
+        )
+        session.add_all(
+            [
+                ParsedCredential(
+                    url=f"https://first{i}.example/login",
+                    domain=f"first{i}.example",
+                    username=f"firstrun{i}",
+                    password="pw",
+                    credential_hash=ParsedCredential.compute_hash(
+                        f"first{i}.example", f"firstrun{i}", "pw"
+                    ),
+                )
+                for i in range(2)
+            ]
+        )
+        session.commit()
+
+    alerts = _collect_watchlist_alerts(in_memory_engine)
+
+    assert len(alerts) == 1
+    assert alerts[0]["label"] == "first"
+    assert alerts[0]["new_matches"] == 2
+    assert alerts[0]["total_matches"] == 2
+    assert len(alerts[0]["hits"]) == 2
+
+
+def test_run_summary_job_skips_when_count_times_out(monkeypatch):
+    """A bounded COUNT(DISTINCT) timeout degrades to a skipped summary."""
+    from telecrime.scheduler import _run_summary_job
+
+    monkeypatch.setattr(
+        "telecrime.scheduler._count_recent_unique_credentials",
+        lambda engine, hours: None,
+    )
+    result = _run_summary_job(MagicMock(), MagicMock(), hours=1)
+    assert "timed out" in result
+
+
+def test_reparse_job_reports_timeout_instead_of_failing(monkeypatch):
+    """A per-statement timeout is reported as a partial batch result."""
+    from sqlalchemy.exc import OperationalError
+
+    from telecrime.scheduler import _run_reparse_stealers_job
+
+    def _boom(*args, **kwargs):
+        raise OperationalError(
+            "SELECT 1", {}, Exception("canceling statement due to statement timeout")
+        )
+
+    monkeypatch.setattr("telecrime.scheduler._reparse_stealers_impl", _boom)
+    result = _run_reparse_stealers_job(MagicMock(), MagicMock())
+    assert "timed out" in result
+
+
+def test_reparse_job_reraises_non_timeout_db_errors(monkeypatch):
+    """Non-timeout OperationalErrors must not be swallowed as a partial run."""
+    from sqlalchemy.exc import OperationalError
+
+    from telecrime.scheduler import _run_reparse_stealers_job
+
+    def _boom(*args, **kwargs):
+        raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+
+    monkeypatch.setattr("telecrime.scheduler._reparse_stealers_impl", _boom)
+    with pytest.raises(OperationalError):
+        _run_reparse_stealers_job(MagicMock(), MagicMock())

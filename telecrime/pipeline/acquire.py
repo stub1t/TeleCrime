@@ -478,8 +478,27 @@ class AcquireStage(PipelineStage):
             return False
         attachment = artifact.attachment
 
-        # Disk space guard: pause downloads if below configured threshold
-        if not self._has_sufficient_disk(ctx, min_free_mb=ctx.config.extraction.min_free_disk_mb):
+        # Disk space guard: pause downloads if below configured threshold.
+        # statvfs on a wedged drive can block in D-state forever and would
+        # freeze the whole event loop, so run it in a worker thread with a hard
+        # cap (mirrors Pipeline.run's notification-path guard); a timeout is
+        # treated as "not enough disk", like any other stat failure.
+        try:
+            enough_disk = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._has_sufficient_disk,
+                    ctx,
+                    min_free_mb=ctx.config.extraction.min_free_disk_mb,
+                ),
+                timeout=10,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Disk usage check did not return within 10s (wedged drive?) — "
+                "treating as insufficient space"
+            )
+            enough_disk = False
+        if not enough_disk:
             logger.warning(
                 "Skipping download — less than 10 GB free disk space. "
                 "Waiting for finalize to reclaim space."

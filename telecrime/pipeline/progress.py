@@ -29,18 +29,6 @@ _NOTE_KEYS: frozenset[str] = frozenset(
 _NOTE_OVERRIDES: dict[str, object] = {}
 _NOTE_LOCK = threading.Lock()
 
-STAGE_ORDER = [
-    "ingest",
-    "channel_discover",
-    "discover",
-    "plan",
-    "acquire",
-    "enrich",
-    "extract",
-    "parse",
-    "finalize",
-]
-
 
 def _progress_path() -> Path:
     default_data_dir = Path(os.environ.get("TELECRIME_DATA_DIR", str(_DEFAULT_DATA_DIR)))
