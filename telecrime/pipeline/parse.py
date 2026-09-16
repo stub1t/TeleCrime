@@ -256,6 +256,36 @@ def _is_dup_batch(new_count: int, dup_count: int, batch_size: int) -> bool:
     return total >= batch_size // 2 and (dup_count / total) >= 0.95
 
 
+# The trigram GIN indexes are absent on databases rebuilt without them; calling
+# gin_clean_pending_list() on a missing relation raises on every chunk (caught
+# best-effort, but it floods the PostgreSQL log and opens a savepoint per
+# chunk). Probe once per process.
+_HAS_TRGM_INDEXES: bool | None = None
+
+
+def _trigram_indexes_present(session) -> bool:
+    global _HAS_TRGM_INDEXES
+    if _HAS_TRGM_INDEXES is not None:
+        return _HAS_TRGM_INDEXES
+    try:
+        rows = (
+            session.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE tablename = 'parsed_credentials' "
+                    "AND indexname IN "
+                    "('ix_pc_username_trgm', 'ix_pc_domain_trgm')"
+                )
+            )
+            .scalars()
+            .all()
+        )
+    except Exception:
+        return False
+    _HAS_TRGM_INDEXES = len(set(rows)) == 2
+    return _HAS_TRGM_INDEXES
+
+
 # PostgreSQL rejects statements binding more than 65,535 parameters, so an
 # unbatched `column.in_(...)` over a large job's outputs raises
 # OperationalError and aborts the file mid-parse.
@@ -1165,7 +1195,13 @@ class ParseStage(PipelineStage):
             # Large files (>20MB) are parsed in parallel worker processes via
             # _iter_parallel_credentials; small files keep the sequential path
             # (lower overhead, and the tests exercise that path directly).
-            file_size = file_path.stat().st_size if file_path.exists() else 0
+            # The file was already confirmed to exist above; a single stat()
+            # (with the missing-file fallback preserved) avoids a second
+            # filesystem round-trip per credential file.
+            try:
+                file_size = file_path.stat().st_size
+            except OSError:
+                file_size = 0
             workers = self._parallel_worker_count()
 
             async def _sequential_parse() -> None:
@@ -1575,26 +1611,27 @@ class ParseStage(PipelineStage):
             # "Credential COPY chunk failed ... retrying" storm. Cleaning here
             # keeps the pending list near-empty so inserts stay fast. Best-
             # effort: a failed clean is a performance issue, not correctness.
-            # IMPORTANT: run it inside its OWN savepoint — an error here (e.g.
-            # the index doesn't exist on a fresh/test DB) would otherwise abort
-            # the ENTIRE outer transaction, discarding the just-committed chunk.
-            try:
-                drain_sp = ctx.session.begin_nested()
+            # IMPORTANT: run it inside its OWN savepoint — an error here would
+            # otherwise abort the ENTIRE outer transaction, discarding the
+            # just-committed chunk.
+            if _trigram_indexes_present(ctx.session):
                 try:
-                    cursor = ctx.session.connection().connection.cursor()
+                    drain_sp = ctx.session.begin_nested()
                     try:
-                        cursor.execute(
-                            "SELECT gin_clean_pending_list('ix_pc_username_trgm'), "
-                            "gin_clean_pending_list('ix_pc_domain_trgm')"
-                        )
-                        cursor.fetchall()
-                    finally:
-                        cursor.close()
-                    drain_sp.commit()
+                        cursor = ctx.session.connection().connection.cursor()
+                        try:
+                            cursor.execute(
+                                "SELECT gin_clean_pending_list('ix_pc_username_trgm'), "
+                                "gin_clean_pending_list('ix_pc_domain_trgm')"
+                            )
+                            cursor.fetchall()
+                        finally:
+                            cursor.close()
+                        drain_sp.commit()
+                    except Exception:
+                        drain_sp.rollback()
                 except Exception:
-                    drain_sp.rollback()
-            except Exception:
-                pass
+                    pass
             return [
                 {"credential_hash": credential_hash, "domain": domain}
                 for credential_hash, domain in rows_returned

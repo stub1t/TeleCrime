@@ -20,7 +20,6 @@ class Credential:
 
     # Source tracking
     source_file: str | None = None
-    line_number: int | None = None
 
     def __post_init__(self) -> None:
         """Extract domain from URL and email."""

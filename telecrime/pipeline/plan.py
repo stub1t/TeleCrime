@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import re
 from collections import defaultdict
 from collections.abc import Sequence
 
@@ -421,12 +422,14 @@ class PlanStage(PipelineStage):
                 for a in unique_attachments
                 if a.platform_file_unique_id
             }
-            _new_indexes = {
-                _new_part_numbers.get(a.id) if _new_part_numbers.get(a.id) is not None else idx
-                for idx, a in enumerate(unique_attachments)
-            }
             for _candidate in _by_name:
                 _cand_base = _derived_base(_candidate.base_name or "")
+                if _cand_base is None:
+                    # Groups created by this stage store the bare base name
+                    # ("Archive"), which no SPLIT_PATTERN matches — compare it
+                    # directly. Without this the late-part merge never fired
+                    # for any group plan.py itself created.
+                    _cand_base = _candidate.base_name
                 if _cand_base is None or _cand_base not in _new_bases:
                     continue
                 _cand_conv_ids = {
@@ -451,8 +454,32 @@ class PlanStage(PipelineStage):
                 # lone part's GroupingResult always carries part_numbers={0},
                 # which would both collide with the existing group's part 0
                 # (blocking the merge) and assign the wrong part_index.
-                # _new_part_numbers/_new_ids/_new_indexes are hoisted above the
-                # candidate loop.
+                # group_by_pattern stores raw numbers for ".partN" sets but
+                # number+1 for every other explicit style (.7z.001, .r00,
+                # .z01, "1of3", ...); reproduce the candidate's convention so
+                # a late part neither collides with nor duplicates an existing
+                # index.
+                _cand_uses_part_n = any(
+                    re.search(r"\.part\d+\b", name, re.IGNORECASE)
+                    for name in (
+                        p.artifact.attachment.filename or ""
+                        for p in _candidate.parts
+                        if p.artifact and p.artifact.attachment
+                    )
+                )
+                _index_offset = 0 if _cand_uses_part_n else 1
+
+                def _effective_index(_att, _idx: int) -> int:
+                    _pn = _new_part_numbers.get(_att.id)
+                    if _pn is not None:
+                        return _pn + _index_offset
+                    if result.part_numbers:
+                        return result.part_numbers.get(_att.id, _idx)
+                    return _idx
+
+                _new_indexes = {
+                    _effective_index(a, idx) for idx, a in enumerate(unique_attachments)
+                }
                 _cand_used_indexes = {
                     p.part_index
                     for p in _candidate.parts
@@ -473,13 +500,7 @@ class PlanStage(PipelineStage):
                     artifact = artifact_map.get(attachment.id)
                     if artifact is None or artifact.id in already_linked_ids:
                         continue
-                    _part_num = _new_part_numbers.get(attachment.id)
-                    if _part_num is None:
-                        _part_num = (
-                            result.part_numbers.get(attachment.id, idx)
-                            if result.part_numbers
-                            else idx
-                        )
+                    _part_num = _effective_index(attachment, idx)
                     ctx.session.add(
                         ArchiveGroupPart(
                             group_id=_candidate.id,

@@ -414,7 +414,12 @@ _OPS_FRAGMENT_STATEMENT_TIMEOUT = "20s"
 
 
 def _credential_match_count(
-    session, *, terms: str, filters: dict[str, list[str]], exclude_conversation_ids: set[int]
+    session,
+    *,
+    terms: str,
+    filters: dict[str, list[str]],
+    exclude_conversation_ids: set[int],
+    candidate_ids: list[int] | None = None,
 ) -> int:
     if not terms:
         return 0
@@ -423,12 +428,17 @@ def _credential_match_count(
         session.execute(
             text(f"SET LOCAL statement_timeout = '{_SEARCH_COUNT_STATEMENT_TIMEOUT}'")
         )
-        candidate_ids = _pg_bounded_candidate_ids(
-            session,
-            terms=terms,
-            limit=_COUNT_CAP,
-            timeout_ms=2000,
-        )
+        # The /search route already ran the bounded trgm candidate fetch to
+        # build its page; re-running it here for the same terms would double
+        # the index probes per page load. ``None`` keeps the standalone
+        # /search/count behavior of fetching the pool itself.
+        if candidate_ids is None:
+            candidate_ids = _pg_bounded_candidate_ids(
+                session,
+                terms=terms,
+                limit=_COUNT_CAP,
+                timeout_ms=2000,
+            )
         if not candidate_ids:
             return 0
         params: dict[str, object] = {
@@ -542,6 +552,7 @@ def _credential_ids_via_fts(
     exclude_conversation_ids: set[int],
     limit: int,
     offset: int = 0,
+    candidate_ids: list[int] | None = None,
 ) -> list[int]:
     if session.get_bind().dialect.name == "postgresql":
         # Over-fetch candidates: filters (stealer:/app:/etc.) are applied AFTER
@@ -555,13 +566,20 @@ def _credential_ids_via_fts(
         # The pool itself is bounded by the helper's per-column LIMIT 500, so a
         # request larger than that returns at most the available pool rather
         # than being truncated by this slice.
+        #
+        # ``candidate_ids`` lets a caller that already fetched the pool for the
+        # same terms (e.g. the /search route, which then counts the matches)
+        # skip the duplicate per-column trgm probes.
         fetch_limit = max(limit * 5, 50)
-        candidate_ids = _pg_bounded_candidate_ids(
-            session,
-            terms=terms,
-            limit=offset + fetch_limit,
-            timeout_ms=2500,
-        )
+        if candidate_ids is None:
+            candidate_ids = _pg_bounded_candidate_ids(
+                session,
+                terms=terms,
+                limit=offset + fetch_limit,
+                timeout_ms=2500,
+            )
+        else:
+            candidate_ids = candidate_ids[: offset + fetch_limit]
         if not candidate_ids:
             return []
         params: dict[str, object] = {
@@ -784,8 +802,13 @@ def _search_for_export(
     # unrelated rows.
     attachments = []
     if terms:
+        # Eager-load the parent message: the exclusion filter below reads
+        # ``a.message.conversation_id`` for every row, and the lazy load would
+        # issue one SELECT per attachment (exports can return tens of
+        # thousands of rows).
         attachments = (
             session.query(FileAttachment)
+            .options(selectinload(FileAttachment.message))
             .join(Message, Message.id == FileAttachment.message_id)
             .filter(like_any(FileAttachment.filename, FileAttachment.mime_type))
             .order_by(FileAttachment.created_at.desc())
@@ -798,8 +821,14 @@ def _search_for_export(
             ]
     archives = []
     if terms:
+        # Same for the archive -> attachment -> message chain read below.
         archives = (
             session.query(DownloadArtifact)
+            .options(
+                selectinload(DownloadArtifact.attachment).selectinload(
+                    FileAttachment.message
+                )
+            )
             .join(FileAttachment, FileAttachment.id == DownloadArtifact.attachment_id)
             .join(Message, Message.id == FileAttachment.message_id)
             .filter(like_any(DownloadArtifact.local_path, DownloadArtifact.temp_path))
@@ -1504,6 +1533,18 @@ def _witem_dict(item) -> dict:
         "last_viewed_at": item.last_viewed_at.isoformat() if item.last_viewed_at else None,
         "created_at": item.created_at.isoformat() if item.created_at else None,
     }
+
+
+def _reset_watchlist_baseline(item) -> None:
+    """Reseed a watchlist item's count window after its query/match_type changed.
+
+    The old baseline describes a different query, so `count - last_known_count`
+    would report every historical match of the new query as "new". The -1
+    sentinel makes the next sweep seed the baseline without alerting.
+    """
+    item.last_known_count = -1
+    item.last_checked_at = None
+    item.new_count = 0
 
 
 def _home_stats_fallback(session, credential_count: object) -> dict[str, object]:
@@ -2852,7 +2893,20 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 if group is not None and group.status in (
                     GroupStatus.FAILED_TERMINAL,
                     GroupStatus.FAILED,
+                    GroupStatus.CLEANED,
                 ):
+                    if group.status == GroupStatus.CLEANED:
+                        # finalize deleted the group's archive files; reset
+                        # every artifact it marked deleted so the revived
+                        # group can re-download instead of extracting paths
+                        # that no longer exist.
+                        for group_part in group.parts:
+                            deleted_artifact = group_part.artifact
+                            if deleted_artifact is not None and deleted_artifact.is_deleted:
+                                deleted_artifact.status = DownloadStatus.PENDING
+                                deleted_artifact.is_deleted = False
+                                deleted_artifact.local_path = None
+                                deleted_artifact.temp_path = None
                     group.status = GroupStatus.INCOMPLETE
             session.commit()
         return JSONResponse({"ok": True})
@@ -3053,6 +3107,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     return or_(*[func.lower(col).like(pattern) for col in cols])
 
                 credential_ids: list[int] | None = None
+                # Bounded trgm candidate pool for this request's terms. Fetched
+                # once and shared by the id page and the match count so neither
+                # re-runs the per-column ILIKE probes.
+                candidate_pool: list[int] | None = None
                 filter_clause = _credential_filter_clause(filters)
                 fts_available = app.state.fts_enabled and terms
 
@@ -3062,6 +3120,12 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     try:
                         fts_used = True
                         offset = (page - 1) * page_size
+                        candidate_pool = _pg_bounded_candidate_ids(
+                            session,
+                            terms=terms,
+                            limit=_COUNT_CAP,
+                            timeout_ms=2500,
+                        )
                         credential_ids = _credential_ids_via_fts(
                             session,
                             terms=terms,
@@ -3069,6 +3133,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                             exclude_conversation_ids=excluded_conversations,
                             limit=fts_fetch_limit,
                             offset=offset,
+                            candidate_ids=candidate_pool,
                         )
                         if not regex:
                             if len(credential_ids) > page_size:
@@ -3080,6 +3145,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                         fts_available = False
                         fts_used = False
                         credential_ids = None
+                        candidate_pool = None
                         # A statement_timeout or connection error leaves the session in
                         # an aborted state. Roll back so subsequent queries can proceed.
                         try:
@@ -3181,6 +3247,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                             terms=terms,
                             filters=filters,
                             exclude_conversation_ids=excluded_conversations,
+                            candidate_ids=candidate_pool,
                         )
                     except Exception:
                         try:
@@ -5010,10 +5077,18 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 item.label = str(body["label"]).strip()
                 changed = True
             if "query" in body and str(body["query"]).strip():
-                item.query = str(body["query"]).strip()
+                new_query = str(body["query"]).strip()
+                if new_query != item.query:
+                    item.query = new_query
+                    _reset_watchlist_baseline(item)
                 changed = True
             if "match_type" in body:
-                item.match_type = body["match_type"]
+                new_match_type = body["match_type"]
+                if new_match_type not in ("any", "domain", "user", "url"):
+                    new_match_type = "any"
+                if new_match_type != item.match_type:
+                    item.match_type = new_match_type
+                    _reset_watchlist_baseline(item)
                 changed = True
             if not changed:
                 return JSONResponse({"error": "nothing to update"}, status_code=400)

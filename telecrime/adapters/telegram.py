@@ -693,10 +693,6 @@ class TelegramAdapter(BaseAdapter):
             if isinstance(doc, Document):
                 files.append(self._document_to_file_info(doc))
 
-        # Could also handle MessageMediaPhoto if needed
-        # elif isinstance(message.media, MessageMediaPhoto):
-        #     ...
-
         return files
 
     def _document_to_file_info(self, doc: Document) -> FileInfo:

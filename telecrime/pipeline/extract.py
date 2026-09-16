@@ -426,6 +426,14 @@ class ExtractStage(PipelineStage):
         # causing test_password to report "Everything is Ok" for any password.
         first_file: str | None = matching_files[0] if matching_files else None
 
+        # Snapshot the per-candidate failure counts BEFORE the 7z attempt: the
+        # RAR→unrar fallback must restore exactly these values (undoing only
+        # the increments this attempt made). The old decrement also erased
+        # failures accumulated on earlier runs whenever 7z failed without ever
+        # testing a password (e.g. UNSUPPORTED_FORMAT), so repeatedly-wrong
+        # passwords were un-exhausted and retried forever.
+        _failed_before_7z = {id(c): (c.times_failed or 0) for c in passwords}
+
         # Try extraction with the given extractor, with password fallback
         result = await self._try_extract_with_passwords(
             extractor, main_archive, output_dir, outer_exts, passwords, job, ctx,
@@ -445,8 +453,9 @@ class ExtractStage(PipelineStage):
             # Undo times_failed increments from 7z attempts — 7z failures on
             # RAR5 archives don't mean the password is wrong
             for pwd_candidate in passwords:
-                if pwd_candidate.times_failed > 0:
-                    pwd_candidate.times_failed = max(0, pwd_candidate.times_failed - 1)
+                before_7z = _failed_before_7z.get(id(pwd_candidate))
+                if before_7z is not None:
+                    pwd_candidate.times_failed = before_7z
             job.password_attempts = 0
             result = await self._try_extract_with_passwords(
                 unrar, main_archive, output_dir, outer_exts, passwords, job, ctx,

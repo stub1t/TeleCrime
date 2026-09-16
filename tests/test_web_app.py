@@ -807,6 +807,78 @@ def test_triage_add_password_falls_back_to_global_without_chain(tmp_path):
         assert candidate.conversation_id is None
 
 
+def test_triage_retry_download_reopens_cleaned_group(tmp_path):
+    """Retrying a failed download from a CLEANED group must reopen the group
+    and reset its deleted artifacts.
+
+    Regression: finalize marks the group CLEANED and unlinks the archive files
+    (artifacts keep is_deleted=True). The route only reopened FAILED_TERMINAL/
+    FAILED groups, so the retried artifact sat PENDING forever (the pickers
+    exclude CLEANED groups), and the stale is_deleted/local_path also made the
+    orphan sweep unlink any re-downloaded file as unclaimed.
+    """
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        conv = Conversation(platform_id=7, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=70,
+            platform_timestamp=datetime.now(UTC),
+        )
+        session.add(msg)
+        session.flush()
+        artifacts = []
+        for i, status in enumerate(
+            (DownloadStatus.FAILED_TERMINAL, DownloadStatus.COMPLETED)
+        ):
+            attachment = FileAttachment(
+                message_id=msg.id, platform_file_id=f"clean-{i}", filename=f"part{i}.rar"
+            )
+            session.add(attachment)
+            session.flush()
+            artifact = DownloadArtifact(
+                attachment_id=attachment.id,
+                status=status,
+                local_path=f"/gone/part{i}.rar",
+                is_deleted=True,
+            )
+            session.add(artifact)
+            session.flush()
+            artifacts.append(artifact)
+        group = ArchiveGroup(
+            fingerprint="cleaned-revival",
+            base_name="clean-archive",
+            expected_part_count=2,
+            detected_part_count=2,
+            status=GroupStatus.CLEANED,
+        )
+        session.add(group)
+        session.flush()
+        session.add_all(
+            [
+                ArchiveGroupPart(group_id=group.id, artifact_id=artifacts[0].id, part_index=1),
+                ArchiveGroupPart(group_id=group.id, artifact_id=artifacts[1].id, part_index=2),
+            ]
+        )
+        session.commit()
+        artifact_id = artifacts[0].id
+        group_id = group.id
+
+    response = _route(app, "/triage/retry/download/{artifact_id}", "POST").endpoint(
+        artifact_id=artifact_id
+    )
+    assert response.status_code == 200
+
+    with get_session(seed_engine) as session:
+        assert session.get(ArchiveGroup, group_id).status == GroupStatus.INCOMPLETE
+        for artifact in session.query(DownloadArtifact).order_by(DownloadArtifact.id):
+            assert artifact.status == DownloadStatus.PENDING
+            assert artifact.is_deleted is False
+            assert artifact.local_path is None
+
+
 def test_credential_fts_pagination_page_two_returns_next_distinct_rows(pg_session):
     """FIX 2: offset must be applied exactly once; page 2 is not skipped."""
     from telecrime.fts import ensure_fts
@@ -952,6 +1024,79 @@ def test_watchlist_add_stores_unknown_sentinel_when_count_fails(pg_engine, monke
         item = session.query(WatchlistItem).one()
         assert item.last_known_count == -1
         assert _witem_dict(item)["last_known_count"] is None
+
+
+def test_watchlist_update_reseeds_baseline_when_query_changes(tmp_path):
+    """A query/match_type edit invalidates the stored baseline.
+
+    Regression: the route kept last_known_count/last_checked_at from the OLD
+    query, so the next sweep reported `new_count = count(new) - count(old)` —
+    every historical match of the new query showed as a phantom new alert.
+    """
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        item = WatchlistItem(
+            label="old",
+            query="old-query",
+            match_type="any",
+            enabled=True,
+            last_checked_at=datetime(2026, 1, 1, tzinfo=UTC),
+            last_known_count=100,
+            new_count=7,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    response = asyncio.run(
+        _route(app, "/api/watchlist/{item_id}", "PATCH").endpoint(
+            item_id=item_id,
+            request=_web_request(
+                method="PATCH", form={"query": "new-query", "match_type": "domain"}
+            ),
+        )
+    )
+    assert response.status_code == 200
+
+    with get_session(seed_engine) as session:
+        item = session.get(WatchlistItem, item_id)
+        assert item.query == "new-query"
+        assert item.match_type == "domain"
+        assert item.last_known_count == -1
+        assert item.last_checked_at is None
+        assert item.new_count == 0
+
+
+def test_watchlist_update_toggle_keeps_baseline(tmp_path):
+    """The enable/disable toggle must NOT reset the count window."""
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        item = WatchlistItem(
+            label="keep",
+            query="keep-query",
+            match_type="any",
+            enabled=True,
+            last_checked_at=datetime(2026, 1, 1, tzinfo=UTC),
+            last_known_count=100,
+            new_count=7,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    response = asyncio.run(
+        _route(app, "/api/watchlist/{item_id}", "PATCH").endpoint(
+            item_id=item_id,
+            request=_web_request(method="PATCH", form={"enabled": "0"}),
+        )
+    )
+    assert response.status_code == 200
+
+    with get_session(seed_engine) as session:
+        item = session.get(WatchlistItem, item_id)
+        assert item.enabled is False
+        assert item.last_known_count == 100
+        assert item.new_count == 7
 
 
 def test_normalize_password_scope_accepts_value_and_repr():

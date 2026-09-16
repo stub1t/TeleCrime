@@ -694,6 +694,127 @@ class TestExtractStageDirect:
         assert group.status in (GroupStatus.READY, GroupStatus.FAILED)
 
 
+class TestExtractStageRarFallback:
+    """7z→unrar fallback must not erase accumulated password failures."""
+
+    @pytest.mark.asyncio
+    async def test_rar_fallback_preserves_password_failure_history(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """A non-password 7z failure never incremented times_failed, so the
+        fallback's blind decrement erased failures from earlier runs and
+        repeatedly-wrong passwords were retried forever (never exhausted)."""
+        from sqlalchemy.orm import joinedload
+
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            ExtractionJob,
+            FileAttachment,
+            Message,
+            PasswordCandidate,
+        )
+        from telecrime.states import PasswordScope
+
+        conv = Conversation(platform_id=599, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=2,
+            platform_timestamp=datetime.now(UTC),
+            text="locked rar drop",
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id,
+            platform_file_id="rar-file",
+            filename="locked.rar",
+            archive_type="rar",
+        )
+        session.add(attachment)
+        session.flush()
+
+        dl_path = tmp_path / "downloads" / "locked.rar"
+        dl_path.parent.mkdir(parents=True, exist_ok=True)
+        # RAR4 signature (not RAR5) so the 7z → unrar fallback path is used.
+        dl_path.write_bytes(b"Rar!\x1a\x07\x00" + b"x" * 32)
+
+        artifact = DownloadArtifact(attachment_id=attachment.id, local_path=str(dl_path))
+        session.add(artifact)
+        session.flush()
+        group = ArchiveGroup(
+            fingerprint="rar-fallback-group",
+            base_name="locked.rar",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.READY,
+        )
+        session.add(group)
+        session.flush()
+        session.add(ArchiveGroupPart(group_id=group.id, artifact_id=artifact.id, part_index=0))
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.PENDING)
+        session.add(job)
+        session.flush()
+
+        candidate = PasswordCandidate(
+            value="wrong-password",
+            scope=PasswordScope.MESSAGE,
+            extraction_method="caption",
+            confidence=0.9,
+            times_failed=2,
+        )
+        session.add(candidate)
+        session.commit()
+
+        group = session.get(
+            ArchiveGroup,
+            group.id,
+            options=[
+                joinedload(ArchiveGroup.parts)
+                .joinedload(ArchiveGroupPart.artifact)
+                .joinedload(DownloadArtifact.attachment)
+            ],
+        )
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        stage = ExtractStage()
+        monkeypatch.setattr(stage, "_has_sufficient_disk", lambda _ctx: True)
+        monkeypatch.setattr(
+            stage, "_get_password_candidates", AsyncMock(return_value=[candidate])
+        )
+        monkeypatch.setattr(UnrarExtractor, "available", staticmethod(lambda: True))
+
+        async def _sevenz_extract(self, archive, dest, **kwargs):
+            return ExtractionResult(
+                success=False,
+                error_code="UNSUPPORTED_FORMAT",
+                error_message="7z cannot extract this rar",
+            )
+
+        async def _sevenz_list(self, archive, password=None, timeout_seconds=None):
+            return []
+
+        async def _unrar_extract(self, archive, dest, **kwargs):
+            out = dest / "recovered.txt"
+            out.write_text("https://example.com;alice;secret\n", encoding="utf-8")
+            return ExtractionResult(success=True, extracted_files=[out])
+
+        monkeypatch.setattr(SevenZipExtractor, "extract", _sevenz_extract)
+        monkeypatch.setattr(SevenZipExtractor, "list_contents", _sevenz_list)
+        monkeypatch.setattr(UnrarExtractor, "extract", _unrar_extract)
+
+        result = await stage._extract_group(ctx, group, SevenZipExtractor("7z"))
+
+        assert result is True
+        assert group.status == GroupStatus.EXTRACTED
+        # The historical failures survive the fallback: 2, not 1.
+        assert candidate.times_failed == 2
+
+
 class TestExtractStageNestedBatching:
     """Regression: nested archives beyond the batch cap must all be extracted."""
 
@@ -1425,6 +1546,186 @@ class TestPlanStage:
         ]
         assert lazy_files == []
         assert lazy_messages == []
+
+    @pytest.mark.asyncio
+    async def test_late_split_merge_links_bare_base_name_group(
+        self, session, test_config
+    ):
+        """Plan stores the bare base name ("archive") for multi-part groups;
+        the late-part merge must still recognize it.
+
+        Regression: `_derived_base("archive")` returns None (no SPLIT_PATTERN
+        matches an extensionless name), so a late `archive.part2.rar` was
+        planned as a stranded standalone group — it failed extraction alone
+        and finalize deleted it, permanently losing the whole archive.
+        """
+        from telecrime.grouping.patterns import GroupingResult
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus, GroupStatus
+
+        conv = Conversation(platform_id=401, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+
+        def _attach(msg_pid, filename, pfid, part_number):
+            msg = Message(
+                conversation_id=conv.id,
+                platform_id=msg_pid,
+                platform_timestamp=datetime.now(UTC),
+            )
+            session.add(msg)
+            session.flush()
+            att = FileAttachment(
+                message_id=msg.id,
+                platform_file_id=filename,
+                platform_file_unique_id=pfid,
+                filename=filename,
+                size=1000,
+                is_archive_candidate=True,
+                archive_type="rar",
+                detected_base_name="archive",
+                detected_part_number=part_number,
+            )
+            session.add(att)
+            session.flush()
+            return att
+
+        att1 = _attach(1, "archive.part1.rar", "old_part_1", 1)
+        art1 = DownloadArtifact(attachment_id=att1.id, status=DownloadStatus.PENDING)
+        session.add(art1)
+        session.flush()
+        # base_name exactly as PlanStage._create_or_update_group stores it.
+        group = ArchiveGroup(
+            fingerprint="bare-base-group",
+            base_name="archive",
+            expected_part_count=2,
+            detected_part_count=1,
+            status=GroupStatus.INCOMPLETE,
+        )
+        session.add(group)
+        session.flush()
+        session.add(ArchiveGroupPart(group_id=group.id, artifact_id=art1.id, part_index=1))
+        session.commit()
+
+        att2 = _attach(2, "archive.part2.rar", "new_part_2", 2)
+        art2 = DownloadArtifact(attachment_id=att2.id, status=DownloadStatus.PENDING)
+        session.add(art2)
+        session.flush()
+        session.commit()
+        _ = att2.message
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        result = GroupingResult(
+            base_name="archive.part2.rar",
+            attachments=[att2],
+            expected_parts=1,
+            part_numbers={att2.id: 0},
+        )
+        returned = await PlanStage()._create_or_update_group(ctx, result, {att2.id: art2})
+        session.commit()
+
+        assert returned is not None and returned.id == group.id
+        linked = session.execute(
+            select(ArchiveGroupPart).where(ArchiveGroupPart.artifact_id == art2.id)
+        ).scalar_one_or_none()
+        assert linked is not None and linked.group_id == group.id
+        assert linked.part_index == 2
+
+    @pytest.mark.asyncio
+    async def test_late_split_merge_offsets_non_partn_indexes(
+        self, session, test_config
+    ):
+        """Non-".partN" styles are stored with part_index = filename number+1
+        (group_by_pattern's convention); the late merge must match it instead
+        of colliding with an existing slot and stranding the part."""
+        from telecrime.grouping.patterns import GroupingResult
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus, GroupStatus
+
+        conv = Conversation(platform_id=402, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+
+        def _attach(msg_pid, filename, pfid, part_number):
+            msg = Message(
+                conversation_id=conv.id,
+                platform_id=msg_pid,
+                platform_timestamp=datetime.now(UTC),
+            )
+            session.add(msg)
+            session.flush()
+            att = FileAttachment(
+                message_id=msg.id,
+                platform_file_id=filename,
+                platform_file_unique_id=pfid,
+                filename=filename,
+                size=1000,
+                is_archive_candidate=True,
+                archive_type="7z",
+                detected_base_name="archive",
+                detected_part_number=part_number,
+            )
+            session.add(att)
+            session.flush()
+            return att
+
+        att1 = _attach(1, "archive.7z.001", "seven_1", 1)
+        att2 = _attach(2, "archive.7z.002", "seven_2", 2)
+        art1 = DownloadArtifact(attachment_id=att1.id, status=DownloadStatus.PENDING)
+        art2 = DownloadArtifact(attachment_id=att2.id, status=DownloadStatus.PENDING)
+        session.add_all([art1, art2])
+        session.flush()
+        group = ArchiveGroup(
+            fingerprint="seven-offset-group",
+            base_name="archive",
+            expected_part_count=2,
+            detected_part_count=2,
+            status=GroupStatus.INCOMPLETE,
+        )
+        session.add(group)
+        session.flush()
+        # group_by_pattern stores .7z.001 → 2 and .7z.002 → 3.
+        session.add(ArchiveGroupPart(group_id=group.id, artifact_id=art1.id, part_index=2))
+        session.add(ArchiveGroupPart(group_id=group.id, artifact_id=art2.id, part_index=3))
+        session.commit()
+
+        att3 = _attach(3, "archive.7z.003", "seven_3", 3)
+        art3 = DownloadArtifact(attachment_id=att3.id, status=DownloadStatus.PENDING)
+        session.add(art3)
+        session.flush()
+        session.commit()
+        _ = att3.message
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        result = GroupingResult(
+            base_name="archive.7z.003",
+            attachments=[att3],
+            expected_parts=1,
+            part_numbers={att3.id: 0},
+        )
+        returned = await PlanStage()._create_or_update_group(ctx, result, {att3.id: art3})
+        session.commit()
+
+        assert returned is not None and returned.id == group.id
+        linked = session.execute(
+            select(ArchiveGroupPart).where(ArchiveGroupPart.artifact_id == att3.id)
+        ).scalar_one_or_none()
+        assert linked is not None and linked.group_id == group.id
+        assert linked.part_index == 4
 
     @pytest.mark.asyncio
     async def test_run_pages_candidates_in_batches(
@@ -3053,6 +3354,91 @@ class TestOrchestratorStaleGroups:
         assert result.attachment.platform_file_id == "file-0"
 
 
+class TestStartupRecoveryAttemptBatching:
+    """Recovery resolves each FAILED group's oldest retained job in one query."""
+
+    def test_failed_groups_use_oldest_job_attempts(self, session, test_config, monkeypatch):
+        from telecrime.models import ArchiveGroup, ExtractionJob
+        from telecrime.pipeline import orchestrator as orch
+        from telecrime.pipeline.acquire import AcquireStage
+        from telecrime.pipeline.constants import EXTRACTION_MAX_ATTEMPTS
+
+        monkeypatch.setattr(
+            AcquireStage, "recover_stuck_downloads", lambda self, s, d: None
+        )
+        monkeypatch.setattr(
+            AcquireStage,
+            "cleanup_stale_incomplete_groups",
+            lambda self, s, max_age_days=30: 0,
+        )
+
+        def _group(fingerprint: str) -> ArchiveGroup:
+            group = ArchiveGroup(
+                fingerprint=fingerprint,
+                expected_part_count=1,
+                detected_part_count=1,
+                status=GroupStatus.FAILED,
+            )
+            session.add(group)
+            session.flush()
+            return group
+
+        # Oldest job is at the cap → terminal (a newer low-attempt job must not win).
+        terminal = _group("sr-terminal")
+        session.add(
+            ExtractionJob(
+                group_id=terminal.id,
+                status=ExtractionStatus.FAILED,
+                attempts_count=EXTRACTION_MAX_ATTEMPTS,
+            )
+        )
+        session.flush()
+        session.add(
+            ExtractionJob(
+                group_id=terminal.id, status=ExtractionStatus.PENDING, attempts_count=0
+            )
+        )
+
+        # Oldest job is below the cap → retry (a newer high-attempt job must not win).
+        retry = _group("sr-retry")
+        session.add(
+            ExtractionJob(
+                group_id=retry.id, status=ExtractionStatus.FAILED, attempts_count=0
+            )
+        )
+        session.flush()
+        session.add(
+            ExtractionJob(
+                group_id=retry.id,
+                status=ExtractionStatus.PENDING,
+                attempts_count=EXTRACTION_MAX_ATTEMPTS,
+            )
+        )
+
+        # No retained jobs at all → retry with zero attempts.
+        no_jobs = _group("sr-nojobs")
+
+        terminal_id = terminal.id
+        retry_id = retry.id
+        no_jobs_id = no_jobs.id
+        session.commit()
+
+        orch._run_startup_recovery(session, test_config)
+        session.expire_all()
+
+        assert session.get(ArchiveGroup, terminal_id).status == GroupStatus.FAILED_TERMINAL
+        assert session.get(ArchiveGroup, retry_id).status == GroupStatus.READY
+        assert session.get(ArchiveGroup, no_jobs_id).status == GroupStatus.READY
+        # The retried group's FAILED job was reset so the attempt cap accumulates
+        # on the same row, and the highest-attempts PENDING job was kept.
+        pending = (
+            session.query(ExtractionJob)
+            .filter_by(group_id=retry_id, status=ExtractionStatus.PENDING)
+            .all()
+        )
+        assert len(pending) == 2
+
+
 class TestFinalizeStageCredentialCount:
     """Tests for FinalizeStage.credential_count denormalization."""
 
@@ -3455,6 +3841,56 @@ class TestFinalizeSweepOrphanedDownloads:
         session.expire_all()
         assert session.get(DownloadArtifact, live_art.id).is_deleted is False
         assert session.get(DownloadArtifact, cleaned_art.id).is_deleted is True
+
+
+class TestFinalizeSweepStaleDirectories:
+    """Stale extraction directories are removed with one batched status query."""
+
+    @pytest.mark.asyncio
+    async def test_sweep_batches_statuses_and_keeps_live_dirs(self, session, test_config):
+        from telecrime.models import ArchiveGroup
+        from telecrime.pipeline.finalize import FinalizeStage
+
+        extracted = test_config.extracted_dir
+        extracted.mkdir(parents=True, exist_ok=True)
+
+        live_group = ArchiveGroup(
+            fingerprint="stale-live",
+            base_name="live.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.READY,
+        )
+        cleaned_group = ArchiveGroup(
+            fingerprint="stale-cleaned",
+            base_name="cleaned.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.CLEANED,
+        )
+        session.add_all([live_group, cleaned_group])
+        session.commit()
+
+        live_dir = extracted / f"group_{live_group.id}"
+        cleaned_dir = extracted / f"group_{cleaned_group.id}"
+        missing_dir = extracted / "group_999999"
+        ignored_dir = extracted / "not_a_group"
+        ignored_file = extracted / "group_123.txt"
+        for path in (live_dir, cleaned_dir, missing_dir, ignored_dir):
+            path.mkdir()
+            (path / "creds.txt").write_text("x")
+        ignored_file.write_text("not a directory")
+
+        stage = FinalizeStage()
+        stage._BATCH_SIZE = 1  # force multiple status chunks
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        await stage._sweep_stale_directories(ctx)
+
+        assert live_dir.exists()
+        assert not cleaned_dir.exists()
+        assert not missing_dir.exists()
+        assert ignored_dir.exists()
+        assert ignored_file.exists()
 
 
 class TestParseEarlyDupSkip:

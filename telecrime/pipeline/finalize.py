@@ -372,17 +372,38 @@ class FinalizeStage(PipelineStage):
         if not extracted_dir.exists():
             return
 
+        # Collect the group ids first, then resolve their statuses with a few
+        # IN queries. The previous per-directory ``session.get`` issued one
+        # round-trip per leftover directory — thousands after a crash backlog.
+        entries: list[tuple[Path, int]] = []
         for entry in extracted_dir.iterdir():
             if not entry.is_dir() or not entry.name.startswith("group_"):
                 continue
-
             try:
                 group_id = int(entry.name.split("_", 1)[1])
             except (ValueError, IndexError):
                 continue
+            entries.append((entry, group_id))
+        if not entries:
+            return
 
-            group = ctx.session.get(ArchiveGroup, group_id)
-            if group is None or group.status == GroupStatus.CLEANED:
+        group_ids = [group_id for _, group_id in entries]
+        statuses: dict[int, GroupStatus] = {}
+        for i in range(0, len(group_ids), self._BATCH_SIZE):
+            batch = group_ids[i : i + self._BATCH_SIZE]
+            statuses.update(
+                ctx.session.execute(
+                    select(ArchiveGroup.id, ArchiveGroup.status).where(
+                        ArchiveGroup.id.in_(batch)
+                    )
+                ).all()
+            )
+
+        for entry, group_id in entries:
+            # A missing group row is treated like a CLEANED one (delete the
+            # leftover directory), matching the previous ``group is None``.
+            status = statuses.get(group_id)
+            if status is None or status == GroupStatus.CLEANED:
                 try:
                     shutil.rmtree(entry)
                     logger.info("Swept stale extraction directory: %s", entry.name)

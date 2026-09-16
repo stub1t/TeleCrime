@@ -31,13 +31,6 @@ from telecrime.pipeline.constants import EXTRACTION_MAX_ATTEMPTS
 from telecrime.pipeline.lock import pipeline_run_lock
 from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
 
-# Maximum extraction attempts per group before startup recovery gives up and
-# marks the group FAILED_TERMINAL. Bounds both the FAILED→READY retry loop and
-# the PASSWORD_NEEDED→PENDING reset (each run counts one attempt).
-# The shared value lives in constants.py (finalize uses it too); keep the
-# historical private alias for existing imports/tests.
-_EXTRACTION_MAX_ATTEMPTS = EXTRACTION_MAX_ATTEMPTS
-
 # Max READY groups selected per main-loop pass. Bounds the per-pass task set;
 # remaining READY groups are drained by the post-download sweep / next pass.
 _READY_GROUP_BATCH = 128
@@ -865,31 +858,33 @@ def _run_startup_recovery(session: Session, config: Config) -> None:
         )
     ).scalars().all()
     if stuck:
-        job_max_attempts = _EXTRACTION_MAX_ATTEMPTS
+        job_max_attempts = EXTRACTION_MAX_ATTEMPTS
         retry_ids: list[int] = []
         terminal_ids: list[int] = []
-        for _g in stuck:
-            if _g.status == GroupStatus.EXTRACTING:
-                retry_ids.append(_g.id)
-                continue
-            # FAILED: retry up to MAX_ATTEMPTS total extraction attempts.
-            # Count attempts on the job _extract_group will actually
-            # pick AFTER the reset below: the oldest PENDING/
-            # PASSWORD_NEEDED job if one exists, ELSE the oldest FAILED
-            # job (which the reset turns into PENDING). Round-15's
-            # PENDING-only query ran BEFORE the reset and saw None for
-            # all-FAILED groups — the cap never tripped and failed
-            # groups were re-extracted once per run forever.
-            # FAILED_TERMINAL jobs are included so their attempts_count
-            # (incremented before the terminal error) still counts toward
-            # the cap — otherwise a group whose job went terminal with the
-            # group left FAILED (extract.py terminal-error paths) shows
-            # attempts=0 and retries once per run forever, creating a fresh
-            # job every time.
-            _retained = session.execute(
-                select(ExtractionJob.id, ExtractionJob.attempts_count)
+        # FAILED groups: retry up to MAX_ATTEMPTS total extraction attempts.
+        # Count attempts on the job _extract_group will actually pick AFTER
+        # the reset below: the oldest PENDING/PASSWORD_NEEDED job if one
+        # exists, ELSE the oldest FAILED job (which the reset turns into
+        # PENDING). FAILED_TERMINAL jobs are included so their
+        # attempts_count (incremented before the terminal error) still
+        # counts toward the cap — otherwise a group whose job went terminal
+        # with the group left FAILED (extract.py terminal-error paths) shows
+        # attempts=0 and retries once per run forever, creating a fresh job
+        # every time.
+        #
+        # Resolve every FAILED group's retained job in ONE ordered query
+        # (oldest id wins per group) instead of one LIMIT 1 query per group;
+        # a crash backlog of thousands of FAILED groups used to pay
+        # thousands of round-trips on every startup.
+        failed_group_ids = [
+            _g.id for _g in stuck if _g.status != GroupStatus.EXTRACTING
+        ]
+        retained_attempts: dict[int, Any] = {}
+        for _i in range(0, len(failed_group_ids), 1000):
+            for _group_id, _attempts in session.execute(
+                select(ExtractionJob.group_id, ExtractionJob.attempts_count)
                 .where(
-                    ExtractionJob.group_id == _g.id,
+                    ExtractionJob.group_id.in_(failed_group_ids[_i : _i + 1000]),
                     ExtractionJob.status.in_(
                         [
                             ExtractionStatus.PENDING,
@@ -900,9 +895,14 @@ def _run_startup_recovery(session: Session, config: Config) -> None:
                     ),
                 )
                 .order_by(ExtractionJob.id)
-                .limit(1)
-            ).first()
-            _retained_attempts = _retained[1] if _retained else 0
+            ).all():
+                retained_attempts.setdefault(_group_id, _attempts)
+
+        for _g in stuck:
+            if _g.status == GroupStatus.EXTRACTING:
+                retry_ids.append(_g.id)
+                continue
+            _retained_attempts = retained_attempts.get(_g.id, 0)
             if _retained_attempts >= job_max_attempts:
                 terminal_ids.append(_g.id)
             else:
@@ -959,8 +959,8 @@ def _run_startup_recovery(session: Session, config: Config) -> None:
             ExtractionJob.attempts_count,
         ).where(ExtractionJob.status == ExtractionStatus.PASSWORD_NEEDED)
     ).all()
-    _pwd_retry = [r[0] for r in _pwd_rows if (r[2] or 0) < _EXTRACTION_MAX_ATTEMPTS]
-    _pwd_terminal = [r[1] for r in _pwd_rows if (r[2] or 0) >= _EXTRACTION_MAX_ATTEMPTS]
+    _pwd_retry = [r[0] for r in _pwd_rows if (r[2] or 0) < EXTRACTION_MAX_ATTEMPTS]
+    _pwd_terminal = [r[1] for r in _pwd_rows if (r[2] or 0) >= EXTRACTION_MAX_ATTEMPTS]
     if _pwd_retry:
         session.execute(
             update(ExtractionJob)
@@ -996,7 +996,7 @@ def _run_startup_recovery(session: Session, config: Config) -> None:
             "Startup recovery: %d PASSWORD_NEEDED groups exceeded %d "
             "attempts → FAILED_TERMINAL",
             len(_pwd_terminal),
-            _EXTRACTION_MAX_ATTEMPTS,
+            EXTRACTION_MAX_ATTEMPTS,
         )
 
     # Startup recovery: orphaned IN_PROGRESS jobs (a crash mid-
