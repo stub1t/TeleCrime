@@ -790,6 +790,25 @@ def test_watchlist_count_arms_statement_timeout(pg_engine):
     assert _WATCHLIST_COUNT_STATEMENT_TIMEOUT in " ".join(statements).lower()
 
 
+def test_collect_watchlist_alerts_skips_when_trigram_indexes_missing(
+    session, monkeypatch
+):
+    """Without the trigram indexes every ILIKE count is a full scan that burns
+    the 40s statement timeout and returns nothing; skip the scans entirely so
+    they stop competing with the pipeline for I/O."""
+    from telecrime import fts as fts_mod
+    from telecrime.scheduler import _collect_watchlist_alerts_unlocked
+
+    engine = session.get_bind()
+    monkeypatch.setattr(engine.dialect, "name", "postgresql", raising=False)
+    monkeypatch.setattr(fts_mod, "fts_available", lambda _engine: False)
+    monkeypatch.setattr(
+        "telecrime.scheduler._watchlist_ft_skip_logged", False, raising=False
+    )
+
+    assert _collect_watchlist_alerts_unlocked(engine) == []
+
+
 def test_check_disk_status_uses_config_threshold(tmp_path, monkeypatch):
     """Disk check respects the configurable scheduler threshold."""
     from telecrime.scheduler import _check_disk_status

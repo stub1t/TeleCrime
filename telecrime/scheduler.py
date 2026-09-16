@@ -1544,6 +1544,12 @@ def _watchlist_match_filter(item):
 # the 319M-row table and leaking pooled connections.
 _watchlist_scan_lock = threading.Lock()
 
+# The recovery-rebuilt database has no trigram indexes, so every watchlist
+# COUNT(ILIKE) is a sequential scan that burns its full 40s statement_timeout
+# and returns nothing (no alerts). Log the skip once per process instead of
+# repeating a misleading per-item error every 15 minutes.
+_watchlist_ft_skip_logged = False
+
 # Hard DB-side bound on each watchlist COUNT(*). It must be finite: with
 # statement_timeout=0 a slow scan kept running for minutes after notify's 45s
 # wait_for abandoned it, pinning a worker thread + pooled connection every 15
@@ -1737,6 +1743,20 @@ def _collect_watchlist_alerts_unlocked(engine) -> list[dict]:
 
     from telecrime.database import get_session
     from telecrime.models.watchlist import WatchlistItem
+
+    global _watchlist_ft_skip_logged
+    if engine.dialect.name == "postgresql":
+        from telecrime.fts import fts_available
+
+        if not fts_available(engine):
+            if not _watchlist_ft_skip_logged:
+                logger.warning(
+                    "Watchlist scans skipped: trigram indexes are missing — "
+                    "every ILIKE count is a full-table scan that times out. "
+                    "Alerts resume automatically once the indexes are rebuilt."
+                )
+                _watchlist_ft_skip_logged = True
+            return []
 
     now = datetime.now(UTC)
     alerts: list[dict] = []
