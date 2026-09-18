@@ -1283,6 +1283,27 @@ async def run_sequential_pipeline(
                     logger.info("Shutdown requested — stopping after current archive boundary")
                     break
 
+                # Within-run recovery: a prefetch task that died without
+                # resetting its artifact leaves it DOWNLOADING, which
+                # _next_pending_artifact never re-selects — without this it
+                # would only be retried by the NEXT run's startup recovery.
+                # In-flight prefetch tasks are protected via _in_flight_ids.
+                try:
+                    _stale_downloads = acquire_stage.recover_stale_downloading(
+                        session, active_ids=_in_flight_ids
+                    )
+                    if _stale_downloads:
+                        logger.info(
+                            "Recovered %d stale DOWNLOADING artifacts mid-run",
+                            _stale_downloads,
+                        )
+                except Exception as _e:
+                    logger.warning("Mid-run stuck-download recovery failed: %s", _e)
+                    try:
+                        session.rollback()
+                    except Exception:
+                        pass
+
                 # Periodic re-ingest: keeps priority (time-limited) and all channels fresh
                 # during long pipeline runs without blocking downloads.
                 _now = datetime.now(UTC)

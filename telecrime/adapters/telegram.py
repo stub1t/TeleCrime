@@ -1,13 +1,14 @@
 """Telegram adapter using Telethon."""
 
 import asyncio
+import fcntl
 import logging
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeVar
+from typing import TextIO, TypeVar
 
 from telethon import TelegramClient
 from telethon.errors import (
@@ -47,29 +48,41 @@ _T = TypeVar("_T")
 def _configure_session_sqlite(session_path: Path, client=None) -> None:
     """Enable WAL mode and busy_timeout on the Telethon session SQLite file.
 
-    WAL mode (set via a temporary connection and persisted in the file) lets
-    multiple readers coexist with a single writer.  busy_timeout makes SQLite
-    retry for up to 5 seconds rather than immediately raising
+    WAL mode (set via a temporary connection and persisted in the file) lets a
+    reader coexist with a writer across processes. busy_timeout makes SQLite
+    retry for up to 30 seconds rather than immediately raising
     "database is locked" when two processes collide on a write.
 
-    We also attempt to apply busy_timeout directly to Telethon's internal
-    SQLite connection so the client itself retries instead of failing fast.
+    File-level pragmas are applied with ``client=None`` and MUST run before
+    Telethon opens the session: SQLite cannot switch journal mode while
+    another connection holds a transaction, so the old post-connect call
+    silently failed and left the file in rollback-journal mode. The
+    ``client`` form applies busy_timeout to Telethon's own connection.
     """
-    try:
-        conn = sqlite3.connect(str(session_path), timeout=5)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.close()
-    except Exception:
-        logger.debug("Could not configure session SQLite pragmas", exc_info=True)
-
-    if client is not None:
+    if client is None:
         try:
-            internal_conn = client.session._conn
-            if internal_conn is not None:
-                internal_conn.execute("PRAGMA busy_timeout=5000")
+            conn = sqlite3.connect(str(session_path), timeout=30)
+            try:
+                mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                conn.execute("PRAGMA busy_timeout=30000")
+            finally:
+                conn.close()
+            if mode and str(mode[0]).lower() != "wal":
+                logger.warning(
+                    "Session SQLite journal_mode is %s (WAL requested) for %s",
+                    mode[0],
+                    session_path,
+                )
         except Exception:
-            logger.debug("Could not set busy_timeout on Telethon session connection", exc_info=True)
+            logger.debug("Could not configure session SQLite pragmas", exc_info=True)
+        return
+
+    try:
+        internal_conn = client.session._conn
+        if internal_conn is not None:
+            internal_conn.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        logger.debug("Could not set busy_timeout on Telethon session connection", exc_info=True)
 
 
 class TelegramAdapter(BaseAdapter):
@@ -96,9 +109,51 @@ class TelegramAdapter(BaseAdapter):
         # drop without updating state). When suspect, _ensure_connected
         # forces a full teardown + fresh connect instead of trusting it.
         self._connection_suspect = False
+        # Cross-process exclusive lock for the session file. Telethon's SQLite
+        # session only tolerates one client: a second process on the same file
+        # produces "database is locked" and "Server replied with a wrong
+        # session ID" (the server invalidates the older connection).
+        self._session_lock: TextIO | None = None
 
         if not config.telegram.api_id or not config.telegram.api_hash:
             raise ValueError("Telegram API credentials not configured")
+
+    def _acquire_session_lock(self, session_path: Path) -> bool:
+        """Take the exclusive session-file lock, or fail fast if another holds it.
+
+        Returns True when this call acquired the lock (False when this adapter
+        already holds it, e.g. inside a reconnect). The lock is released by
+        ``disconnect()``; the OS releases it automatically if we crash.
+        """
+        if self._session_lock is not None:
+            return False
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = session_path.with_name(session_path.name + ".lock")
+        handle = lock_path.open("w")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise ConnectionError(
+                f"Telegram session {session_path.name} is in use by another "
+                "process — not connecting to avoid SQLite lock/session collisions"
+            ) from None
+        self._session_lock = handle
+        return True
+
+    def _release_session_lock(self) -> None:
+        handle = self._session_lock
+        self._session_lock = None
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
 
     async def connect(self, timeout: int = 30) -> None:
         """Connect to Telegram.
@@ -108,74 +163,84 @@ class TelegramAdapter(BaseAdapter):
                      Prevents indefinite hangs when session needs re-auth.
         """
         session_path = self.config.data_dir / f"{self.config.telegram.session_name}.session"
-
-        self.client = TelegramClient(
-            str(session_path),
-            self.config.telegram.api_id,
-            self.config.telegram.api_hash,
-            timeout=timeout,
-            connection_retries=5,
-            retry_delay=1,
-            # auto_reconnect=False: Telethon's internal reconnect loop races
-            # the adapter's own reconnect paths, and a leaked old client
-            # reconnecting on the same session file invalidates the fresh
-            # connection ("Server replied with a wrong session ID") and wedges
-            # permanently with "AttributeError: 'NoneType' object has no
-            # attribute 'connect'" in mtprotosender._reconnect. The adapter's
-            # bounded _ensure_connected/_reconnect_blocking are the single
-            # reconnect authority; a drop fails fast instead of spinning.
-            auto_reconnect=False,
-            flood_sleep_threshold=60,
-            request_retries=3,
-        )
+        acquired_lock = self._acquire_session_lock(session_path)
 
         try:
-            if self.config.telegram.phone:
-                await asyncio.wait_for(
-                    self.client.start(phone=self.config.telegram.phone),
-                    timeout=timeout,
-                )
-            else:
-                # No phone configured — connect and rely on existing session file.
-                await asyncio.wait_for(self.client.connect(), timeout=timeout)
-                if not await self.client.is_user_authorized():
-                    # Clean up the half-open client: without this, a leaked
-                    # live client (with its internal connection state) keeps
-                    # the session file busy and poisons later connects.
-                    try:
-                        await asyncio.wait_for(
-                            self.client.disconnect(),
-                            timeout=self._DISCONNECT_TIMEOUT_SECONDS,
-                        )
-                    except Exception:
-                        pass
-                    self.client = None
-                    raise ConnectionError(
-                        "Telegram session is not authorized. "
-                        "Set TELECRIME_TELEGRAM_PHONE and run interactively to log in."
-                    )
-        except TimeoutError:
-            self._set_runtime_note(
-                f"Telegram connect timed out after {timeout}s",
-                kind="telegram_reconnect",
+            # Before Telethon opens the file: SQLite cannot switch to WAL while
+            # another connection holds a transaction.
+            _configure_session_sqlite(session_path)
+
+            self.client = TelegramClient(
+                str(session_path),
+                self.config.telegram.api_id,
+                self.config.telegram.api_hash,
+                timeout=timeout,
+                connection_retries=5,
+                retry_delay=1,
+                # auto_reconnect=False: Telethon's internal reconnect loop races
+                # the adapter's own reconnect paths, and a leaked old client
+                # reconnecting on the same session file invalidates the fresh
+                # connection ("Server replied with a wrong session ID") and wedges
+                # permanently with "AttributeError: 'NoneType' object has no
+                # attribute 'connect'" in mtprotosender._reconnect. The adapter's
+                # bounded _ensure_connected/_reconnect_blocking are the single
+                # reconnect authority; a drop fails fast instead of spinning.
+                auto_reconnect=False,
+                flood_sleep_threshold=60,
+                request_retries=3,
             )
-            # CRITICAL: explicitly disconnect the half-connected client so its
-            # background auto_reconnect=True loop stops spinning. Without this,
-            # the leaked client keeps holding sockets + tasks for hours, which
-            # is what caused 2026-06-04 (9h-idle PG transaction wedged on a
-            # leaked Telethon client). Best-effort: swallow disconnect errors.
+            _configure_session_sqlite(session_path, self.client)
+
             try:
-                await asyncio.wait_for(self.client.disconnect(), timeout=5)
-            except Exception:
-                pass
-            self.client = None
-            raise ConnectionError(
-                f"Telegram connection timed out after {timeout}s. "
-                "Session may need re-authentication — run interactively first."
-            )
-        self._clear_runtime_note()
-        _configure_session_sqlite(session_path, self.client)
-        logger.info("Connected to Telegram")
+                if self.config.telegram.phone:
+                    await asyncio.wait_for(
+                        self.client.start(phone=self.config.telegram.phone),
+                        timeout=timeout,
+                    )
+                else:
+                    # No phone configured — connect and rely on existing session file.
+                    await asyncio.wait_for(self.client.connect(), timeout=timeout)
+                    if not await self.client.is_user_authorized():
+                        # Clean up the half-open client: without this, a leaked
+                        # live client (with its internal connection state) keeps
+                        # the session file busy and poisons later connects.
+                        try:
+                            await asyncio.wait_for(
+                                self.client.disconnect(),
+                                timeout=self._DISCONNECT_TIMEOUT_SECONDS,
+                            )
+                        except Exception:
+                            pass
+                        self.client = None
+                        raise ConnectionError(
+                            "Telegram session is not authorized. "
+                            "Set TELECRIME_TELEGRAM_PHONE and run interactively to log in."
+                        )
+            except TimeoutError:
+                self._set_runtime_note(
+                    f"Telegram connect timed out after {timeout}s",
+                    kind="telegram_reconnect",
+                )
+                # CRITICAL: explicitly disconnect the half-connected client so its
+                # background auto_reconnect=True loop stops spinning. Without this,
+                # the leaked client keeps holding sockets + tasks for hours, which
+                # is what caused 2026-06-04 (9h-idle PG transaction wedged on a
+                # leaked Telethon client). Best-effort: swallow disconnect errors.
+                try:
+                    await asyncio.wait_for(self.client.disconnect(), timeout=5)
+                except Exception:
+                    pass
+                self.client = None
+                raise ConnectionError(
+                    f"Telegram connection timed out after {timeout}s. "
+                    "Session may need re-authentication — run interactively first."
+                )
+            self._clear_runtime_note()
+            logger.info("Connected to Telegram")
+        except BaseException:
+            if acquired_lock:
+                self._release_session_lock()
+            raise
 
     async def disconnect(self) -> None:
         """Disconnect from Telegram (bounded — a wedged client must not hang
@@ -189,6 +254,7 @@ class TelegramAdapter(BaseAdapter):
             except Exception:
                 pass
             logger.info("Disconnected from Telegram")
+        self._release_session_lock()
 
     def _set_runtime_note(self, note: str, *, kind: str) -> None:
         # The "since" stamp must be file-global, not per-instance: multiple

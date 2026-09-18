@@ -385,6 +385,92 @@ async def test_reconnect_blocking_clears_suspect(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_session_sqlite_uses_wal_before_client_opens(monkeypatch, tmp_path):
+    """The session file must be WAL before Telethon opens it.
+
+    Regression: the old post-connect pragma call silently failed under the
+    client's open connection, so the file stayed in rollback-journal mode and
+    concurrent processes hit "database is locked".
+    """
+    import sqlite3
+
+    from telecrime.config import Config, TelegramConfig
+
+    cfg = Config(
+        database_url="postgresql://x:y@db/z",
+        data_dir=tmp_path,
+        telegram=TelegramConfig(api_id=1, api_hash="x", session_name="wal_sess"),
+    )
+    session_path = tmp_path / "wal_sess.session"
+    sqlite3.connect(str(session_path)).close()
+    observed = {}
+
+    def _fake_client(*args, **kwargs):
+        probe = sqlite3.connect(str(session_path))
+        try:
+            observed["journal_mode"] = probe.execute("PRAGMA journal_mode").fetchone()[0]
+        finally:
+            probe.close()
+        client = MagicMock()
+        client.session._conn = sqlite3.connect(
+            str(session_path), check_same_thread=False
+        )
+        client.connect = AsyncMock()
+        client.is_user_authorized = AsyncMock(return_value=True)
+        client.disconnect = AsyncMock()
+        return client
+
+    monkeypatch.setattr("telecrime.adapters.telegram.TelegramClient", _fake_client)
+    adapter = TelegramAdapter(cfg)
+    await adapter.connect(timeout=5)
+
+    assert observed["journal_mode"].lower() == "wal"
+    busy = adapter.client.session._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert busy == 30000
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_session_lock_serializes_same_session_across_adapters(monkeypatch, tmp_path):
+    """Only one adapter may use a session file at a time.
+
+    A second process/client on the same session produces SQLite
+    "database is locked" and makes Telegram invalidate the older connection
+    ("wrong session ID"); the lock makes it fail fast instead.
+    """
+    import sqlite3
+
+    from telecrime.config import Config, TelegramConfig
+
+    cfg = Config(
+        database_url="postgresql://x:y@db/z",
+        data_dir=tmp_path,
+        telegram=TelegramConfig(api_id=1, api_hash="x", session_name="lock_sess"),
+    )
+    sqlite3.connect(str(tmp_path / "lock_sess.session")).close()
+
+    def _fake_client(*args, **kwargs):
+        client = MagicMock()
+        client.session._conn = None
+        client.connect = AsyncMock()
+        client.is_user_authorized = AsyncMock(return_value=True)
+        client.disconnect = AsyncMock()
+        return client
+
+    monkeypatch.setattr("telecrime.adapters.telegram.TelegramClient", _fake_client)
+    first = TelegramAdapter(cfg)
+    second = TelegramAdapter(cfg)
+
+    await first.connect(timeout=5)
+    with pytest.raises(ConnectionError, match="in use"):
+        await second.connect(timeout=5)
+
+    await first.disconnect()
+    await second.connect(timeout=5)
+    await second.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_client_created_with_auto_reconnect_disabled(monkeypatch, tmp_path):
     """Regression: auto_reconnect=True let Telethon's internal reconnect loop
     race the adapter's own reconnect, wedge the client permanently, and leak

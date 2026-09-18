@@ -12,6 +12,10 @@
 # and (b) real DB query activity. If both are absent for two consecutive
 # checks, the pipeline is hung and gets restarted.
 #
+# Drive-wedge detection deliberately needs MORE evidence than a hung pipeline:
+# a wedged drive looks identical to a hang, but restarting into a wedge churns
+# downloads, so a transient D-state writer must never be enough.
+#
 # Install:
 #   crontab -e
 #   */10 * * * * /path/to/TeleCrime/scripts/unattended-watchdog.sh >> /path/to/TeleCrime/data/watchdog.log 2>&1
@@ -50,6 +54,11 @@ mkdir -p "$DATA_DIR"
 LOG="$DATA_DIR/watchdog.log"
 PROGRESS="$DATA_DIR/pipeline_progress.json"
 SNAP=/tmp/telecrime-watchdog-snap.txt   # last observed progress signature
+WEDGE_PROC_DIR="${TELECRIME_PROC_DIR:-/proc}"  # overridable for hermetic tests
+# A transient D-state `dmcrypt_write*`/`jbd2/*` thread under heavy write load
+# is normal; only the SAME thread staying in D-state across this many
+# consecutive checks with no DB query activity counts as a wedged drive.
+WEDGE_MIN_CHECKS=3
 # Heartbeat freshness must match the scheduler's configured stale threshold
 # (TELECRIME_PIPELINE_STALE_SECONDS) rather than a hardcoded 600.
 STALE_HEARTBEAT_SEC="$(dotenv_value TELECRIME_PIPELINE_STALE_SECONDS)"
@@ -256,35 +265,48 @@ log "check: pipeline_pid=$PIPELINE_PID alive=$PIPELINE_ALIVE heartbeat_age=${HEA
 # pipeline's progress writes — the pipeline then LOOKS hung by every signal
 # below. Killing/restarting into the wedge churns (resets downloads, fresh run
 # into degraded I/O) and cannot help. Transient D-state is normal under heavy
-# write load, so only a drive-writer thread stuck across two checks counts.
+# write load, so a wedge requires the SAME thread in D-state across
+# WEDGE_MIN_CHECKS consecutive checks AND no DB query progress. The snapshot
+# records "pid count comm" per line; anything not matching (e.g. the old
+# pid-only snapshot format) restarts that thread's count at 1.
 DRIVE_WEDGED=0
 WEDGE_SNAP=/tmp/telecrime-wedge-pids.txt
 CURRENT_WEDGED=""
-if [ -d /proc ]; then
-  for _comm in /proc/[0-9]*/comm; do
+WEDGE_EVIDENCE=""
+if [ -d "$WEDGE_PROC_DIR" ]; then
+  for _comm in "$WEDGE_PROC_DIR"/[0-9]*/comm; do
     [ -r "$_comm" ] || continue
     _name=$(cat "$_comm" 2>/dev/null) || continue
     case "$_name" in
       dmcrypt_write*|jbd2/*)
         _pid=$(basename "$(dirname "$_comm")")
-        if [ -r "/proc/$_pid/stat" ] && grep -qE '^[0-9]+ \([^)]*\) D' "/proc/$_pid/stat" 2>/dev/null; then
-          CURRENT_WEDGED="$CURRENT_WEDGED $_pid"
+        if [ -r "$WEDGE_PROC_DIR/$_pid/stat" ] && grep -qE '^[0-9]+ \([^)]*\) D' "$WEDGE_PROC_DIR/$_pid/stat" 2>/dev/null; then
+          _count=1
+          if [ -f "$WEDGE_SNAP" ]; then
+            _prev_count=$(awk -v p="$_pid" -v n="$_name" '$1 == p && $3 == n {print $2; exit}' "$WEDGE_SNAP")
+            case "$_prev_count" in
+              ''|*[!0-9]*) _prev_count=0 ;;
+            esac
+            _count=$((_prev_count + 1))
+          fi
+          if [ -z "$CURRENT_WEDGED" ]; then
+            CURRENT_WEDGED="$_pid $_count $_name"
+          else
+            CURRENT_WEDGED="$CURRENT_WEDGED
+$_pid $_count $_name"
+          fi
+          if [ "$_count" -ge "$WEDGE_MIN_CHECKS" ] && [ "$DB_ACTIVE" = "0" ] && [ -z "$WEDGE_EVIDENCE" ]; then
+            DRIVE_WEDGED=1
+            WEDGE_EVIDENCE="pid=$_pid comm=$_name count=$_count"
+          fi
         fi
         ;;
     esac
   done
 fi
-if [ -n "$CURRENT_WEDGED" ] && [ -f "$WEDGE_SNAP" ]; then
-  PREV_WEDGED=$(cat "$WEDGE_SNAP" 2>/dev/null)
-  for _p in $CURRENT_WEDGED; do
-    case " $PREV_WEDGED " in
-      *" $_p "*) DRIVE_WEDGED=1 ;;
-    esac
-  done
-fi
-echo "$CURRENT_WEDGED" > "$WEDGE_SNAP"
+printf '%s\n' "$CURRENT_WEDGED" > "$WEDGE_SNAP"
 if [ "$DRIVE_WEDGED" = "1" ]; then
-  log "CRITICAL: data drive write appears hung (same D-state thread across two checks) — pausing pipeline heals"
+  log "CRITICAL: data drive write appears hung ($WEDGE_EVIDENCE in D-state across $WEDGE_MIN_CHECKS consecutive checks, db_active=$DB_ACTIVE) — pausing pipeline heals"
 fi
 
 # --- Heal logic ---
@@ -379,7 +401,7 @@ fi
 # NOTE: DRIVE_WEDGED was computed ABOVE the pipeline-heal logic and must NOT
 # be reset here — the container-heal guards below rely on it.
 if [ "$DRIVE_WEDGED" = "1" ]; then
-  log "CRITICAL: data drive write appears hung — pausing container heals"
+  log "CRITICAL: data drive write appears hung ($WEDGE_EVIDENCE) — pausing container heals"
 fi
 
 for svc in db web worker; do

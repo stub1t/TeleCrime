@@ -349,6 +349,60 @@ def test_search_count_endpoint_returns_total_matches(pg_engine):
     assert payload["total_credentials"] == 1
 
 
+def test_search_total_count_respects_source_conv_filter(pg_engine):
+    """The total shown for /search?q=&source_conv=N must count only that
+    conversation's matches, matching the list's filter."""
+    from telecrime.database import get_session as _gs
+
+    with _gs(pg_engine) as session:
+        conv_a = Conversation(platform_id=101, conversation_type="channel", title="A")
+        conv_b = Conversation(platform_id=102, conversation_type="channel", title="B")
+        session.add_all([conv_a, conv_b])
+        session.flush()
+        for conv, username in ((conv_a, "alice"), (conv_b, "bob")):
+            session.add(
+                ParsedCredential(
+                    url="https://needle.example.com/login",
+                    domain="needle.example.com",
+                    username=username,
+                    password="secret",
+                    soft_credential_hash=ParsedCredential.compute_soft_hash(
+                        "needle.example.com", username, "secret"
+                    ),
+                    credential_hash=ParsedCredential.compute_hash(
+                        "needle.example.com", username, "secret"
+                    ),
+                    source_conversation_id=conv.id,
+                )
+            )
+        session.commit()
+        conv_a_id = conv_a.id
+
+    app = create_app(pg_engine.url.render_as_string(hide_password=False))
+    response = _route(app, "/search").endpoint(
+        request=_web_request(),
+        q="needle",
+        limit=50,
+        limit_messages=0,
+        limit_attachments=0,
+        limit_archives=0,
+        limit_extracted=0,
+        limit_conversations=0,
+        limit_channels=0,
+        page=1,
+        page_size=50,
+        after_id=0,
+        regex=False,
+        facets=False,
+        no_markdown=False,
+        source_conv=conv_a_id,
+    )
+
+    assert response.status_code == 200
+    assert [c.username for c in response.context["results"].credentials] == ["alice"]
+    assert response.context["total_credentials"] == 1
+
+
 def test_search_export_soft_dedupes_equivalent_credentials(pg_engine):
     assert _ensure_search_infra(pg_engine) is True
 

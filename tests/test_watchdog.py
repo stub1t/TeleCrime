@@ -15,6 +15,7 @@ are hermetic and fast.
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from datetime import UTC, datetime
@@ -70,6 +71,9 @@ esac
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["TELECRIME_DATA_DIR"] = str(data)
+    # Keep the drive-wedge /proc scan hermetic: with the default it would read
+    # the host's real /proc and could see (or miss) D-state kernel threads.
+    env["TELECRIME_PROC_DIR"] = str(data / "proc")
     env.pop("TELECRIME_PIPELINE_STALE_SECONDS", None)
     return SimpleNamespace(repo=repo, data=data, script=script, env=env, calls=calls)
 
@@ -259,6 +263,22 @@ def _write_stale_snapshot(watchdog, signature: str, age_seconds: int = 1000):
     (watchdog.data / "telecrime-wedge-pids.txt").write_text("")
 
 
+def _write_dstate_thread(watchdog, pid: int, name: str) -> None:
+    proc = watchdog.data / "proc" / str(pid)
+    proc.mkdir(parents=True, exist_ok=True)
+    (proc / "comm").write_text(f"{name}\n")
+    (proc / "stat").write_text(f"{pid} ({name}) D 1 0 0 0 -1 0 0 0 0 0 0 0 0 0\n")
+
+
+def _remove_dstate_thread(watchdog, pid: int) -> None:
+    shutil.rmtree(watchdog.data / "proc" / str(pid), ignore_errors=True)
+
+
+def _write_wedge_snapshot(watchdog, *entries: tuple[int, int, str]) -> None:
+    lines = [f"{pid} {count} {name}" for pid, count, name in entries]
+    (watchdog.data / "telecrime-wedge-pids.txt").write_text("\n".join(lines) + "\n")
+
+
 def test_watchdog_heals_dead_pipeline_with_pid_file(watchdog):
     """A pid file whose process is gone means the run crashed mid-flight."""
     _write_progress(watchdog)
@@ -347,3 +367,107 @@ def test_watchdog_active_download_blocks_frozen_heal(watchdog):
     log = (watchdog.data / "watchdog.log").read_text()
     assert "dl_active=1" in log
     assert "HEAL" not in log
+
+
+def test_watchdog_drive_wedge_needs_three_consecutive_checks(watchdog):
+    """Two consecutive D-state sightings of the same thread are not enough.
+
+    Regression: the old detection declared a wedge on the second sighting
+    (any shared pid), so transient D-state under write load paused all heals.
+    """
+    _write_progress(watchdog)
+    _write_dstate_thread(watchdog, 4242, "dmcrypt_write/0")
+    _write_wedge_snapshot(watchdog, (4242, 1, "dmcrypt_write/0"))
+
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "CRITICAL: data drive write appears hung" not in log
+    # The consecutive-sighting counter still advances.
+    assert "4242 2 dmcrypt_write/0" in (
+        watchdog.data / "telecrime-wedge-pids.txt"
+    ).read_text()
+
+
+def test_watchdog_drive_wedge_after_three_checks_logs_signature(watchdog):
+    """Three consecutive D-state checks of the same thread with no DB query
+    activity is a wedge, and the log names the observed signature."""
+    _write_progress(watchdog)
+    _write_dstate_thread(watchdog, 4242, "dmcrypt_write/0")
+    _write_wedge_snapshot(watchdog, (4242, 2, "dmcrypt_write/0"))
+
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "CRITICAL: data drive write appears hung" in log
+    assert "pid=4242" in log
+    assert "comm=dmcrypt_write/0" in log
+    assert "count=3" in log
+    assert "across 3 consecutive checks" in log
+    assert "heal skipped: data drive wedged" in log
+
+
+def test_watchdog_drive_wedge_requires_no_db_activity(watchdog):
+    """A persisted D-state thread with an active pipeline DB query is load, not
+    a wedge: heal pausing must not trigger."""
+    bin_dir = Path(watchdog.env["PATH"].split(":")[0])
+    _write_stub(
+        bin_dir,
+        "docker",
+        f"""printf '%s\\n' "$*" >> "{watchdog.calls}"
+case " $* " in
+  *" ps -q "*) echo "stub-worker-cid"; exit 0 ;;
+  *" ps "*) echo "stubservice Up (healthy)"; exit 0 ;;
+  *" exec "*) echo "5"; exit 0 ;;
+  *) exit 0 ;;
+esac
+""",
+    )
+    _write_progress(watchdog)
+    _write_dstate_thread(watchdog, 4242, "dmcrypt_write/0")
+    _write_wedge_snapshot(watchdog, (4242, 2, "dmcrypt_write/0"))
+
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "db_active=1" in log
+    assert "CRITICAL: data drive write appears hung" not in log
+
+
+def test_watchdog_drive_wedge_requires_the_same_thread(watchdog):
+    """A different D-state thread each check is not sustained evidence."""
+    _write_progress(watchdog)
+    _write_dstate_thread(watchdog, 9999, "jbd2/sda1-8")
+    _write_wedge_snapshot(watchdog, (4242, 2, "dmcrypt_write/0"))
+
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "CRITICAL: data drive write appears hung" not in log
+    snapshot = (watchdog.data / "telecrime-wedge-pids.txt").read_text()
+    assert "9999 1 jbd2/sda1-8" in snapshot
+    assert "4242" not in snapshot
+
+
+def test_watchdog_drive_wedge_ignores_legacy_pid_only_snapshot(watchdog):
+    """The pre-upgrade pid-only snapshot must not be mistaken for counts.
+
+    ``123 456`` (two pids) previously parsed as pid=123 with count=456, which
+    would declare a wedge instantly after deploy.
+    """
+    _write_progress(watchdog)
+    _write_dstate_thread(watchdog, 123, "dmcrypt_write/0")
+    (watchdog.data / "telecrime-wedge-pids.txt").write_text("123 456\n")
+
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "CRITICAL: data drive write appears hung" not in log
+    assert "123 1 dmcrypt_write/0" in (
+        watchdog.data / "telecrime-wedge-pids.txt"
+    ).read_text()

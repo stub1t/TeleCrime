@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import shutil
+import sqlite3
 import tempfile
 import time
 from datetime import UTC, datetime, timedelta
@@ -20,6 +21,7 @@ from telecrime.models import (
     FileAttachment,
     Message,
 )
+from telecrime.pipeline.constants import DOWNLOAD_TRANSIENT_MAX_ATTEMPTS
 from telecrime.pipeline.orchestrator import PipelineContext, PipelineStage
 from telecrime.states import DownloadStatus, GroupStatus
 from telecrime.utils.retry import backoff_delay
@@ -49,6 +51,21 @@ _PERMANENT_ERROR_SUBSTRINGS = (
     "Download task completed but file not found",
 )
 
+_TRANSIENT_ERROR_SUBSTRINGS = (
+    "database is locked",
+    "database table is locked",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection aborted",
+    "server closed the connection",
+    "0 bytes read",
+    "while disconnected",
+    "not connected",
+    "request was unsuccessful",
+    "wrong session id",
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +75,22 @@ def _is_permanent_error(e: BaseException) -> bool:
         return True
     msg = str(e)
     return any(sub in msg for sub in _PERMANENT_ERROR_SUBSTRINGS)
+
+
+def _is_transient_error(e: BaseException) -> bool:
+    """Return True for session-file locks / connection drops that self-heal.
+
+    SQLite "database is locked" (another process holds the session file) and
+    connection timeouts must not terminalize an artifact: the file is still on
+    Telegram, only the session was momentarily busy.
+    """
+    if isinstance(e, sqlite3.OperationalError):
+        msg = str(e).lower()
+        return "locked" in msg or "busy" in msg
+    if isinstance(e, (ConnectionError, TimeoutError)):
+        return True
+    msg = str(e).lower()
+    return any(sub in msg for sub in _TRANSIENT_ERROR_SUBSTRINGS)
 
 
 class AcquireStage(PipelineStage):
@@ -282,6 +315,57 @@ class AcquireStage(PipelineStage):
             session.commit()
             logger.info("Startup recovery: resolved %d stuck DOWNLOADING artifacts", recovered)
 
+        return recovered
+
+    def recover_stale_downloading(
+        self,
+        session,
+        *,
+        active_ids: set[int] | None = None,
+        stale_seconds: int = 900,
+    ) -> int:
+        """Reset orphaned DOWNLOADING artifacts so the *current* run retries them.
+
+        Startup recovery only runs between runs; a download task that dies or
+        is abandoned mid-run leaves its artifact DOWNLOADING until the next
+        startup. ``active_ids`` protects downloads whose task is still live but
+        whose row has not been rewritten since the download started (a long
+        download never updates ``updated_at``), and ``stale_seconds`` stops a
+        just-orphaned artifact from being reset while its task may still be
+        winding down.
+        """
+        active_ids = active_ids or set()
+        cutoff = datetime.now(UTC) - timedelta(seconds=stale_seconds)
+        stale = (
+            session.execute(
+                select(DownloadArtifact).where(
+                    DownloadArtifact.status == DownloadStatus.DOWNLOADING,
+                    DownloadArtifact.updated_at < cutoff,
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        recovered = 0
+        for artifact in stale:
+            if artifact.id in active_ids:
+                continue
+            if artifact.temp_path:
+                try:
+                    Path(artifact.temp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            artifact.temp_path = None
+            artifact.status = DownloadStatus.PENDING
+            recovered += 1
+
+        if recovered:
+            session.commit()
+            logger.warning(
+                "Within-run recovery: reset %d stale DOWNLOADING artifacts → PENDING",
+                recovered,
+            )
         return recovered
 
     def cleanup_stale_incomplete_groups(self, session, max_age_days: int = 30) -> int:
@@ -796,6 +880,25 @@ class AcquireStage(PipelineStage):
                     )
                     await asyncio.sleep(delay)
                     continue
+
+                total_attempts = persisted_retry_count + local_retry_count
+                if (
+                    _is_transient_error(e)
+                    and total_attempts < DOWNLOAD_TRANSIENT_MAX_ATTEMPTS
+                ):
+                    # Session-file locks / connection timeouts are not the
+                    # file's fault: leave the artifact retryable (FAILED) and
+                    # cap the cross-run attempts instead of terminalizing.
+                    artifact.status = DownloadStatus.FAILED
+                    logger.warning(
+                        "Download of %s hit a transient session/connection error "
+                        "(attempt %d/%d) — will retry on a later run: %r",
+                        filename,
+                        total_attempts,
+                        DOWNLOAD_TRANSIENT_MAX_ATTEMPTS,
+                        e,
+                    )
+                    return False
 
                 artifact.status = DownloadStatus.FAILED_TERMINAL
                 return False

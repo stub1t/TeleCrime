@@ -81,36 +81,77 @@ def _assert_safe_test_database(url: str) -> None:
     )
 
 
-@pytest.fixture()
-def pg_engine():
-    """PostgreSQL engine, reset before each test (skipped if no PG URL set).
+def _reset_all_tables(engine) -> None:
+    """Empty every test table and restart its identity sequences.
 
-    Drops and recreates the schema on a dedicated autocommit connection so
-    every test starts empty and the trgm extension is present. Leftover idle
-    connections from `create_app` are terminated first to avoid lock blocks.
-    A cross-process file lock serializes the destructive reset so two pytest
-    runs sharing the test database do not kill each other's connections.
+    Equivalent to the former ``DROP SCHEMA`` + ``create_all`` reset (empty
+    tables, sequences back at 1) but without any DDL. ``DELETE`` in reverse
+    dependency order plus one ``setval`` per sequence is used instead of
+    ``TRUNCATE ... RESTART IDENTITY``: TRUNCATE forces an immediate data-file
+    fsync per relation (``DataFileImmediateSync``), which stalls when the
+    Postgres data volume is slow/wedged, while DELETE/setval write only WAL
+    (kept on the internal SSD). Test tables hold a handful of rows, so the
+    scans are trivial; idle ``create_app`` connections are still terminated
+    first so their row locks cannot block the reset.
+    """
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(
+            text(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+            )
+        )
+        # Children before parents (reversed create order) satisfies FKs.
+        for table in reversed(Base.metadata.sorted_tables):
+            conn.execute(table.delete())
+        sequences = list(
+            conn.execute(
+                text(
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE c.relkind = 'S' AND n.nspname = 'public'"
+                )
+            ).scalars()
+        )
+        if sequences:
+            # One statement for every sequence: setval(seq, 1, false) makes the
+            # next nextval return 1, exactly like RESTART IDENTITY.
+            sets = ", ".join(
+                f"setval('{name.replace(chr(39), chr(39) * 2)}', 1, false)"
+                for name in sequences
+            )
+            conn.execute(text(f"SELECT {sets}"))
+
+
+@pytest.fixture(scope="session")
+def _pg_schema_engine():
+    """PostgreSQL engine with the schema built once per test session.
+
+    PG-dependent tests need an empty schema plus the trgm extension/indexes.
+    Building that per test dominated the suite under a slow data volume, so it
+    happens once; ``pg_engine`` still resets all data before every test.
     """
     if not PG_URL:
         pytest.skip("TELECRIME_TEST_DATABASE_URL not set — PG-only test skipped")
     _assert_safe_test_database(PG_URL)
-    lock_handle = _acquire_pg_test_lock()
     engine = create_engine(PG_URL, pool_pre_ping=True)
+    admin = create_engine(PG_URL, isolation_level="AUTOCOMMIT")
+    # The destructive DDL must hold the same cross-process lock as the
+    # per-test reset, or a concurrent pytest run could have its schema
+    # dropped mid-test. Release it before yielding so the per-test
+    # acquisition is not a self-deadlock (flock is per open file description).
+    lock_handle = _acquire_pg_test_lock()
     try:
-        admin = create_engine(PG_URL, isolation_level="AUTOCOMMIT")
-        try:
-            with admin.connect() as conn:
-                conn.execute(
-                    text(
-                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                        "WHERE datname = current_database() AND pid <> pg_backend_pid()"
-                    )
+        with admin.connect() as conn:
+            conn.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND pid <> pg_backend_pid()"
                 )
-                conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
-                conn.execute(text("CREATE SCHEMA public"))
-                conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        finally:
-            admin.dispose()
+            )
+            conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+            conn.execute(text("CREATE SCHEMA public"))
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         Base.metadata.create_all(bind=engine)
         # The trigram GIN indexes live in migration i9j0k1l2m3n4, not in the
         # models, so create_all leaves them out and fts_available() (correctly)
@@ -126,9 +167,33 @@ def pg_engine():
                         f"USING GIN ({column} gin_trgm_ops)"
                     )
                 )
+    finally:
+        lock_handle.close()
+    try:
         yield engine
     finally:
+        admin.dispose()
         engine.dispose()
+
+
+@pytest.fixture()
+def pg_engine(_pg_schema_engine):
+    """PostgreSQL engine reset to empty before each test (skip if no PG URL).
+
+    Uses the session-scoped schema and resets data with a bounded set of
+    DELETEs per test instead of dropping/recreating the schema (and rebuilding
+    every index). A cross-process file lock still serializes the destructive
+    reset so two pytest runs sharing the test database do not kill each
+    other's connections.
+    """
+    if not PG_URL:
+        pytest.skip("TELECRIME_TEST_DATABASE_URL not set — PG-only test skipped")
+    _assert_safe_test_database(PG_URL)
+    lock_handle = _acquire_pg_test_lock()
+    try:
+        _reset_all_tables(_pg_schema_engine)
+        yield _pg_schema_engine
+    finally:
         lock_handle.close()
 
 

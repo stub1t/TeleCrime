@@ -1,6 +1,7 @@
 """Tests for pipeline stages and orchestration."""
 
 import asyncio
+import sqlite3
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -267,6 +268,56 @@ class TestPipeline:
         assert run is not None
         assert run.mode == "sequential"
         assert run.status == "failed"
+
+    @pytest.mark.asyncio
+    async def test_sequential_pipeline_runs_mid_run_stuck_download_recovery(
+        self, session, test_config, monkeypatch
+    ):
+        """The sequential loop resets orphaned DOWNLOADING artifacts mid-run.
+
+        Regression: only startup recovery handled them, so an artifact whose
+        prefetch task died stayed DOWNLOADING for the rest of the run.
+        """
+        from telecrime.pipeline.acquire import AcquireStage
+
+        calls: list[set[int]] = []
+        original = AcquireStage.recover_stale_downloading
+
+        def _spy(self, sess, *, active_ids=None, stale_seconds=900):
+            calls.append(set(active_ids or set()))
+            return original(self, sess, active_ids=active_ids, stale_seconds=stale_seconds)
+
+        monkeypatch.setattr(AcquireStage, "recover_stale_downloading", _spy)
+
+        class OkStage(PipelineStage):
+            def __init__(self, name):
+                self.name = name
+
+            async def run(self, ctx):
+                return True
+
+        monkeypatch.setattr("telecrime.pipeline.ingest.IngestStage", lambda: OkStage("ingest"))
+        monkeypatch.setattr(
+            "telecrime.pipeline.channel_discover.ChannelDiscoverStage",
+            lambda: OkStage("channel_discover"),
+        )
+        monkeypatch.setattr(
+            "telecrime.pipeline.discover.DiscoverStage", lambda: OkStage("discover")
+        )
+        monkeypatch.setattr("telecrime.pipeline.plan.PlanStage", lambda: OkStage("plan"))
+        monkeypatch.setattr("telecrime.pipeline.extract.ExtractStage", lambda: MagicMock())
+        monkeypatch.setattr("telecrime.pipeline.parse.ParseStage", lambda: MagicMock())
+        monkeypatch.setattr("telecrime.pipeline.finalize.FinalizeStage", lambda: MagicMock())
+        monkeypatch.setattr("telecrime.pipeline.channel_discover.ChannelJoiner", lambda: None)
+        monkeypatch.setattr(
+            "telecrime.extractor.seven_zip.SevenZipExtractor", lambda *args, **kwargs: MagicMock()
+        )
+
+        await run_sequential_pipeline(
+            test_config, session, MagicMock(), dry_run=False, limit=1
+        )
+
+        assert calls == [set()]
 
     @pytest.mark.asyncio
     async def test_sequential_pipeline_fails_cleanly_when_locked(self, session, test_config):
@@ -1894,6 +1945,111 @@ class TestAcquireStage:
         assert artifact.temp_path is None
         assert not partial.exists()  # partial file cleaned up
 
+    def test_recover_stale_downloading_resets_orphan_within_run(self, session, tmp_path):
+        """An orphaned DOWNLOADING artifact older than the threshold is reset
+        mid-run so the current run retries it (not just the next startup)."""
+        from datetime import timedelta
+
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        tmp_dir = tmp_path / "downloads" / ".tmp"
+        tmp_dir.mkdir(parents=True)
+        partial = tmp_dir / "orphan.partial"
+        partial.write_bytes(b"incomplete")
+
+        conv = Conversation(platform_id=101, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=101,
+            platform_timestamp=datetime.now(UTC),
+        )
+        session.add(msg)
+        session.flush()
+        fa = FileAttachment(message_id=msg.id, filename="orphan.rar", platform_file_id="fid_101")
+        session.add(fa)
+        session.flush()
+        artifact = DownloadArtifact(
+            attachment_id=fa.id,
+            status=DownloadStatus.DOWNLOADING,
+            temp_path=str(partial),
+        )
+        artifact.updated_at = datetime.now(UTC) - timedelta(hours=1)
+        session.add(artifact)
+        session.commit()
+
+        recovered = AcquireStage().recover_stale_downloading(session, active_ids=set())
+
+        assert recovered == 1
+        session.refresh(artifact)
+        assert artifact.status == DownloadStatus.PENDING
+        assert artifact.temp_path is None
+        assert not partial.exists()
+
+    def test_recover_stale_downloading_respects_active_and_fresh_downloads(
+        self, session, tmp_path
+    ):
+        """Live downloads (even with an old row) and recent rows are untouched."""
+        from datetime import timedelta
+
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        conv = Conversation(platform_id=102, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=102,
+            platform_timestamp=datetime.now(UTC),
+        )
+        session.add(msg)
+        session.flush()
+
+        def _artifact(suffix: str) -> DownloadArtifact:
+            fa = FileAttachment(
+                message_id=msg.id,
+                filename=f"{suffix}.rar",
+                platform_file_id=f"fid_{suffix}",
+            )
+            session.add(fa)
+            session.flush()
+            return DownloadArtifact(
+                attachment_id=fa.id,
+                status=DownloadStatus.DOWNLOADING,
+                temp_path=str(tmp_path / f"{suffix}.partial"),
+            )
+
+        active = _artifact("active")
+        active.updated_at = datetime.now(UTC) - timedelta(hours=2)
+        session.add(active)
+        fresh = _artifact("fresh")
+        fresh.updated_at = datetime.now(UTC)
+        session.add(fresh)
+        session.commit()
+
+        recovered = AcquireStage().recover_stale_downloading(
+            session, active_ids={active.id}
+        )
+
+        assert recovered == 0
+        session.refresh(active)
+        session.refresh(fresh)
+        assert active.status == DownloadStatus.DOWNLOADING
+        assert fresh.status == DownloadStatus.DOWNLOADING
+
     @pytest.mark.asyncio
     async def test_update_group_statuses_only_touches_requested_groups(self, session, test_config):
         """Acquire status updates can target just the groups changed by downloads."""
@@ -2084,6 +2240,128 @@ class TestAcquireStage:
         session.refresh(artifact)
         assert artifact.status == DownloadStatus.FAILED_TERMINAL
         assert artifact.retry_count == 7  # 5 persisted + 2 attempts this call
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            sqlite3.OperationalError("database is locked"),
+            ConnectionError(
+                "Telegram connection timed out after 30s. Session may need "
+                "re-authentication — run interactively first."
+            ),
+        ],
+        ids=["sqlite-locked", "connection-timeout"],
+    )
+    @pytest.mark.asyncio
+    async def test_transient_session_error_stays_retryable(
+        self, session, test_config, error
+    ):
+        """Session locks / connection timeouts keep the artifact retryable.
+
+        Regression: after max_retries local attempts the artifact went
+        FAILED_TERMINAL even though the file was still on Telegram and only the
+        SQLite session file was momentarily locked (~38 permanent failures/day).
+        """
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        test_config.download.max_retries = 2
+        test_config.download.retry_delay_seconds = 0
+        test_config.extraction.min_free_disk_mb = 0
+
+        conv = Conversation(platform_id=6, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id, platform_id=60, platform_timestamp=datetime.now(UTC)
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id,
+            platform_file_id="locked-file",
+            filename="locked.rar",
+            size=10,
+        )
+        session.add(attachment)
+        session.flush()
+        artifact = DownloadArtifact(
+            attachment_id=attachment.id, status=DownloadStatus.PENDING
+        )
+        session.add(artifact)
+        session.commit()
+
+        adapter = MagicMock()
+        adapter.download_message_media = AsyncMock(side_effect=error)
+        ctx = PipelineContext(config=test_config, session=session, adapter=adapter)
+
+        result = await AcquireStage()._download_artifact(ctx, artifact)
+
+        assert result is False
+        session.commit()
+        session.refresh(artifact)
+        assert artifact.status == DownloadStatus.FAILED
+        assert artifact.retry_count == 2
+
+    @pytest.mark.asyncio
+    async def test_transient_error_terminalizes_at_attempt_cap(self, session, test_config):
+        """After DOWNLOAD_TRANSIENT_MAX_ATTEMPTS the artifact goes terminal so a
+        permanently-locked session cannot retry forever."""
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.pipeline.constants import DOWNLOAD_TRANSIENT_MAX_ATTEMPTS
+        from telecrime.states import DownloadStatus
+
+        test_config.download.max_retries = 1
+        test_config.download.retry_delay_seconds = 0
+        test_config.extraction.min_free_disk_mb = 0
+
+        conv = Conversation(platform_id=7, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id, platform_id=70, platform_timestamp=datetime.now(UTC)
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id,
+            platform_file_id="locked-file-cap",
+            filename="locked-cap.rar",
+            size=10,
+        )
+        session.add(attachment)
+        session.flush()
+        artifact = DownloadArtifact(
+            attachment_id=attachment.id,
+            status=DownloadStatus.FAILED,
+            retry_count=DOWNLOAD_TRANSIENT_MAX_ATTEMPTS,
+        )
+        session.add(artifact)
+        session.commit()
+
+        adapter = MagicMock()
+        adapter.download_message_media = AsyncMock(
+            side_effect=sqlite3.OperationalError("database is locked")
+        )
+        ctx = PipelineContext(config=test_config, session=session, adapter=adapter)
+
+        result = await AcquireStage()._download_artifact(ctx, artifact)
+
+        assert result is False
+        session.commit()
+        session.refresh(artifact)
+        assert artifact.status == DownloadStatus.FAILED_TERMINAL
+        assert artifact.retry_count == DOWNLOAD_TRANSIENT_MAX_ATTEMPTS + 1
 
     def test_recover_skips_file_claimed_by_other_artifact(self, session, tmp_path):
         """A same-name file already owned by another artifact is not recovered here."""
@@ -2550,10 +2828,20 @@ class TestParseStageChunkedInsert:
     """Tests for ParseStage chunked bulk insert."""
 
     @pytest.mark.asyncio
-    async def test_bulk_insert_chunks_large_batches(self, session, test_config, tmp_path):
-        """_bulk_insert_credentials splits large batches into smaller chunks."""
+    async def test_bulk_insert_chunks_large_batches(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """_bulk_insert_credentials splits large batches into smaller chunks.
+
+        The chunk sizes are monkeypatched small: the behavior under test is the
+        split/flush loop, not the production 10K/50K constants — building
+        50,100 SQLite rows took seconds while proving the same thing.
+        """
         from telecrime.models import ArchiveGroup, ExtractedOutput, ExtractionJob, ParsedCredential
-        from telecrime.pipeline.parse import _INSERT_CHUNK_SIZE
+        from telecrime.pipeline import parse as parse_mod
+
+        monkeypatch.setattr(parse_mod, "_INSERT_CHUNK_SIZE", 40)
+        monkeypatch.setattr(parse_mod, "_INSERT_CHUNK_SIZE_SQLITE", 40)
 
         group = ArchiveGroup(
             fingerprint="chunk-test",
@@ -2585,7 +2873,7 @@ class TestParseStageChunkedInsert:
 
         # Create more rows than _INSERT_CHUNK_SIZE so chunking is exercised
         rows = []
-        for i in range(_INSERT_CHUNK_SIZE + 100):
+        for i in range(parse_mod._INSERT_CHUNK_SIZE + 100):
             rows.append(
                 {
                     "url": f"https://site{i}.com/login",
@@ -2610,6 +2898,113 @@ class TestParseStageChunkedInsert:
         # Verify all rows landed in the DB
         count = session.query(ParsedCredential).count()
         assert count == len(rows)
+
+    def test_copy_payload_constants_match_per_row_escaping(
+        self, test_config, monkeypatch
+    ):
+        """Pre-escaping the per-file constants once per chunk must produce the
+        exact COPY bytes the per-row escape loop produced (including values
+        with tab/newline/backslash control characters)."""
+        from telecrime.pipeline import parse as parse_mod
+
+        monkeypatch.setattr(parse_mod, "_has_hash64_index", lambda engine: False)
+        monkeypatch.setattr(parse_mod, "_trigram_indexes_present", lambda session: False)
+
+        class _RecordingCursor:
+            def __init__(self, log):
+                self.log = log
+
+            def execute(self, sql, *args):
+                self.log.append(("execute", sql))
+
+            def copy_expert(self, sql, buf):
+                self.log.append(("copy", sql, buf.getvalue()))
+
+            def fetchall(self):
+                return []
+
+            def close(self):
+                pass
+
+        class _FakeSavepoint:
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+        class _FakeRawConn:
+            def __init__(self, log):
+                self.log = log
+                self._cursor = _RecordingCursor(log)
+
+            def cursor(self):
+                return self._cursor
+
+        class _FakeConn:
+            def __init__(self, log):
+                self.connection = _FakeRawConn(log)
+
+        class _FakeSession:
+            def __init__(self):
+                self.log: list = []
+                self._conn = _FakeConn(self.log)
+
+            def get_bind(self):
+                return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+            def begin_nested(self):
+                return _FakeSavepoint()
+
+            def connection(self):
+                return self._conn
+
+        constants = {
+            "extraction_job_id": 7,
+            "source_file": "/tmp/source\tfile.txt",
+            "source_archive": "arch\\ive\n.zip",
+            "source_conversation_id": None,
+            "source_message_id": 12,
+            "stealer_type": "redline",
+        }
+
+        def row(idx: int) -> dict[str, object]:
+            return {
+                "url": f"https://site{idx}.example/login",
+                "domain": f"site{idx}.example",
+                "username": f"user{idx}",
+                "password": "p\tw\\d",
+                "email_domain": None,
+                "application": "Chrome",
+                "profile": "Default",
+                "credential_hash": f"{idx:064x}",
+            }
+
+        def payload(use_constants: bool) -> bytes:
+            fake = _FakeSession()
+            ctx = PipelineContext(
+                config=test_config, session=fake, adapter=MagicMock()
+            )
+            fields = parse_mod.ParseStage._COPY_FIELDS
+            chunk = []
+            for i in range(3):
+                data = row(i)
+                if not use_constants:
+                    # Baseline: the provenance values live in every row.
+                    data.update(constants)
+                chunk.append(data)
+            parse_mod.ParseStage()._copy_insert_chunk(
+                ctx,
+                chunk,
+                fields,
+                ", ".join(fields),
+                constants if use_constants else None,
+            )
+            copies = [entry for entry in fake.log if entry[0] == "copy"]
+            assert len(copies) == 1
+            return copies[0][2]
+
+        assert payload(False) == payload(True)
 
 
 def test_postgres_bulk_insert_uses_copy_and_exact_dedup(pg_session, test_config):
@@ -2645,6 +3040,51 @@ def test_postgres_bulk_insert_uses_copy_and_exact_dedup(pg_session, test_config)
 
     assert len(inserted) == 2
     assert pg_session.query(ParsedCredential).count() == 2
+
+
+def test_postgres_bulk_insert_constants_supply_per_file_fields(pg_session, test_config):
+    """The COPY path's per-chunk constant escaping must land the exact
+    constant values (and not consume the rows' copies), including fields with
+    COPY control characters."""
+    from telecrime.models import ParsedCredential
+
+    stage = ParseStage()
+    ctx = PipelineContext(config=test_config, session=pg_session, adapter=MagicMock())
+
+    def row(idx: int) -> dict[str, object]:
+        # Per-file provenance keys are deliberately omitted: the constants
+        # mapping is the only source for them on this path.
+        return {
+            "url": f"https://example.com/login?n={idx}",
+            "domain": "example.com",
+            "username": f"user{idx}",
+            "password": "secret",
+            "email_domain": None,
+            "application": None,
+            "profile": None,
+            "credential_hash": ParsedCredential.compute_hash(
+                "example.com", f"user{idx}", "secret"
+            ),
+        }
+
+    rows = [row(0), row(1), row(2)]
+    constants = {
+        "extraction_job_id": None,
+        "source_file": "/tmp/const\tants.txt",
+        "source_archive": "archive.zip",
+        "source_conversation_id": None,
+        "source_message_id": None,
+        "stealer_type": "redline",
+    }
+    inserted = stage._bulk_insert_credentials(ctx, rows, constants)
+    pg_session.commit()
+
+    assert len(inserted) == 3
+    stored = pg_session.query(ParsedCredential).order_by(ParsedCredential.id).all()
+    assert [r.username for r in stored] == ["user0", "user1", "user2"]
+    assert all(r.source_file == "/tmp/const\tants.txt" for r in stored)
+    assert all(r.source_archive == "archive.zip" for r in stored)
+    assert all(r.stealer_type == "redline" for r in stored)
 
 
 class TestParseFailureCompensation:

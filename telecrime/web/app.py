@@ -469,6 +469,7 @@ def _credential_match_count(
     filters: dict[str, list[str]],
     exclude_conversation_ids: set[int],
     candidate_ids: list[int] | None = None,
+    source_conv: int = 0,
 ) -> int:
     if not terms:
         return 0
@@ -503,6 +504,9 @@ def _credential_match_count(
             exclude_conversation_ids,
             case_insensitive_op="ILIKE",
         )
+        if source_conv > 0:
+            where_parts.append("pc.source_conversation_id = :source_conv")
+            params["source_conv"] = source_conv
         identity_sql = _credential_identity_sql(session)
         select_cols = "pc.credential_hash, pc.id"
         if _has_db_column(session, "parsed_credentials", "soft_credential_hash"):
@@ -526,6 +530,9 @@ def _credential_match_count(
     where_parts = ["parsed_credentials_fts MATCH :q"]
     params = {"q": _fts_escape(terms)}
     _apply_credential_filters_sql(where_parts, params, filters, exclude_conversation_ids)
+    if source_conv > 0:
+        where_parts.append("pc.source_conversation_id = :source_conv")
+        params["source_conv"] = source_conv
 
     identity_sql = _credential_identity_sql(session)
     row = session.execute(
@@ -3322,6 +3329,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                             filters=filters,
                             exclude_conversation_ids=excluded_conversations,
                             candidate_ids=candidate_pool,
+                            source_conv=source_conv,
                         )
                     except Exception:
                         try:

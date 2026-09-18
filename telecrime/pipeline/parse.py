@@ -1214,7 +1214,23 @@ class ParseStage(PipelineStage):
                 # Yield before the blocking INSERT so concurrent tasks (prefetch
                 # downloads, progress heartbeat) get a chance to run.
                 await asyncio.sleep(0)
-                inserted_rows = self._bulk_insert_credentials(ctx, rows)
+                # These six provenance fields are identical for every row in
+                # this flush (they change only per output file); letting the
+                # COPY path escape them once per chunk removes 6 of 15
+                # per-row escape+join operations. Values match the rows built
+                # above exactly.
+                inserted_rows = self._bulk_insert_credentials(
+                    ctx,
+                    rows,
+                    constants={
+                        "extraction_job_id": _job_id,
+                        "source_file": _file_path_str,
+                        "source_archive": _source_archive,
+                        "source_conversation_id": _src_conv,
+                        "source_message_id": _src_msg,
+                        "stealer_type": _stealer,
+                    },
+                )
                 for row in inserted_rows:
                     domain = row.get("domain")
                     if isinstance(domain, str) and domain:
@@ -1444,6 +1460,7 @@ class ParseStage(PipelineStage):
         self,
         ctx: PipelineContext,
         rows: list[dict[str, object]],
+        constants: dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         """Insert a credential batch and return the rows that were newly inserted.
 
@@ -1454,6 +1471,12 @@ class ParseStage(PipelineStage):
         live schema with all GIN indexes present). Falls back to the slower
         path on SQLite (test fixtures) since COPY is PG-specific.
 
+        ``constants`` optionally carries field values that are identical for
+        every row of the batch (the parse hot path's per-file provenance
+        fields) so the COPY path can escape them once per chunk instead of
+        once per row. Output is byte-identical to leaving it unset; the
+        SQLite fallback ignores it.
+
         Each chunk runs inside its own SAVEPOINT so a failure of one chunk only
         discards that chunk — previously inserted chunks remain durable in the
         enclosing transaction and the reported count matches reality.
@@ -1462,7 +1485,7 @@ class ParseStage(PipelineStage):
             return []
 
         if ctx.session.get_bind().dialect.name == "postgresql":
-            return self._bulk_insert_via_copy(ctx, rows)
+            return self._bulk_insert_via_copy(ctx, rows, constants)
         return self._bulk_insert_via_values(ctx, rows)
 
     # Columns used by the COPY path. Order must match the COPY column list in
@@ -1495,6 +1518,7 @@ class ParseStage(PipelineStage):
         self,
         ctx: PipelineContext,
         rows: list[dict[str, object]],
+        constants: dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         """COPY-into-staging + INSERT-SELECT ON CONFLICT (PostgreSQL-only)."""
         fields = self._COPY_FIELDS
@@ -1508,7 +1532,9 @@ class ParseStage(PipelineStage):
         for i in range(0, len(rows), _INSERT_CHUNK_SIZE):
             chunk = rows[i : i + _INSERT_CHUNK_SIZE]
             try:
-                inserted.extend(self._copy_insert_chunk(ctx, chunk, fields, col_list))
+                inserted.extend(
+                    self._copy_insert_chunk(ctx, chunk, fields, col_list, constants)
+                )
             except Exception as exc:
                 logger.error(
                     "Credential COPY chunk failed after retry; aborting parse instead of "
@@ -1528,6 +1554,7 @@ class ParseStage(PipelineStage):
         chunk: list[dict[str, object]],
         fields: tuple[str, ...],
         col_list: str,
+        constants: dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         """COPY-insert one chunk inside a savepoint; halve-and-retry on failure.
 
@@ -1580,6 +1607,27 @@ class ParseStage(PipelineStage):
                 buf = io.StringIO()
                 write = buf.write
                 esc = self._copy_escape
+                # Per-file provenance fields (job id, source file/archive,
+                # source ids, stealer type) are identical for every row of a
+                # flush. Escaping them once per chunk instead of once per row
+                # removes 6/15 of the escape+join work from the row loop.
+                # Only used when they occupy one contiguous run of `fields`,
+                # so concatenation order (and thus the COPY payload) is
+                # byte-identical; otherwise the loop escapes every field.
+                constant_middle: str | None = None
+                prefix_fields: tuple[str, ...] = ()
+                suffix_fields: tuple[str, ...] = ()
+                if constants:
+                    positions = [i for i, f in enumerate(fields) if f in constants]
+                    if positions and positions == list(
+                        range(positions[0], positions[-1] + 1)
+                    ):
+                        start, end = positions[0], positions[-1]
+                        prefix_fields = fields[:start]
+                        suffix_fields = fields[end + 1 :]
+                        constant_middle = "\t".join(
+                            esc(constants[f]) for f in fields[start : end + 1]
+                        )
                 # In-chunk dedup: repeated credential_hash rows (the
                 # same victim's log line appearing twice in one file)
                 # violate _pc_staging_hash during COPY — PostgreSQL
@@ -1594,8 +1642,18 @@ class ParseStage(PipelineStage):
                         if _h in _seen_hashes:
                             continue
                         _seen_hashes.add(_h)
-                    write("\t".join(esc(row.get(f)) for f in fields))
-                    write("\n")
+                    if constant_middle is not None:
+                        if prefix_fields:
+                            write("\t".join([esc(row.get(f)) for f in prefix_fields]))
+                            write("\t")
+                        write(constant_middle)
+                        for f in suffix_fields:
+                            write("\t")
+                            write(esc(row.get(f)))
+                        write("\n")
+                    else:
+                        write("\t".join([esc(row.get(f)) for f in fields]))
+                        write("\n")
                 buf.seek(0)
                 cursor.copy_expert(
                     f"COPY _pc_staging ({col_list}) FROM STDIN",
@@ -1697,16 +1755,24 @@ class ParseStage(PipelineStage):
                 "Credential COPY chunk failed (%s: %s) — splitting %d rows in half and retrying",
                 type(exc).__name__, exc, len(chunk),
             )
-            first_half = self._copy_insert_chunk(ctx, chunk[:half], fields, col_list)
-            second_half = self._copy_insert_chunk(ctx, chunk[half:], fields, col_list)
+            first_half = self._copy_insert_chunk(
+                ctx, chunk[:half], fields, col_list, constants
+            )
+            second_half = self._copy_insert_chunk(
+                ctx, chunk[half:], fields, col_list, constants
+            )
             return first_half + second_half
 
     def _bulk_insert_via_values(
         self,
         ctx: PipelineContext,
         rows: list[dict[str, object]],
+        constants: dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         """Legacy chunked INSERT-VALUES path, used by SQLite test fixtures."""
+        # SQLite has no COPY; the pre-escaped constants optimization is
+        # PostgreSQL-only and the value rows are already assembled.
+        del constants
         inserted: list[dict[str, object]] = []
         dialect_insert = get_dialect_insert(ctx.session)
 

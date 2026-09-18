@@ -1073,13 +1073,35 @@ def _cancel_parse_competing_queries(engine) -> int:
 # explicit bulk-write session).
 _VACUUM_STATEMENT_TIMEOUT = "6h"
 
+# The vacuum interval is 168h, so a transient connection loss during the run
+# must not skip maintenance for a week. Retry bounded and only for connection
+# failures: re-running a cancelled 6h statement-timeout would burn another 6h
+# per attempt.
+_VACUUM_MAX_ATTEMPTS = 3
+_VACUUM_RETRY_DELAY_SECONDS = 10.0
+_VACUUM_TRANSIENT_MSG_FRAGMENTS = (
+    "server closed the connection",
+    "server closed connection",
+    "connection reset",
+    "connection has been closed",
+    "connection was closed",
+    "ssl connection has been closed",
+    "could not connect",
+    "connection refused",
+    "terminating connection",
+    "server is in recovery",
+)
 
-def _run_vacuum_job(engine) -> str:
-    """Run VACUUM ANALYZE to reclaim space (PostgreSQL).
 
-    Also prunes stale extracted_output rows for CLEANED groups — these are
-    kept only until finalize, after which they serve no purpose.
-    """
+def _vacuum_transient_error(exc: BaseException) -> bool:
+    if getattr(exc, "connection_invalidated", False):
+        return True
+    message = str(exc).lower()
+    return any(fragment in message for fragment in _VACUUM_TRANSIENT_MSG_FRAGMENTS)
+
+
+def _run_vacuum_once(engine) -> int:
+    """Run one VACUUM ANALYZE pass; returns the number of pruned rows."""
     import sqlalchemy as _sa
 
     from telecrime.database import get_session
@@ -1131,7 +1153,34 @@ def _run_vacuum_job(engine) -> str:
             _sa.text(f"SET statement_timeout = '{_VACUUM_STATEMENT_TIMEOUT}'")
         )
         conn.execute(_sa.text("VACUUM ANALYZE"))
-    return f"VACUUM completed, pruned {pruned:,} stale extracted_output rows"
+    return pruned
+
+
+def _run_vacuum_job(engine) -> str:
+    """Run VACUUM ANALYZE to reclaim space (PostgreSQL).
+
+    Also prunes stale extracted_output rows for CLEANED groups — these are
+    kept only until finalize, after which they serve no purpose.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    for attempt in range(_VACUUM_MAX_ATTEMPTS):
+        try:
+            pruned = _run_vacuum_once(engine)
+            return f"VACUUM completed, pruned {pruned:,} stale extracted_output rows"
+        except OperationalError as exc:
+            if attempt == _VACUUM_MAX_ATTEMPTS - 1 or not _vacuum_transient_error(exc):
+                raise
+            delay = _VACUUM_RETRY_DELAY_SECONDS * (attempt + 1)
+            logger.warning(
+                "VACUUM attempt %d/%d failed (%s) — retrying in %.0fs",
+                attempt + 1,
+                _VACUUM_MAX_ATTEMPTS,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def _reparse_stealers_impl(

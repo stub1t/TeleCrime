@@ -211,6 +211,78 @@ def test_vacuum_job_executes_vacuum(pg_engine):
     assert result == "VACUUM completed, pruned 0 stale extracted_output rows"
 
 
+def test_vacuum_job_retries_transient_connection_loss(monkeypatch):
+    """A dropped connection retries in-job instead of skipping a 168h interval."""
+    from sqlalchemy.exc import OperationalError
+
+    from telecrime import scheduler as sched
+
+    calls: list[object] = []
+
+    def _fake_once(engine):
+        calls.append(engine)
+        if len(calls) < 3:
+            raise OperationalError(
+                "VACUUM", {}, Exception("server closed the connection unexpectedly")
+            )
+        return 7
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(sched, "_run_vacuum_once", _fake_once)
+    monkeypatch.setattr(sched.time, "sleep", lambda delay: sleeps.append(delay))
+
+    result = sched._run_vacuum_job(object())
+
+    assert result == "VACUUM completed, pruned 7 stale extracted_output rows"
+    assert len(calls) == 3
+    assert len(sleeps) == 2
+    assert 0 < sleeps[0] < sleeps[1]
+
+
+def test_vacuum_job_gives_up_after_bounded_transient_retries(monkeypatch):
+    """Persistent connection loss still surfaces after the bounded attempts."""
+    from sqlalchemy.exc import OperationalError
+
+    from telecrime import scheduler as sched
+
+    calls: list[object] = []
+
+    def _fake_once(engine):
+        calls.append(engine)
+        raise OperationalError(
+            "VACUUM", {}, Exception("server closed the connection unexpectedly")
+        )
+
+    monkeypatch.setattr(sched, "_run_vacuum_once", _fake_once)
+    monkeypatch.setattr(sched.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(OperationalError):
+        sched._run_vacuum_job(object())
+
+    assert len(calls) == sched._VACUUM_MAX_ATTEMPTS
+
+
+def test_vacuum_job_does_not_retry_non_transient_errors(monkeypatch):
+    """A non-connection OperationalError must fail fast, not burn retries."""
+    from sqlalchemy.exc import OperationalError
+
+    from telecrime import scheduler as sched
+
+    calls: list[object] = []
+
+    def _fake_once(engine):
+        calls.append(engine)
+        raise OperationalError("VACUUM", {}, Exception("syntax error at or near"))
+
+    monkeypatch.setattr(sched, "_run_vacuum_once", _fake_once)
+    monkeypatch.setattr(sched.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(OperationalError):
+        sched._run_vacuum_job(object())
+
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
