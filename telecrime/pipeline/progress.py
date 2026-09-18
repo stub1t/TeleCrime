@@ -158,6 +158,12 @@ class PipelineProgressWriter:
             self._write()
 
     def _write(self, running: bool = True) -> None:
+        if running and self._stop_event.is_set():
+            # The heartbeat thread can be preempted between its wait() and
+            # this write by finish(); without the guard its late write
+            # resurrected running=True after a clean stop, leaving the
+            # dashboard and the watchdog with a phantom live pipeline.
+            running = False
         with self._write_lock:
             data = {
                 "running": running,
@@ -323,6 +329,17 @@ class PipelineProgressWriter:
 
     def add_error(self) -> None:
         self._errors += 1
+        self._mark_progress()
+        self._write()
+
+    def update_errors(self, count: int) -> None:
+        """Set the error counter to the authoritative pipeline total.
+
+        Stages append recoverable per-item failures directly to ``ctx.errors``
+        without calling ``add_error()``; without this sync the progress file
+        reported errors=0 while the persisted PipelineRun recorded failures.
+        """
+        self._errors = int(count)
         self._mark_progress()
         self._write()
 

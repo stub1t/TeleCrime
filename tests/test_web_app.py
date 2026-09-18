@@ -1198,6 +1198,97 @@ def test_conversations_list_counts_only_page_and_orders(tmp_path, monkeypatch):
     assert response.context["stats"]["total_convs"] == 3
 
 
+def test_conversations_list_skips_indexless_credential_scan(tmp_path, monkeypatch):
+    """Without the source_conversation_id index on a large table the per-page
+    credential COUNT can only time out; the route skips it and keeps message
+    counts instead of paying the full 12s scan for zeros."""
+    from telecrime.web import app as web_app
+
+    monkeypatch.setattr(web_app, "_pg_fast_count_estimates", lambda *args: {})
+    monkeypatch.setattr(web_app, "_cred_page_aggregation_allowed", lambda *args: False)
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        conv = Conversation(platform_id=1, conversation_type="channel", title="conv")
+        session.add(conv)
+        session.flush()
+        session.add(
+            Message(
+                conversation_id=conv.id,
+                platform_id=1,
+                platform_timestamp=datetime.now(UTC),
+                text="hello",
+            )
+        )
+        session.add(
+            ParsedCredential(
+                url="https://conv.example/login",
+                domain="conv.example",
+                username="user",
+                password="pw",
+                source_conversation_id=conv.id,
+                credential_hash=ParsedCredential.compute_hash(
+                    "conv.example", "user", "pw"
+                ),
+            )
+        )
+
+    response = _route(app, "/conversations").endpoint(
+        request=_web_request(), page=1, limit=50
+    )
+
+    assert response.status_code == 200
+    row = response.context["conversations"][0]
+    assert row["cred_count"] == 0
+    assert row["msg_count"] == 1
+
+
+def test_cred_page_aggregation_allowed_probes_index_once(tmp_path):
+    """Large PG table without the index → skip (probe once then cached);
+    with the index → run; small table → run without probing."""
+    from telecrime.web import app as web_app
+
+    web_app._cred_agg_allowed_cache.clear()
+
+    class _Result:
+        def __init__(self, row):
+            self._row = row
+
+        def first(self):
+            return self._row
+
+    class _FakePgSession:
+        def __init__(self, row):
+            self.row = row
+            self.queries: list[object] = []
+
+        def get_bind(self):
+            return SimpleNamespace(
+                dialect=SimpleNamespace(name="postgresql"),
+                url="postgresql://telecrime/db",
+            )
+
+        def execute(self, stmt, params=None):
+            self.queries.append(params)
+            return _Result(self.row)
+
+    large = web_app._CRED_AGG_SEQ_SCAN_MAX_ROWS * 3
+
+    missing = _FakePgSession(None)
+    assert web_app._cred_page_aggregation_allowed(missing, large) is False
+    # Cached: a second call must not re-probe.
+    assert web_app._cred_page_aggregation_allowed(_FakePgSession((1,)), large) is False
+    assert len(missing.queries) == 1
+
+    web_app._cred_agg_allowed_cache.clear()
+    present = _FakePgSession((1,))
+    assert web_app._cred_page_aggregation_allowed(present, large) is True
+    assert len(present.queries) == 1
+
+    small = _FakePgSession(None)
+    assert web_app._cred_page_aggregation_allowed(small, 100) is True
+    assert small.queries == []
+
+
 def test_conversation_detail_caps_cred_count(tmp_path, monkeypatch):
     """The exact COUNT(*) is replaced by a LIMIT-capped count that renders as
     "N+" once the cap is reached."""
@@ -1476,3 +1567,124 @@ def test_no_unbounded_statement_timeout_in_web_or_scheduler():
         source = (root / rel).read_text()
         assert "SET statement_timeout = 0" not in source
         assert "SET statement_timeout=0" not in source
+
+
+def test_search_renders_when_match_count_rolls_back(tmp_path):
+    """A tolerated count-query rollback must not detach the loaded credentials.
+
+    Regression: ``last_id`` was read after the session closed; any rollback
+    that expired the loaded rows (e.g. the match-count statement timeout this
+    route explicitly degrades on) raised DetachedInstanceError and turned the
+    degraded search into a 500.
+    """
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        conv = Conversation(platform_id=1, conversation_type="channel", title="A")
+        session.add(conv)
+        session.flush()
+        session.add(
+            ParsedCredential(
+                url="https://example.com/login",
+                domain="example.com",
+                username="alice",
+                password="secret",
+                credential_hash=ParsedCredential.compute_hash(
+                    "example.com", "alice", "secret"
+                ),
+                source_conversation_id=conv.id,
+            )
+        )
+        conv_id = conv.id
+
+    response = _route(app, "/search").endpoint(
+        request=_web_request(),
+        q="example",
+        limit=50,
+        limit_messages=0,
+        limit_attachments=0,
+        limit_archives=0,
+        limit_extracted=0,
+        limit_conversations=0,
+        limit_channels=0,
+        page=1,
+        page_size=50,
+        after_id=0,
+        regex=False,
+        facets=False,
+        no_markdown=False,
+        source_conv=conv_id,
+    )
+
+    assert response.status_code == 200
+    assert [c.username for c in response.context["results"].credentials] == ["alice"]
+    assert response.context["last_id"] > 0
+
+
+def test_triage_retry_extraction_reopens_cleaned_group(tmp_path):
+    """Retrying an extraction of a CLEANED group must restore its artifacts.
+
+    Regression: the route set the group READY while finalize had marked its
+    artifacts is_deleted and unlinked the files, so extraction failed with "No
+    archive files found" and the group got stuck FAILED with no re-download
+    possible (the acquire pickers re-select PENDING artifacts, not deleted
+    COMPLETED ones).
+    """
+    app, seed_engine = _sqlite_app(tmp_path)
+    with get_session(seed_engine) as session:
+        conv = Conversation(platform_id=11, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=110,
+            platform_timestamp=datetime.now(UTC),
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id, platform_file_id="cleaned-job", filename="data.zip"
+        )
+        session.add(attachment)
+        session.flush()
+        artifact = DownloadArtifact(
+            attachment_id=attachment.id,
+            status=DownloadStatus.COMPLETED,
+            local_path="/gone/data.zip",
+            is_deleted=True,
+        )
+        session.add(artifact)
+        session.flush()
+        group = ArchiveGroup(
+            fingerprint="cleaned-extraction",
+            base_name="data.zip",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.CLEANED,
+        )
+        session.add(group)
+        session.flush()
+        session.add(
+            ArchiveGroupPart(group_id=group.id, artifact_id=artifact.id, part_index=0)
+        )
+        job = ExtractionJob(
+            group_id=group.id,
+            status=ExtractionStatus.FAILED_TERMINAL,
+            target_extensions=".txt",
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        group_id = group.id
+        artifact_id = artifact.id
+
+    response = _route(app, "/triage/retry/extraction/{job_id}", "POST").endpoint(
+        job_id=job_id
+    )
+    assert response.status_code == 200
+
+    with get_session(seed_engine) as session:
+        assert session.get(ArchiveGroup, group_id).status == GroupStatus.INCOMPLETE
+        artifact = session.get(DownloadArtifact, artifact_id)
+        assert artifact.status == DownloadStatus.PENDING
+        assert artifact.is_deleted is False
+        assert artifact.local_path is None

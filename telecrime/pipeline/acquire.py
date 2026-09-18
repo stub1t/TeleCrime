@@ -115,6 +115,38 @@ class AcquireStage(PipelineStage):
                 if owner_path:
                     claimed_paths.setdefault(str(Path(owner_path).resolve()), set()).add(owner_id)
 
+        # Completed siblings' content hashes, batched in ONE query instead of a
+        # per-recovered-artifact SELECT (the old N+1). platform_file_unique_id
+        # guarantees byte-identical content, so a completed sibling's stored
+        # hash is authoritative when verifying a file recovered from disk.
+        # Recovered artifacts are added to the map as they are accepted, so a
+        # later stuck artifact with the same platform id still compares against
+        # the sibling this recovery just marked COMPLETED (same visibility the
+        # former per-artifact query had via autoflush).
+        sibling_hashes: dict[str, str] = {}
+        stuck_platform_ids = {
+            artifact.attachment.platform_file_unique_id
+            for artifact in stuck
+            if artifact.attachment and artifact.attachment.platform_file_unique_id
+        }
+        if stuck_platform_ids:
+            for unique_id, content_hash in session.execute(
+                select(
+                    FileAttachment.platform_file_unique_id,
+                    DownloadArtifact.content_hash,
+                )
+                .join(
+                    DownloadArtifact,
+                    DownloadArtifact.attachment_id == FileAttachment.id,
+                )
+                .where(
+                    FileAttachment.platform_file_unique_id.in_(stuck_platform_ids),
+                    DownloadArtifact.status == DownloadStatus.COMPLETED,
+                    DownloadArtifact.content_hash.isnot(None),
+                )
+            ):
+                sibling_hashes.setdefault(unique_id, content_hash)
+
         recovered = 0
         for artifact in stuck:
             filename = artifact.attachment.filename if artifact.attachment else None
@@ -172,7 +204,16 @@ class AcquireStage(PipelineStage):
                 # A COMPLETED sibling with the same platform_file_unique_id is
                 # guaranteed by Telegram to be byte-identical. If this file
                 # hashes differently it is the wrong file — re-download.
-                sibling_hash = self._sibling_content_hash(session, artifact)
+                platform_file_unique_id = (
+                    artifact.attachment.platform_file_unique_id
+                    if artifact.attachment
+                    else None
+                )
+                sibling_hash = (
+                    sibling_hashes.get(platform_file_unique_id)
+                    if platform_file_unique_id
+                    else None
+                )
                 if (
                     recovered_hash is not None
                     and sibling_hash is not None
@@ -197,6 +238,10 @@ class AcquireStage(PipelineStage):
                 if recovered_hash is not None:
                     artifact.content_hash = recovered_hash
                     artifact.verified_size = existing_path.stat().st_size
+                    if platform_file_unique_id:
+                        sibling_hashes.setdefault(
+                            platform_file_unique_id, recovered_hash
+                        )
                 logger.info(
                     "Recovered artifact %d (%s) → COMPLETED (file on disk)",
                     artifact.id, filename or "unknown",
@@ -238,34 +283,6 @@ class AcquireStage(PipelineStage):
             logger.info("Startup recovery: resolved %d stuck DOWNLOADING artifacts", recovered)
 
         return recovered
-
-    @staticmethod
-    def _sibling_content_hash(
-        session, artifact: DownloadArtifact
-    ) -> str | None:
-        """Hash of a COMPLETED repost of the same Telegram file, if any.
-
-        ``platform_file_unique_id`` guarantees byte-identical content, so a
-        completed sibling's stored hash is authoritative when verifying a
-        file recovered from disk.
-        """
-        attachment = artifact.attachment
-        platform_file_unique_id = (
-            attachment.platform_file_unique_id if attachment else None
-        )
-        if not platform_file_unique_id:
-            return None
-        return session.execute(
-            select(DownloadArtifact.content_hash)
-            .join(FileAttachment, DownloadArtifact.attachment_id == FileAttachment.id)
-            .where(
-                DownloadArtifact.id != artifact.id,
-                DownloadArtifact.status == DownloadStatus.COMPLETED,
-                DownloadArtifact.content_hash.isnot(None),
-                FileAttachment.platform_file_unique_id == platform_file_unique_id,
-            )
-            .limit(1)
-        ).scalar_one_or_none()
 
     def cleanup_stale_incomplete_groups(self, session, max_age_days: int = 30) -> int:
         """Mark very old INCOMPLETE groups with zero progress as FAILED_TERMINAL.
@@ -557,7 +574,8 @@ class AcquireStage(PipelineStage):
                 artifact.content_hash = existing.content_hash
                 artifact.verified_size = existing.verified_size
                 artifact.status = DownloadStatus.COMPLETED
-                ctx.session.flush()
+                # commit() flushes pending state — a separate flush() is a
+                # redundant second round trip.
                 ctx.session.commit()
                 logger.info(
                     "Deduped %s (Telegram ID %s) — reusing existing download",
@@ -585,10 +603,9 @@ class AcquireStage(PipelineStage):
 
                 # Persist DOWNLOADING status + temp_path for crash recovery, and
                 # commit immediately so the transaction snapshot is released before
-                # the long network transfer begins.
+                # the long network transfer begins. commit() implies flush().
                 artifact.status = DownloadStatus.DOWNLOADING
                 artifact.temp_path = str(temp_path)
-                ctx.session.flush()
                 ctx.session.commit()
 
                 logger.info(
@@ -769,7 +786,6 @@ class AcquireStage(PipelineStage):
                 if attempt < max_retries - 1:
                     # Commit FAILED state and release the transaction before
                     # sleeping so we don't hold a connection idle during the delay.
-                    ctx.session.flush()
                     ctx.session.commit()
                     delay = backoff_delay(attempt, base_delay, base_delay * 8)
                     logger.info(

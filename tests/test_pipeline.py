@@ -2320,6 +2320,95 @@ class TestAcquireStage:
         assert artifact.status == DownloadStatus.COMPLETED
         assert not partial.exists()
 
+    def test_recover_batches_sibling_hash_lookup(self, session, tmp_path):
+        """The completed-sibling hash lookup is ONE query for N recovery
+        candidates — regression for the former per-artifact N+1 query."""
+        import hashlib
+
+        from sqlalchemy import event
+
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        downloads_dir = tmp_path / "downloads"
+        downloads_dir.mkdir()
+        content = b"sibling content"
+        content_hash = hashlib.sha256(content).hexdigest()
+
+        conv = Conversation(platform_id=204, conversation_type="channel")
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id, platform_id=204, platform_timestamp=datetime.now(UTC)
+        )
+        session.add(msg)
+        session.flush()
+
+        for idx in range(2):
+            candidate = downloads_dir / f"twin{idx}.rar"
+            candidate.write_bytes(content)
+            sibling_file = downloads_dir / f"sibling{idx}.rar"
+            sibling_file.write_bytes(content)
+
+            sibling_att = FileAttachment(
+                message_id=msg.id,
+                filename=f"sibling{idx}.rar",
+                platform_file_id=f"completed{idx}",
+                platform_file_unique_id=f"doc_{idx}",
+                size=len(content),
+            )
+            session.add(sibling_att)
+            session.flush()
+            session.add(
+                DownloadArtifact(
+                    attachment_id=sibling_att.id,
+                    status=DownloadStatus.COMPLETED,
+                    local_path=str(sibling_file),
+                    content_hash=content_hash,
+                )
+            )
+
+            stuck_att = FileAttachment(
+                message_id=msg.id,
+                filename=f"twin{idx}.rar",
+                platform_file_id=f"stuck{idx}",
+                platform_file_unique_id=f"doc_{idx}",
+                size=len(content),
+            )
+            session.add(stuck_att)
+            session.flush()
+            session.add(
+                DownloadArtifact(
+                    attachment_id=stuck_att.id,
+                    status=DownloadStatus.DOWNLOADING,
+                )
+            )
+        session.commit()
+
+        engine = session.get_bind()
+        sibling_queries: list[str] = []
+
+        def _count_sibling_lookups(_conn, _cursor, statement, _params, _ctx, _many):
+            lowered = statement.lower()
+            if "from file_attachments" in lowered and "join download_artifacts" in lowered:
+                sibling_queries.append(statement)
+
+        event.listen(engine, "before_cursor_execute", _count_sibling_lookups)
+        try:
+            recovered = AcquireStage().recover_stuck_downloads(session, downloads_dir)
+        finally:
+            event.remove(engine, "before_cursor_execute", _count_sibling_lookups)
+
+        assert recovered == 2
+        assert len(sibling_queries) == 1, (
+            f"expected one batched sibling-hash query, got {len(sibling_queries)}"
+        )
+
 
 
 class TestParseStage:
@@ -2901,6 +2990,117 @@ class TestParseParallelChunking:
             all_creds.extend(_parse_lines_chunk_worker((chunk, src, decision)))
         assert len(all_creds) == 502
         assert {t[2] for t in all_creds} >= {"head", "late"}
+
+    async def test_parallel_credentials_event_driven_streams_in_order(
+        self, tmp_path, monkeypatch
+    ):
+        """The consumer wakes on completed futures (no 50 ms polling), submits
+        every chunk and yields results in submission order."""
+        from concurrent.futures import Future
+
+        from telecrime.pipeline import parse as parse_mod
+
+        src = tmp_path / "large.txt"
+        src.write_text(
+            "Soft: Chrome\nHost: https://x.example\nLogin: u\nPassword: p\n"
+        )
+
+        chunks = [["a1", "a2"], ["b1"], ["c1", "c2"]]
+        # Multiple chunks without a 100k-line file: the reader's chunk iterator
+        # is the only thing replaced; everything downstream stays real.
+        monkeypatch.setattr(
+            parse_mod, "_iter_line_chunks", lambda _fh, chunk_lines=None: iter(chunks)
+        )
+
+        class _FakePool:
+            _processes: dict = {}
+
+            def __init__(self, max_workers=None, mp_context=None):
+                self.submitted: list[list[str]] = []
+
+            def submit(self, _fn, args):
+                chunk = list(args[0])
+                self.submitted.append(chunk)
+                fut = Future()
+                fut.set_result([
+                    (
+                        f"url:{line}", None, "user", "pw",
+                        None, None, None, f"h:{line}", f"s:{line}",
+                    )
+                    for line in chunk
+                ])
+                return fut
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                pass
+
+        created: dict = {}
+
+        def _pool_factory(*args, **kwargs):
+            created["pool"] = _FakePool(*args, **kwargs)
+            return created["pool"]
+
+        monkeypatch.setattr(parse_mod, "ProcessPoolExecutor", _pool_factory)
+
+        stage = parse_mod.ParseStage()
+        collected = [
+            tup[0]
+            async for tup in stage._iter_parallel_credentials(
+                src, str(src), workers=2
+            )
+        ]
+
+        assert collected == ["url:a1", "url:a2", "url:b1", "url:c1", "url:c2"]
+        assert created["pool"].submitted == chunks
+
+    async def test_parallel_credentials_early_break_shuts_down_cleanly(
+        self, tmp_path, monkeypatch
+    ):
+        """Breaking out of the async generator (early-skip path) still stops
+        the reader and force-shuts the pool without hanging."""
+        from concurrent.futures import Future
+
+        from telecrime.pipeline import parse as parse_mod
+
+        src = tmp_path / "large.txt"
+        src.write_text(
+            "Soft: Chrome\nHost: https://x.example\nLogin: u\nPassword: p\n"
+        )
+        monkeypatch.setattr(
+            parse_mod,
+            "_iter_line_chunks",
+            lambda _fh, chunk_lines=None: iter([["a1"], ["b1"]]),
+        )
+
+        class _FakePool:
+            _processes: dict = {}
+            shutdowns: list[bool] = []
+
+            def __init__(self, max_workers=None, mp_context=None):
+                pass
+
+            def submit(self, _fn, args):
+                fut = Future()
+                fut.set_result([
+                    ("u", None, "x", "y", None, None, None, "h", "s")
+                    for _ in args[0]
+                ])
+                return fut
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                # force=True is translated to shutdown(wait=False, cancel_futures=True).
+                type(self).shutdowns.append(not wait or cancel_futures)
+
+        monkeypatch.setattr(parse_mod, "ProcessPoolExecutor", _FakePool)
+
+        stage = parse_mod.ParseStage()
+        agen = stage._iter_parallel_credentials(src, str(src), workers=1)
+        first = await agen.__anext__()
+        assert first[0] == "u"
+        await agen.aclose()
+
+        # The generator returned control: no hang, reader stopped, pool forced.
+        assert _FakePool.shutdowns == [True]
 
 
 def test_has_hash64_probe_does_not_cache_transient_failure(monkeypatch):

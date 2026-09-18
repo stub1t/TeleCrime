@@ -101,6 +101,29 @@ def test_write_status_atomic(status_file):
     assert status_file.exists()
 
 
+def test_write_status_skips_identical_rewrite(status_file):
+    """A no-op update must not pay the temp-file + rename cost again, while a
+    changed payload still writes atomically."""
+    import tempfile
+
+    statuses = {"pipeline": JobStatus(name="pipeline", description="d", interval_hours=4)}
+    _write_status(statuses)
+
+    with patch(
+        "telecrime.scheduler.tempfile.mkstemp",
+        side_effect=AssertionError("identical status must not be rewritten"),
+    ):
+        _write_status({"pipeline": JobStatus(name="pipeline", description="d", interval_hours=4)})
+
+    statuses["pipeline"].last_result = "done"
+    with patch(
+        "telecrime.scheduler.tempfile.mkstemp", wraps=tempfile.mkstemp
+    ) as mkstemp:
+        _write_status(statuses)
+    assert mkstemp.called
+    assert read_status()["pipeline"].last_result == "done"
+
+
 def test_runtime_files_follow_configured_data_dir(tmp_path, monkeypatch):
     data_dir = tmp_path / "runtime"
     monkeypatch.setenv("TELECRIME_DATA_DIR", str(data_dir))
@@ -185,8 +208,7 @@ def test_vacuum_job_executes_vacuum(pg_engine):
 
     result = _run_vacuum_job(pg_engine)
 
-    assert "VACUUM" in result
-    assert "completed" in result.lower() or "done" in result.lower()
+    assert result == "VACUUM completed, pruned 0 stale extracted_output rows"
 
 
 @pytest.mark.parametrize(
@@ -209,11 +231,21 @@ def test_job_defs_registers_background_jobs(name, expected):
 
 def test_progress_age_seconds_handles_valid_and_invalid_values():
     assert _progress_age_seconds({"updated_at": "not-a-date"}, "updated_at") is None
-    age = _progress_age_seconds(
-        {"updated_at": "2026-04-20T20:00:00+00:00"},
-        "updated_at",
+    assert _progress_age_seconds({}, "updated_at") is None
+    assert _progress_age_seconds({"updated_at": 123}, "updated_at") is None
+    # A naive ISO stamp must be treated as UTC, not raise TypeError.
+    naive = _progress_age_seconds(
+        {"updated_at": "2026-01-01T00:00:00"}, "updated_at"
     )
-    assert age is not None
+    assert naive is not None
+    assert naive > 0
+    # A just-stamped heartbeat must report a small, non-negative age — not
+    # merely "some value": the age drives the stale-pipeline heal decision.
+    fresh = _progress_age_seconds(
+        {"updated_at": datetime.now(UTC).isoformat()}, "updated_at"
+    )
+    assert fresh is not None
+    assert 0 <= fresh < 10
 
 
 def test_check_pipeline_health_reports_progress(status_file, tmp_path, monkeypatch):
@@ -885,7 +917,7 @@ def test_send_telegram_notification_swallows_connection_error():
 
         result = _send_telegram_notification(cfg, lambda n: asyncio.sleep(0))
 
-    assert "transient" in result.lower() or "skipped" in result.lower()
+    assert result == "skipped: transient ConnectionError"
 
 
 def test_send_telegram_notification_swallows_session_lock():
@@ -905,7 +937,7 @@ def test_send_telegram_notification_swallows_session_lock():
 
         result = _send_telegram_notification(cfg, lambda n: asyncio.sleep(0))
 
-    assert "transient" in result.lower() or "skipped" in result.lower()
+    assert result == "skipped: transient OperationalError"
 
 
 def test_send_telegram_notification_propagates_unexpected_errors():

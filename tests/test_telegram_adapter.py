@@ -138,10 +138,6 @@ class _FakeIter:
         return bytes(p % 256 for p in range(start, end))
 
 
-class _FakeMedia:
-    pass
-
-
 class _FakeMessage:
     def __init__(self, size: int):
         self.media = type("M", (), {})()
@@ -219,7 +215,9 @@ async def test_iter_messages_raises_on_cancelled():
         raise asyncio.CancelledError
 
     client.iter_messages = lambda **kw: _boom()
-    with pytest.raises(RuntimeError):
+    with pytest.raises(
+        RuntimeError, match="message iteration truncated for conversation 1"
+    ):
         async for _ in adapter.iter_messages(1, min_id=0):
             pass
 

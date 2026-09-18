@@ -1815,6 +1815,7 @@ def _finish_pipeline_run(
     stages_failed: list[str],
 ) -> None:
     """Persist final pipeline run counters and stage outcomes."""
+    _sync_display_error_count(ctx)
     # Capture the id WITHOUT touching `run`'s attributes: after the many
     # mid-run commits the instance is expired, and once the session has been
     # invalidated/rolled back a lazy refresh on `run.id` raises
@@ -1870,6 +1871,23 @@ def _record_stage_success(stages_completed: list[str], stage_name: str) -> None:
     """Record a successful stage once."""
     if stage_name not in stages_completed:
         stages_completed.append(stage_name)
+
+
+def _sync_display_error_count(ctx: PipelineContext) -> None:
+    """Mirror the authoritative ``ctx.errors`` total into the display.
+
+    Several stages append per-item failures directly to ``ctx.errors`` (e.g.
+    download/extract/parse/finalize errors) without calling
+    ``display.add_error()``, so the progress file's ``errors`` counter stayed
+    0 while the persisted PipelineRun recorded failures.
+    """
+    updater = getattr(ctx.display, "update_errors", None)
+    if not callable(updater):
+        return
+    try:
+        updater(len(ctx.errors))
+    except Exception:
+        logger.debug("Failed to sync display error count", exc_info=True)
 
 
 def _record_stage_failure(stages_failed: list[str], stage_name: str) -> None:

@@ -99,6 +99,55 @@ def _credential_identity_sql(session, alias: str = "pc") -> str:
     return f"COALESCE({alias}.credential_hash, CAST({alias}.id AS TEXT))"
 
 
+# The conversations page aggregates parsed_credentials per page of conversation
+# ids. That aggregation needs ix_parsed_credentials_source_conversation_id:
+# without it PostgreSQL sequentially scans the multi-hundred-million-row table
+# and always hits the route's 12s statement_timeout, returning zeros after
+# burning the full timeout on every page load. Migration x4y5z6a7b8c9 dropped
+# the index (zero scans, 1.5 GB) and _ensure_stats_indexes deliberately does
+# not recreate it, but the 2026-09 recovery rebuild brought it back — so probe,
+# don't assume. Small tables keep exact counts (a seq scan there is trivial).
+_CRED_AGG_INDEX_NAME = "ix_parsed_credentials_source_conversation_id"
+_CRED_AGG_SEQ_SCAN_MAX_ROWS = 5_000_000
+_cred_agg_allowed_cache: dict[str, bool] = {}
+
+
+def _cred_page_aggregation_allowed(session, table_rows: object) -> bool:
+    """False when the per-page credential COUNT can only be a full-table scan.
+
+    ``table_rows`` is the (already fetched) reltuples estimate for
+    parsed_credentials. On a small table the scan is cheap and exact counts are
+    kept; on a production-sized table without the supporting index the query is
+    guaranteed to time out, so it is skipped (the route already degrades to
+    zero counts on timeout — skipping removes the wasted 12s scan).
+    """
+    bind = session.get_bind()
+    if bind.dialect.name != "postgresql":
+        return True
+    try:
+        if int(table_rows or 0) < _CRED_AGG_SEQ_SCAN_MAX_ROWS:
+            return True
+    except (TypeError, ValueError):
+        return True
+    key = str(bind.url)
+    if key in _cred_agg_allowed_cache:
+        return _cred_agg_allowed_cache[key]
+    try:
+        present = (
+            session.execute(
+                text("SELECT 1 FROM pg_indexes WHERE indexname = :name"),
+                {"name": _CRED_AGG_INDEX_NAME},
+            ).first()
+            is not None
+        )
+    except Exception:
+        # Unknown schema state must not change behavior: run the bounded
+        # aggregation exactly as before.
+        return True
+    _cred_agg_allowed_cache[key] = present
+    return present
+
+
 def _templates_dir() -> Path:
     return Path(__file__).parent / "templates"
 
@@ -922,6 +971,30 @@ def _search_for_export(
     )
 
 
+def _reopen_group_for_retry(group) -> None:
+    """Reopen a group so a retried extraction can actually run.
+
+    A CLEANED group had its archives deleted by finalize and its artifacts
+    marked is_deleted; resetting it to READY (as the retry routes did) made
+    extraction fail immediately with no local paths and left the group stuck
+    FAILED with no re-download possible. Restore the artifacts and send the
+    group back to INCOMPLETE so the acquire stage re-downloads them.
+    """
+    if group is None:
+        return
+    if group.status == GroupStatus.CLEANED:
+        for group_part in group.parts:
+            artifact = group_part.artifact
+            if artifact is not None and artifact.is_deleted:
+                artifact.status = DownloadStatus.PENDING
+                artifact.is_deleted = False
+                artifact.local_path = None
+                artifact.temp_path = None
+        group.status = GroupStatus.INCOMPLETE
+    else:
+        group.status = GroupStatus.READY
+
+
 def _triage_payload(session, *, limit: int = 50) -> dict[str, object]:
     """Build recent failure and retryability data for dashboard triage views."""
     failed_downloads = (
@@ -1241,6 +1314,10 @@ def _preferred_table_estimate(reltuples: object, n_live_tup: object) -> int:
 
 def _pg_fast_count_estimates(session, *table_names: str) -> dict[str, int]:
     if not table_names:
+        return {}
+    if session.get_bind().dialect.name != "postgresql":
+        # pg_class/pg_stat_user_tables are PostgreSQL-only; returning {} makes
+        # callers fall back to exact counts instead of 500ing on SQLite.
         return {}
     rows = session.execute(
         text(
@@ -2926,9 +3003,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
             job.status = ExtractionStatus.PENDING
             job.last_error_code = None
             job.last_error_message = None
-            group = session.get(ArchiveGroup, job.group_id)
-            if group:
-                group.status = GroupStatus.READY
+            _reopen_group_for_retry(session.get(ArchiveGroup, job.group_id))
             session.commit()
         return JSONResponse({"ok": True})
 
@@ -2971,9 +3046,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
             job.status = ExtractionStatus.PENDING
             job.last_error_code = None
             job.last_error_message = None
-            group = session.get(ArchiveGroup, job.group_id)
-            if group:
-                group.status = GroupStatus.READY
+            _reopen_group_for_retry(session.get(ArchiveGroup, job.group_id))
             session.commit()
         return JSONResponse({"ok": True})
 
@@ -3081,6 +3154,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         saved_searches: list[dict[str, str]] = []
         fts_used = False
         has_more = False
+        last_id = 0
         active_filters: list[dict[str, str]] = []
 
         with engine.begin() as conn:
@@ -3420,12 +3494,14 @@ def create_app(database_url: str | None = None) -> FastAPI:
                             conversations=results.conversations,
                             channels=results.channels,
                         )
+                # Read the keyset cursor INSIDE the session: a tolerated
+                # rollback (e.g. the match-count timeout) expires every loaded
+                # credential, and reading .id after the session closes raised
+                # DetachedInstanceError — turning a degraded search into a 500.
+                if results.credentials:
+                    last_id = results.credentials[-1].id
                 if debug:
                     print(f"search: done {(time.time() - t0) * 1000:.1f} ms")
-
-        last_id = 0
-        if results.credentials:
-            last_id = results.credentials[-1].id
 
         result_counts = {
             "credentials": len(results.credentials),
@@ -5451,15 +5527,19 @@ def create_app(database_url: str | None = None) -> FastAPI:
                         .group_by(Message.conversation_id)
                         .all()
                     )
-                    cred_count_by_id = dict(
-                        session.query(
-                            ParsedCredential.source_conversation_id,
-                            func.count(ParsedCredential.id),
+                    # Without its index this COUNT is a guaranteed full-table
+                    # scan on a production-sized table (always times out at the
+                    # route's 12s bound). Skip it instead of paying the scan.
+                    if _cred_page_aggregation_allowed(session, total_creds):
+                        cred_count_by_id = dict(
+                            session.query(
+                                ParsedCredential.source_conversation_id,
+                                func.count(ParsedCredential.id),
+                            )
+                            .filter(ParsedCredential.source_conversation_id.in_(page_ids))
+                            .group_by(ParsedCredential.source_conversation_id)
+                            .all()
                         )
-                        .filter(ParsedCredential.source_conversation_id.in_(page_ids))
-                        .group_by(ParsedCredential.source_conversation_id)
-                        .all()
-                    )
                 except SQLAlchemyError as exc:
                     try:
                         session.rollback()

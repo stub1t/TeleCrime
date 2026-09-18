@@ -7,6 +7,8 @@ from sqlalchemy import inspect, text
 
 from telecrime.database import (
     _pg_connect_args,
+    ensure_runtime_schema,
+    get_cached_engine,
     get_engine,
     get_session,
     get_session_factory,
@@ -40,7 +42,7 @@ class TestGetEngine:
             engine.dispose()
 
     def test_requires_database_url(self):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="database_url is required"):
             get_engine()
 
 
@@ -48,9 +50,13 @@ class TestGetSessionFactory:
     def test_creates_session_factory(self, pg_engine):
         factory = get_session_factory(pg_engine)
         assert factory is not None
-        s = factory()
-        assert s is not None
-        s.close()
+        session = factory()
+        try:
+            # A factory that merely exists proves nothing; the session it
+            # yields must actually be bound to the engine.
+            assert session.execute(text("SELECT 1")).scalar() == 1
+        finally:
+            session.close()
 
 
 class TestGetSession:
@@ -248,3 +254,132 @@ class TestDestructiveTestDatabaseGuard:
         _assert_safe_test_database(
             "postgresql://telecrime:telecrime@localhost:5432/telecrime"
         )
+
+
+class TestGetCachedEngine:
+    """URL-keyed engine cache used by the web background workers."""
+
+    def test_same_url_reuses_engine_and_clear_rebuilds(self, tmp_path):
+        url = f"sqlite:///{tmp_path / 'cached.db'}"
+        first = get_cached_engine(url)
+        try:
+            assert get_cached_engine(url) is first
+            get_cached_engine.cache_clear()
+            second = get_cached_engine(url)
+            assert second is not first
+            second.dispose()
+        finally:
+            get_cached_engine.cache_clear()
+            first.dispose()
+
+
+class TestEnsureRuntimeSchema:
+    """Forward-compatible repairs for databases created before Alembic ran.
+
+    The function is the CLI's startup repair path; before this class it had
+    zero coverage even though a bug here means a live DB missing alert columns.
+    """
+
+    @staticmethod
+    def _legacy_engine(tmp_path, *, version: str | None = "m3n4o5p6q7r8"):
+        """A pre-soft-hash schema: parsed_credentials/watchlist_items lack the
+        columns the repair adds, plus an alembic_version row."""
+        engine = get_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE parsed_credentials (id INTEGER PRIMARY KEY)"))
+            conn.execute(text("CREATE TABLE watchlist_items (id INTEGER PRIMARY KEY)"))
+            conn.execute(
+                text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+            )
+            if version is not None:
+                conn.execute(
+                    text("INSERT INTO alembic_version (version_num) VALUES (:v)"),
+                    {"v": version},
+                )
+        return engine
+
+    def test_repairs_columns_and_advances_old_alembic_version(self, tmp_path):
+        engine = self._legacy_engine(tmp_path)
+        try:
+            changes = ensure_runtime_schema(engine)
+
+            assert changes == [
+                "added parsed_credentials.soft_credential_hash",
+                "added watchlist_items.last_alerted_at",
+                "added watchlist_items.last_alerted_count",
+                "advanced alembic_version to n4o5p6q7r8s9",
+            ]
+            with engine.connect() as conn:
+                parsed_cols = {
+                    row[1]
+                    for row in conn.execute(text("PRAGMA table_info(parsed_credentials)"))
+                }
+                watch_cols = {
+                    row[1]
+                    for row in conn.execute(text("PRAGMA table_info(watchlist_items)"))
+                }
+                version = conn.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar()
+            assert "soft_credential_hash" in parsed_cols
+            assert {"last_alerted_at", "last_alerted_count"} <= watch_cols
+            assert version == "n4o5p6q7r8s9"
+        finally:
+            engine.dispose()
+
+    def test_second_run_is_a_noop(self, tmp_path):
+        engine = self._legacy_engine(tmp_path)
+        try:
+            assert ensure_runtime_schema(engine)  # first run repairs
+            assert ensure_runtime_schema(engine) == []
+        finally:
+            engine.dispose()
+
+    def test_unknown_alembic_version_is_not_rewritten(self, tmp_path):
+        engine = self._legacy_engine(tmp_path, version="z9y8x7w6v5u4")
+        try:
+            changes = ensure_runtime_schema(engine)
+            assert "advanced alembic_version to n4o5p6q7r8s9" not in changes
+            with engine.connect() as conn:
+                assert conn.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar() == "z9y8x7w6v5u4"
+        finally:
+            engine.dispose()
+
+    def test_partial_schema_repairs_but_does_not_advance_version(self, tmp_path):
+        """Without watchlist_items there is no alert schema to declare ready,
+        so the version must not be bumped."""
+        engine = get_engine(f"sqlite:///{tmp_path / 'partial.db'}")
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("CREATE TABLE parsed_credentials (id INTEGER PRIMARY KEY)")
+                )
+                conn.execute(
+                    text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+                )
+                conn.execute(
+                    text("INSERT INTO alembic_version (version_num) VALUES ('m3n4o5p6q7r8')")
+                )
+
+            changes = ensure_runtime_schema(engine)
+
+            assert changes == ["added parsed_credentials.soft_credential_hash"]
+        finally:
+            engine.dispose()
+
+    def test_empty_database_is_untouched(self, tmp_path):
+        engine = get_engine(f"sqlite:///{tmp_path / 'empty.db'}")
+        try:
+            assert ensure_runtime_schema(engine) == []
+        finally:
+            engine.dispose()
+
+    def test_fresh_schema_needs_no_repairs(self, tmp_path):
+        engine = get_engine(f"sqlite:///{tmp_path / 'fresh.db'}")
+        try:
+            init_db(engine)
+            assert ensure_runtime_schema(engine) == []
+        finally:
+            engine.dispose()

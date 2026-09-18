@@ -145,16 +145,24 @@ if [ -n "$SIG" ] && [ -f "$SNAP" ]; then
   case "$PREV_TS" in
     ''|*[!0-9]*) PREV_TS=0 ;;
   esac
-  # Two-consecutive-identical-signatures must be observed at least 9 minutes
-  # apart. The cron watchdog (10-min) and the monitor loop (5-min) interleave,
-  # so consecutive *invocations* can be ~2 seconds apart — without the time
-  # gate, a momentary gap between downloads (dl_speed=0, no DB query, same
-  # signature 2 s later) would false-kill a healthy pipeline in acquire.
-  if [ "$PREV_SIG" = "$SIG" ] && [ $((NOW_TS - PREV_TS)) -ge 540 ]; then
-    FROZEN=1
+  # The timestamp must measure how long the SIGNATURE has been unchanged, not
+  # how long since the previous invocation. Refreshing it on every run made
+  # the 540s age gate unreachable whenever the 5-min monitor loop ran between
+  # the 10-min cron checks (each run reset the clock), so a live-but-deadlocked
+  # pipeline was never healed. Keep the first-seen timestamp while SIG matches;
+  # reset it after a frozen decision so a heal cannot re-fire immediately.
+  if [ "$PREV_SIG" = "$SIG" ]; then
+    if [ $((NOW_TS - PREV_TS)) -ge 540 ]; then
+      FROZEN=1
+      PREV_TS=$NOW_TS
+    fi
+    printf '%s\n%s\n' "$SIG" "$PREV_TS" > "$SNAP"
+  else
+    printf '%s\n%s\n' "$SIG" "$NOW_TS" > "$SNAP"
   fi
+else
+  printf '%s\n%s\n' "$SIG" "$NOW_TS" > "$SNAP"
 fi
-printf '%s\n%s\n' "$SIG" "$NOW_TS" > "$SNAP"
 
 # Pipeline stage — the extract and parse phases are legitimate long-running
 # states: 7z/unrar on 50k+ file archives can take 1-2 h, and parsing a
@@ -340,13 +348,17 @@ if [ "$NEED_HEAL" = "1" ]; then
   # --no-deps: `compose up -d worker` would wait on `web: service_healthy`
   # with no timeout — an unhealthy web would park this heal (and hold the
   # flock) indefinitely. db is already running at this point.
-  timeout 120 compose up -d --no-deps worker 2>/dev/null
+  # NB: invoke `docker compose` directly — `timeout` is an external command and
+  # cannot run the `compose` shell function, so `timeout 120 compose ...`
+  # silently no-op'd (stderr suppressed), leaving HEAL unable to restart the
+  # worker exactly when it was needed.
+  timeout 120 docker compose -f "$COMPOSE_FILE" up -d --no-deps worker 2>/dev/null
   sleep 5
   if ! compose ps -q worker 2>/dev/null | grep -q .; then
     # First attempt failed (e.g. container create stalled on a wedged volume
     # and the timeout killed compose) — retry once.
     log "HEAL: worker did not start after first attempt — retrying"
-    timeout 120 compose up -d --no-deps worker 2>/dev/null
+    timeout 120 docker compose -f "$COMPOSE_FILE" up -d --no-deps worker 2>/dev/null
     sleep 5
   fi
   if compose ps -q worker 2>/dev/null | grep -q .; then

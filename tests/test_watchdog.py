@@ -192,3 +192,158 @@ def test_watchdog_numeric_sanitization_and_now_ts_order():
         "NOW_TS must be initialized before the snapshot branch: with `set -u` "
         "a missing snapshot/progress file would abort the whole watchdog"
     )
+
+
+def test_watchdog_frozen_signature_ages_across_monitor_ticks(watchdog, tmp_path):
+    """A signature frozen for >=9 minutes heals even when checks are 5 min apart.
+
+    Regression: every invocation rewrote the snapshot timestamp, so the 540s
+    age gate could never be reached under the 5-min monitor loop (each check
+    reset the clock) and a live-but-deadlocked pipeline was never healed.
+    """
+    bin_dir = Path(watchdog.env["PATH"].split(":")[0])
+    _write_stub(
+        bin_dir,
+        "date",
+        'case " $* " in\n'
+        '  *" +%s "*) printf \'%s\\n\' "${TELECRIME_FAKE_NOW:-0}"; exit 0 ;;\n'
+        "esac\n"
+        'exec /bin/date "$@"\n',
+    )
+
+    (watchdog.data / "pipeline_progress.json").write_text(
+        json.dumps(_progress_payload())
+    )
+    signature = "5|1|2|a.zip|0"
+    snapshot = watchdog.data / "telecrime-watchdog-snap.txt"
+    t0 = 1_700_000_000
+    snapshot.write_text(f"{signature}\n{t0 - 300}\n")
+
+    first = _run(watchdog, {"TELECRIME_FAKE_NOW": str(t0)})
+    assert first.returncode == 0, first.stderr
+    assert "frozen=0" in (watchdog.data / "watchdog.log").read_text()
+    assert snapshot.read_text().splitlines()[1] == str(t0 - 300), (
+        "an unchanged signature must keep its first-seen timestamp so the age "
+        "keeps accumulating between checks"
+    )
+
+    # The drive-wedge check scans the host /proc for persistent D-state
+    # threads; on a host that has one, a non-empty previous wedge snapshot
+    # would make the second run skip every heal. Clear it so this test only
+    # exercises the frozen-signature path.
+    (watchdog.data / "telecrime-wedge-pids.txt").write_text("")
+
+    second = _run(watchdog, {"TELECRIME_FAKE_NOW": str(t0 + 300)})
+    assert second.returncode == 0, second.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "frozen=1" in log
+    assert "HEAL: hung pipeline (progress frozen" in log
+    assert snapshot.read_text().splitlines()[1] == str(t0 + 300), (
+        "the snapshot timestamp resets after a frozen decision so a heal "
+        "cannot re-fire with the same age"
+    )
+
+
+def _write_progress(watchdog, **overrides):
+    (watchdog.data / "pipeline_progress.json").write_text(
+        json.dumps(_progress_payload(**overrides))
+    )
+
+
+def _write_stale_snapshot(watchdog, signature: str, age_seconds: int = 1000):
+    (watchdog.data / "telecrime-watchdog-snap.txt").write_text(
+        f"{signature}\n{int(time.time()) - age_seconds}\n"
+    )
+    # A host thread stuck in D-state would otherwise make the script pause
+    # every heal; this test only exercises the pipeline-heal branches.
+    (watchdog.data / "telecrime-wedge-pids.txt").write_text("")
+
+
+def test_watchdog_heals_dead_pipeline_with_pid_file(watchdog):
+    """A pid file whose process is gone means the run crashed mid-flight."""
+    _write_progress(watchdog)
+    (watchdog.data / "pipeline.pid").write_text("4242\n")
+
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "HEAL: pipeline process dead (pid=4242)" in log
+    assert "HEAL done: worker restarted" in log
+    calls = watchdog.calls.read_text()
+    # The old container must be force-killed and removed before restart.
+    assert "kill stub-worker-cid" in calls
+    assert "rm -f stub-worker-cid" in calls
+    # The restart must actually reach docker. `timeout` is an external command
+    # and cannot run the `compose` shell function, so `timeout 120 compose ...`
+    # silently no-op'd; the heal now invokes `docker compose` directly.
+    assert "up -d --no-deps worker" in calls
+
+
+def test_watchdog_heals_stale_heartbeat_without_pid(watchdog):
+    """Heartbeat older than the stale threshold, no process and no DB activity
+    heals even when the pid file is absent (pipeline started elsewhere)."""
+    from datetime import timedelta
+
+    stale = (datetime.now(UTC) - timedelta(seconds=5000)).isoformat()
+    _write_progress(watchdog, last_progress_at=stale)
+    _write_stale_snapshot(watchdog, "5|1|2|a.zip|0")
+
+    result = _run(watchdog, {"TELECRIME_PIPELINE_STALE_SECONDS": "1200"})
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "HEAL: hung pipeline (heartbeat" in log
+
+
+def test_watchdog_frozen_parse_stage_is_not_healed(watchdog):
+    """A multi-minute parse is self-protected: killing it discards the file's
+    unparsed credentials (finalize would clean the group)."""
+    _write_progress(watchdog, current_stage="parse")
+    _write_stale_snapshot(watchdog, "5|1|2|a.zip|0")
+
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "frozen=1" in log
+    assert "HEAL" not in log
+
+
+def test_watchdog_frozen_extract_with_archive_is_not_healed(watchdog):
+    """A long extraction always names the group it is working; do not kill it."""
+    _write_progress(watchdog, current_stage="extract", current_archive="a.zip")
+    _write_stale_snapshot(watchdog, "5|1|2|a.zip|0")
+
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "frozen=1" in log
+    assert "HEAL" not in log
+
+
+def test_watchdog_frozen_extract_without_archive_is_healed(watchdog):
+    """Extract frozen with no group selected is wedged before starting work."""
+    _write_progress(watchdog, current_stage="extract", current_archive="")
+    _write_stale_snapshot(watchdog, "5|1|2||0")
+
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "HEAL: hung pipeline (extract frozen on no group" in log
+
+
+def test_watchdog_active_download_blocks_frozen_heal(watchdog):
+    """Counters freeze while a download runs (no DB query); a live download
+    with moving speed must not be healed."""
+    _write_progress(watchdog, current_stage="acquire", dl_active=True, dl_speed=1.5)
+    _write_stale_snapshot(watchdog, "5|1|2|a.zip|0")
+
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "dl_active=1" in log
+    assert "HEAL" not in log

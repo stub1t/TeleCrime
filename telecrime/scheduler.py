@@ -418,6 +418,10 @@ def _progress_age_seconds(progress: dict[str, object], key: str) -> float | None
         updated_at = datetime.fromisoformat(raw)
     except ValueError:
         return None
+    if updated_at.tzinfo is None:
+        # Naive stamps (hand-written or pre-UTC writers) are UTC by convention;
+        # subtracting them from an aware now() raises TypeError.
+        updated_at = updated_at.replace(tzinfo=UTC)
     return (datetime.now(UTC) - updated_at).total_seconds()
 
 
@@ -467,10 +471,22 @@ def read_status() -> dict[str, JobStatus]:
 
 def _write_status(statuses: dict[str, JobStatus]) -> None:
     path = _status_path()
+    payload = json.dumps(
+        {k: asdict(v) for k, v in statuses.items()}, default=str
+    ).encode()
+    # Most status updates rewrite byte-identical content (job bookkeeping when
+    # nothing changed, repeated _apply_shutdown_status on a quiet system).
+    # Each rewrite is a fresh temp file + rename, so skipping the no-op avoids
+    # pointless metadata I/O on the data volume.
+    try:
+        if path.read_bytes() == payload:
+            return
+    except OSError:
+        pass
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
-        os.write(fd, json.dumps({k: asdict(v) for k, v in statuses.items()}, default=str).encode())
+        os.write(fd, payload)
         os.close(fd)
         os.replace(tmp_path, path)
     except BaseException:

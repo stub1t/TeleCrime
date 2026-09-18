@@ -51,6 +51,10 @@ _CHUNK_BOUNDARY_RE = re.compile(r"^(?:---+|===+|_{3,})\s*$")
 # cut. Carrying the trailing lines into the next chunk would re-parse complete
 # records (harmless: ON CONFLICT dedups) but never loses a straddling one.
 _HARD_CUT_CARRY_LINES = 5
+# Fallback sleep for the event-driven parallel consumer. Real work wakes it
+# immediately (chunk enqueue / future completion); this only bounds how long a
+# lost/edge-missed signal or the no-progress watchdog check can sit idle.
+_PARALLEL_PARSE_IDLE_WAIT_SECONDS = 1.0
 # Persisted on the job when a file was early-skipped so the next run forces a
 # full parse of that file instead of early-skipping at the same point forever
 # (the duplicate-heavy prefix is deterministic).
@@ -479,10 +483,11 @@ class ParseStage(PipelineStage):
 
         The file is split into line chunks (cut only at labeled-block boundary
         lines) and each chunk is handed to a worker via a process pool. A
-        dedicated producer thread submits chunks to the pool with bounded
-        in-flight futures (≤ 2×workers) and pushes *completed* futures onto an
-        asyncio.Queue; this async generator drains the queue in submission
-        order, keeping memory bounded and never blocking the event loop.
+        dedicated producer thread reads chunks into a bounded thread-safe queue
+        (≤ 2×workers) and a matching window of in-flight futures is kept; the
+        consumer drains completed futures in submission order and is woken
+        edge-triggered (no polling), keeping memory bounded and never blocking
+        the event loop.
 
         Yields pre-processed tuples (url, domain, username, password,
         email_domain, application, profile, credential_hash, soft_hash) so the
@@ -520,6 +525,24 @@ class ParseStage(PipelineStage):
         # hung-but-alive process).
         stop_event = threading.Event()
 
+        # Edge-triggered wakeup for the consumer. The previous implementation
+        # polled with `await asyncio.sleep(0.05)`: every completed chunk waited
+        # up to 50 ms before being drained (a 0.3 s chunk lost ~8-15% wall
+        # time) and the event loop woke 20×/s even when nothing changed. The
+        # reader thread and pool completion callbacks now signal this event;
+        # `call_soon_threadsafe` is the only cross-thread asyncio primitive
+        # used, so the pool's internal locks are never re-entered from a
+        # threaded wait (the deadlock the polling loop was avoiding).
+        wakeup = asyncio.Event()
+
+        def _notify() -> None:
+            try:
+                loop.call_soon_threadsafe(wakeup.set)
+            except RuntimeError:
+                # Loop already closed (generator aborted while a worker was
+                # still finishing) — nothing to wake.
+                pass
+
         def _read_chunks() -> None:
             try:
                 for chunk in _iter_line_chunks(chunk_source):
@@ -531,6 +554,7 @@ class ParseStage(PipelineStage):
                             continue
                     if stop_event.is_set():
                         break
+                    _notify()
             except Exception as exc:
                 logger.warning("Parallel parse reader failed: %s", exc)
             finally:
@@ -546,6 +570,7 @@ class ParseStage(PipelineStage):
                         break
                     except _queue.Full:
                         continue
+                _notify()
 
         read_task = loop.run_in_executor(None, _read_chunks)
 
@@ -575,7 +600,7 @@ class ParseStage(PipelineStage):
                 while True:
                     # Refill the in-flight window from the reader thread.
                     # chunks_q is a thread-safe queue.Queue: drain it without
-                    # blocking the event loop (get_nowait + short sleeps).
+                    # blocking the event loop (get_nowait + idle event wait).
                     while len(in_flight) < workers * 2 and submitting:
                         try:
                             chunk = chunks_q.get_nowait()
@@ -584,12 +609,14 @@ class ParseStage(PipelineStage):
                         if chunk is sentinel:
                             submitting = False
                             break
-                        in_flight.append(
-                            pool.submit(
-                                _parse_lines_chunk_worker,
-                                (chunk, source_file, combo_decision),
-                            )
+                        fut = pool.submit(
+                            _parse_lines_chunk_worker,
+                            (chunk, source_file, combo_decision),
                         )
+                        # Callback runs in the pool's management thread; the
+                        # notify is thread-safe and only sets the event.
+                        fut.add_done_callback(lambda _f: _notify())
+                        in_flight.append(fut)
                     if not in_flight and not submitting:
                         break
                     if (
@@ -601,9 +628,20 @@ class ParseStage(PipelineStage):
                         # queued and nothing in flight — done, even if the
                         # sentinel was somehow lost.
                         break
-                    # Poll for completed futures without ever blocking the loop
-                    # on a threaded wait() that could re-enter pool locks.
-                    await asyncio.sleep(0.05)
+                    # Edge-triggered wait: a completed future or a queued chunk
+                    # sets `wakeup` from its own thread, so results are drained
+                    # immediately instead of up to a poll interval later. The
+                    # timeout only bounds the no-progress check and recovers
+                    # from an edge-missed signal; the event loop never blocks
+                    # on a threaded pool wait (which could re-enter pool locks).
+                    try:
+                        await asyncio.wait_for(
+                            wakeup.wait(),
+                            timeout=_PARALLEL_PARSE_IDLE_WAIT_SECONDS,
+                        )
+                    except TimeoutError:
+                        pass
+                    wakeup.clear()
                     still_pending: list[Future] = []
                     progressed = False
                     for fut in in_flight:

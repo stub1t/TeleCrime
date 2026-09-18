@@ -355,6 +355,16 @@ class PipelineDisplay:
         self._errors += 1
         self._update()
 
+    def update_errors(self, count: int) -> None:
+        """Set the error counter to the authoritative pipeline total.
+
+        Stages append recoverable per-item failures directly to ``ctx.errors``
+        without calling ``add_error()``; the pipeline syncs the total here
+        before finishing so the panel matches the persisted run record.
+        """
+        self._errors = int(count)
+        self._update()
+
     def channels_update(self, joined: int) -> None:
         """Update channel joined counter."""
         self._channels_joined = joined

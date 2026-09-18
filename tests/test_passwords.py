@@ -358,7 +358,7 @@ class TestGetRankingReason:
         candidate = self._make_candidate(PasswordScope.MESSAGE)
         reason = get_ranking_reason(candidate)
 
-        assert "caption" in reason.lower() or "message" in reason.lower()
+        assert reason == "found in message caption; extracted via test"
 
     def test_success_mentioned(self):
         """Test success count is mentioned."""

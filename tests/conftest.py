@@ -11,7 +11,12 @@ is set (the GitHub Actions `tests.yml` workflow starts a postgres service and
 exports it). Without it, those tests skip.
 """
 
+import fcntl
+import hashlib
 import os
+import tempfile
+import time
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -21,6 +26,36 @@ from telecrime.config import Config
 from telecrime.models import Base
 
 PG_URL = os.environ.get("TELECRIME_TEST_DATABASE_URL", "")
+_PG_TEST_LOCK_WAIT_SECONDS = 900.0
+
+
+def _acquire_pg_test_lock():
+    """Serialize destructive PG fixtures across pytest processes.
+
+    Two pytest runs sharing one ``telecrime_test`` database (e.g. a developer
+    and CI, or concurrent agents) otherwise terminate each other's backends
+    with ``pg_terminate_backend`` and DROP/CREATE the schema under a live test,
+    producing "server closed the connection unexpectedly". The lock is held
+    for the duration of one PG test; a bounded wait turns a wedged holder into
+    a clear error instead of a hang.
+    """
+    digest = hashlib.sha256(PG_URL.encode()).hexdigest()[:16]
+    lock_path = Path(tempfile.gettempdir()) / f"telecrime-pytest-pg-{digest}.lock"
+    handle = lock_path.open("w")
+    deadline = time.monotonic() + _PG_TEST_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise RuntimeError(
+                    "Another pytest run has held the telecrime_test lock for "
+                    f"{_PG_TEST_LOCK_WAIT_SECONDS:.0f}s ({lock_path}); refusing "
+                    "to reset the schema under it."
+                ) from None
+            time.sleep(0.5)
 
 
 def _assert_safe_test_database(url: str) -> None:
@@ -53,43 +88,48 @@ def pg_engine():
     Drops and recreates the schema on a dedicated autocommit connection so
     every test starts empty and the trgm extension is present. Leftover idle
     connections from `create_app` are terminated first to avoid lock blocks.
+    A cross-process file lock serializes the destructive reset so two pytest
+    runs sharing the test database do not kill each other's connections.
     """
     if not PG_URL:
         pytest.skip("TELECRIME_TEST_DATABASE_URL not set — PG-only test skipped")
     _assert_safe_test_database(PG_URL)
+    lock_handle = _acquire_pg_test_lock()
     engine = create_engine(PG_URL, pool_pre_ping=True)
-
-    admin = create_engine(PG_URL, isolation_level="AUTOCOMMIT")
     try:
-        with admin.connect() as conn:
-            conn.execute(
-                text(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+        admin = create_engine(PG_URL, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+                    )
                 )
-            )
-            conn.execute(text("DROP SCHEMA public CASCADE"))
-            conn.execute(text("CREATE SCHEMA public"))
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-    finally:
-        admin.dispose()
-    Base.metadata.create_all(bind=engine)
-    # The trigram GIN indexes live in migration i9j0k1l2m3n4, not in the
-    # models, so create_all leaves them out and fts_available() (correctly)
-    # reports FTS as unavailable. Recreate them on the empty schema so the
-    # PG-backed FTS tests exercise the production search path.
-    from telecrime.fts import _PG_TRGM_INDEXES
+                conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+                conn.execute(text("CREATE SCHEMA public"))
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        finally:
+            admin.dispose()
+        Base.metadata.create_all(bind=engine)
+        # The trigram GIN indexes live in migration i9j0k1l2m3n4, not in the
+        # models, so create_all leaves them out and fts_available() (correctly)
+        # reports FTS as unavailable. Recreate them on the empty schema so the
+        # PG-backed FTS tests exercise the production search path.
+        from telecrime.fts import _PG_TRGM_INDEXES
 
-    with engine.begin() as conn:
-        for name, column in _PG_TRGM_INDEXES.items():
-            conn.execute(
-                text(
-                    f"CREATE INDEX IF NOT EXISTS {name} ON parsed_credentials "
-                    f"USING GIN ({column} gin_trgm_ops)"
+        with engine.begin() as conn:
+            for name, column in _PG_TRGM_INDEXES.items():
+                conn.execute(
+                    text(
+                        f"CREATE INDEX IF NOT EXISTS {name} ON parsed_credentials "
+                        f"USING GIN ({column} gin_trgm_ops)"
+                    )
                 )
-            )
-    yield engine
-    engine.dispose()
+        yield engine
+    finally:
+        engine.dispose()
+        lock_handle.close()
 
 
 @pytest.fixture
@@ -112,7 +152,15 @@ def _isolate_runtime_state_files(tmp_path, monkeypatch):
     file is isolated symmetrically: a live host pipeline can leave
     ``data/pipeline_progress.json`` with ``running: true``, which would make
     tests that read it depend on host state instead of their own fixtures.
+
+    The scheduler status / pipeline PID / data-dir variables are isolated for
+    the same reason: the host worker keeps ``data/scheduler_status.json`` and
+    ``data/pipeline.pid`` current, so a test that forgets an explicit override
+    would otherwise read (or overwrite) live host state in the repo root.
+    Tests that assert the ``TELECRIME_DATA_DIR`` fallback delete these
+    explicitly via ``monkeypatch``.
     """
+    monkeypatch.setenv("TELECRIME_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv(
         "TELECRIME_SHUTDOWN_REQUEST_FILE",
         str(tmp_path / "pipeline_shutdown_request.json"),
@@ -120,6 +168,14 @@ def _isolate_runtime_state_files(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "TELECRIME_PROGRESS_FILE",
         str(tmp_path / "pipeline_progress.json"),
+    )
+    monkeypatch.setenv(
+        "TELECRIME_STATUS_FILE",
+        str(tmp_path / "scheduler_status.json"),
+    )
+    monkeypatch.setenv(
+        "TELECRIME_PIPELINE_PID_FILE",
+        str(tmp_path / "pipeline.pid"),
     )
 
 
@@ -145,6 +201,17 @@ def _reset_module_caches() -> None:
         # engine must not decide the dedup path for this test's engine.
         parse_mod._HAS_HASH64 = None
         parse_mod._HAS_HASH64_RETRY_AT = 0.0
+        # Same class of cache for the trigram-index probe: a result cached
+        # against one test's schema must not decide gin_clean_pending_list()
+        # behavior for the next test's schema.
+        parse_mod._HAS_TRGM_INDEXES = None
+
+    database = sys.modules.get("telecrime.database")
+    if database is not None:
+        # URL-keyed engine cache: tests share the PG URL, so without a reset a
+        # later test can reuse an engine created before the schema was dropped
+        # and recreated by the pg_engine fixture.
+        database.get_cached_engine.cache_clear()
 
     extractor = sys.modules.get("telecrime.passwords.extractor")
     if extractor is not None:
@@ -161,6 +228,7 @@ def _reset_module_caches() -> None:
     web_app = sys.modules.get("telecrime.web.app")
     if web_app is not None:
         web_app._db_column_cache.clear()
+        web_app._cred_agg_allowed_cache.clear()
 
     progress = sys.modules.get("telecrime.pipeline.progress")
     if progress is not None:

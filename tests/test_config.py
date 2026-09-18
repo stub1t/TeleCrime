@@ -267,7 +267,8 @@ class TestLoadConfig:
 
         assert config.telegram.api_id == 99999
 
-    def test_load_from_toml_file(self, tmp_path):
+    def test_load_from_toml_file(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TELECRIME_DATA_DIR", raising=False)
         config_path = tmp_path / "config.toml"
         config_path.write_text(f"""
 database_url = "{self._PG_URL}"

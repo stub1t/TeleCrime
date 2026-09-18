@@ -1,8 +1,8 @@
 """Tests for CLI module."""
 
 import os
+import re
 from datetime import UTC, datetime
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
@@ -20,22 +20,35 @@ class TestCliInit:
     """Tests for init command."""
 
     def test_init_creates_database(self, tmp_path):
-        """Test init command creates database."""
+        """init must create the schema and write the config file for real.
+
+        The old version patched init_db, save_config and Path.exists, so a
+        completely broken init command still passed.
+        """
+        from sqlalchemy import inspect
+
+        from telecrime.config import Config, load_config
+        from telecrime.database import get_engine
+
+        config = Config(
+            database_url=f"sqlite:///{tmp_path / 'init.db'}",
+            data_dir=tmp_path / "data",
+            downloads_dir=tmp_path / "downloads",
+            extracted_dir=tmp_path / "extracted",
+        )
+        config.ensure_directories()
+        engine = get_engine(config.database_url)
         config_path = tmp_path / "config.toml"
 
-        with patch("telecrime.cli.get_config_and_engine") as mock_get:
-            mock_config = MagicMock()
-            mock_config.database_url = "postgresql://telecrime:telecrime@db:5432/telecrime"
-            mock_engine = MagicMock()
-            mock_get.return_value = (mock_config, mock_engine)
+        with patch("telecrime.cli.get_config_and_engine", return_value=(config, engine)):
+            result = runner.invoke(app, ["init", "--config", str(config_path)])
 
-            with patch("telecrime.cli.init_db"):
-                with patch("telecrime.cli.save_config"):
-                    with patch.object(Path, "exists", return_value=False):
-                        result = runner.invoke(app, ["init", "--config", str(config_path)])
-
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.stdout
         assert "initialized" in result.stdout.lower()
+        assert "conversations" in inspect(engine).get_table_names()
+        assert config_path.exists()
+        # The saved file must round-trip through the real loader.
+        assert load_config(config_path).database_url == config.database_url
 
 
 class TestCliDashboard:
@@ -59,25 +72,43 @@ class TestCliStatus:
     """Tests for status command."""
 
     def test_status_shows_counts(self, tmp_path):
-        """Test status command shows entity counts."""
-        with patch("telecrime.cli.get_config_and_engine") as mock_get:
-            mock_config = MagicMock()
-            mock_engine = MagicMock()
-            mock_get.return_value = (mock_config, mock_engine)
+        """Status renders the real DB counts, not just the table labels.
 
-            with patch("telecrime.cli.get_session") as mock_session:
-                # Create mock session context manager
-                mock_sess = MagicMock()
-                mock_sess.query.return_value.count.return_value = 0
-                mock_sess.query.return_value.filter.return_value.count.return_value = 0
-                mock_session.return_value.__enter__ = MagicMock(return_value=mock_sess)
-                mock_session.return_value.__exit__ = MagicMock(return_value=False)
+        The old version mocked the session so completely that the command's
+        queries never ran; it passed even if every count was hardcoded.
+        """
+        from telecrime.database import get_engine, init_db
+        from telecrime.models import Conversation, Message
 
-                result = runner.invoke(app, ["status"])
+        engine = get_engine(f"sqlite:///{tmp_path / 'status.db'}")
+        init_db(engine)
+        with get_session(engine) as session:
+            conv = Conversation(platform_id=1, conversation_type="channel")
+            session.add(conv)
+            session.flush()
+            session.add_all(
+                [
+                    Message(
+                        conversation_id=conv.id,
+                        platform_id=1,
+                        platform_timestamp=datetime.now(UTC),
+                        text="first",
+                    ),
+                    Message(
+                        conversation_id=conv.id,
+                        platform_id=2,
+                        platform_timestamp=datetime.now(UTC),
+                        text="second",
+                    ),
+                ]
+            )
+
+        with patch("telecrime.cli.get_config_and_engine", return_value=(MagicMock(), engine)):
+            result = runner.invoke(app, ["status"])
 
         assert result.exit_code == 0
-        # Should show table with entities
-        assert "Conversations" in result.stdout or "conversations" in result.stdout.lower()
+        assert re.search(r"│ Conversations\s+│\s+1 │", result.stdout), result.stdout
+        assert re.search(r"│ Messages\s+│\s+2 │", result.stdout), result.stdout
 
 
 class TestCliDiagnostics:
@@ -162,6 +193,132 @@ class TestCliRetry:
         assert mock_sess.execute.call_count == 3
         mock_sess.query.assert_not_called()
         assert "Reset 4 jobs for retry" in result.stdout
+
+    def test_retry_resets_failed_rows_end_to_end(self, tmp_path):
+        """The real SQL must reset exactly the failed rows.
+
+        test_retry_uses_bulk_updates mocks the session, so it cannot catch a
+        wrong filter/status mapping; this runs the command against a real DB.
+        """
+        from telecrime.database import get_engine, init_db
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            ExtractedOutput,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
+
+        engine = get_engine(f"sqlite:///{tmp_path / 'retry.db'}")
+        init_db(engine)
+        with get_session(engine) as session:
+            conv = Conversation(platform_id=1, conversation_type="channel")
+            session.add(conv)
+            session.flush()
+            msg = Message(
+                conversation_id=conv.id,
+                platform_id=1,
+                platform_timestamp=datetime.now(UTC),
+                text="x",
+            )
+            session.add(msg)
+            session.flush()
+
+            def artifact(tag: str, status: DownloadStatus) -> DownloadArtifact:
+                attachment = FileAttachment(
+                    message_id=msg.id, platform_file_id=f"retry-{tag}"
+                )
+                session.add(attachment)
+                session.flush()
+                item = DownloadArtifact(
+                    attachment_id=attachment.id,
+                    status=status,
+                    error_message="previous failure",
+                    retry_count=3,
+                )
+                session.add(item)
+                session.flush()
+                return item
+
+            failed = artifact("failed", DownloadStatus.FAILED)
+            terminal = artifact("terminal", DownloadStatus.FAILED_TERMINAL)
+            completed = artifact("completed", DownloadStatus.COMPLETED)
+
+            failed_group = ArchiveGroup(
+                fingerprint="retry-failed",
+                base_name="a.zip",
+                expected_part_count=1,
+                status=GroupStatus.FAILED,
+            )
+            done_group = ArchiveGroup(
+                fingerprint="retry-done",
+                base_name="b.zip",
+                expected_part_count=1,
+                status=GroupStatus.EXTRACTED,
+            )
+            session.add_all([failed_group, done_group])
+            session.flush()
+            failed_job = ExtractionJob(
+                group_id=failed_group.id,
+                status=ExtractionStatus.FAILED,
+                last_error_code="BAD",
+                last_error_message="boom",
+            )
+            done_job = ExtractionJob(
+                group_id=done_group.id, status=ExtractionStatus.COMPLETED
+            )
+            session.add_all([failed_job, done_job])
+            session.flush()
+            session.add(
+                ExtractedOutput(
+                    job_id=failed_job.id,
+                    output_path="/tmp/x.txt",
+                    output_filename="x.txt",
+                    output_hash="h",
+                )
+            )
+
+        with patch("telecrime.cli.get_config_and_engine", return_value=(MagicMock(), engine)):
+            result = runner.invoke(app, ["retry", "--downloads", "--extractions"])
+
+        assert result.exit_code == 0
+        assert "Reset 2 jobs for retry" in result.stdout
+        with get_session(engine) as session:
+            assert session.get(DownloadArtifact, failed.id).status == DownloadStatus.PENDING
+            assert session.get(DownloadArtifact, failed.id).error_message is None
+            # Terminal failures stay terminal unless --terminal is passed.
+            assert (
+                session.get(DownloadArtifact, terminal.id).status
+                == DownloadStatus.FAILED_TERMINAL
+            )
+            assert (
+                session.get(DownloadArtifact, completed.id).status
+                == DownloadStatus.COMPLETED
+            )
+
+            assert session.get(ArchiveGroup, failed_group.id).status == GroupStatus.READY
+            assert session.get(ArchiveGroup, done_group.id).status == GroupStatus.EXTRACTED
+            job = session.get(ExtractionJob, failed_job.id)
+            assert job.status == ExtractionStatus.PENDING
+            assert job.last_error_code is None
+            assert job.last_error_message is None
+            assert (
+                session.get(ExtractionJob, done_job.id).status
+                == ExtractionStatus.COMPLETED
+            )
+
+        # --terminal widens the reset to permanently failed rows.
+        with patch("telecrime.cli.get_config_and_engine", return_value=(MagicMock(), engine)):
+            result = runner.invoke(app, ["retry", "--downloads", "--terminal"])
+
+        assert result.exit_code == 0
+        assert "Reset 1 jobs for retry" in result.stdout
+        with get_session(engine) as session:
+            assert (
+                session.get(DownloadArtifact, terminal.id).status
+                == DownloadStatus.PENDING
+            )
 
 
 class TestCliShutdownRequest:
@@ -249,23 +406,76 @@ class TestCliShutdownRequest:
 class TestCliFailures:
     """Tests for failures command."""
 
-    def test_failures_command_runs(self):
-        with patch("telecrime.cli.get_config_and_engine") as mock_get:
-            mock_get.return_value = (MagicMock(), MagicMock())
+    def test_failures_command_runs(self, tmp_path):
+        """failures must run the real failure queries and print their rows.
 
-            with patch("telecrime.cli.get_session") as mock_session:
-                mock_sess = MagicMock()
-                mock_query = MagicMock()
-                mock_query.filter.return_value.order_by.return_value.limit.return_value.all.return_value = []
-                mock_sess.query.return_value = mock_query
-                mock_session.return_value.__enter__ = MagicMock(return_value=mock_sess)
-                mock_session.return_value.__exit__ = MagicMock(return_value=False)
+        The old version stubbed the session with a query chain returning [], so
+        only the two table titles were ever exercised.
+        """
+        from telecrime.database import get_engine, init_db
+        from telecrime.models import (
+            Conversation,
+            DownloadArtifact,
+            ExtractionJob,
+            FileAttachment,
+            Message,
+        )
+        from telecrime.states import DownloadStatus
 
-                result = runner.invoke(app, ["failures"])
+        engine = get_engine(f"sqlite:///{tmp_path / 'failures.db'}")
+        init_db(engine)
+        with get_session(engine) as session:
+            conv = Conversation(platform_id=1, conversation_type="channel")
+            session.add(conv)
+            session.flush()
+            msg = Message(
+                conversation_id=conv.id,
+                platform_id=1,
+                platform_timestamp=datetime.now(UTC),
+                text="x",
+            )
+            session.add(msg)
+            session.flush()
+            attachment = FileAttachment(
+                message_id=msg.id, platform_file_id="f1", filename="broken.zip"
+            )
+            session.add(attachment)
+            session.flush()
+            session.add(
+                DownloadArtifact(
+                    attachment_id=attachment.id,
+                    status=DownloadStatus.FAILED,
+                    error_message="download boom",
+                )
+            )
+            group = ArchiveGroup(
+                fingerprint="failures-group",
+                base_name="failed.zip",
+                expected_part_count=1,
+                status=GroupStatus.FAILED,
+            )
+            session.add(group)
+            session.flush()
+            session.add(
+                ExtractionJob(
+                    group_id=group.id,
+                    status=ExtractionStatus.FAILED_TERMINAL,
+                    last_error_code="CORRUPTED",
+                    last_error_message="extract boom",
+                )
+            )
+
+        with patch("telecrime.cli.get_config_and_engine", return_value=(MagicMock(), engine)):
+            result = runner.invoke(app, ["failures"])
 
         assert result.exit_code == 0
         assert "failed downloads" in result.stdout.lower()
         assert "failed extractions" in result.stdout.lower()
+        assert "broken.zip" in result.stdout
+        assert "download boom" in result.stdout
+        assert "failed.zip" in result.stdout
+        assert "CORRUPTED" in result.stdout
+        assert "extract boom" in result.stdout
 
 
 class TestCliReprocess:
@@ -403,6 +613,9 @@ class TestCliClean:
 
         assert result.exit_code == 0
         assert "cleaned" in result.stdout.lower()
+        # The command recreates the directory but must have removed the archive.
+        assert downloads_dir.exists()
+        assert not (downloads_dir / "test.zip").exists()
 
     def test_clean_asks_confirmation(self, tmp_path):
         """Test clean command asks for confirmation without --force."""
@@ -419,8 +632,11 @@ class TestCliClean:
             # Say no to confirmation
             result = runner.invoke(app, ["clean", "--downloads"], input="n\n")
 
-        # Declining must abort without deleting the downloads
-        assert result.exit_code != 0 or (downloads_dir / "test.zip").exists()
+        # Declining must abort without deleting the downloads. Assert both
+        # halves independently: `exit_code != 0 or file.exists()` also passed
+        # when the command deleted the file but exited non-zero.
+        assert (downloads_dir / "test.zip").exists()
+        assert "Downloads cleaned" not in result.stdout
 
 
 class TestCliRun:
@@ -438,7 +654,7 @@ class TestCliRun:
             result = runner.invoke(app, ["run"])
 
         assert result.exit_code == 1
-        assert "credentials" in result.stdout.lower() or "configured" in result.stdout.lower()
+        assert "Telegram credentials not configured" in result.stdout
 
     def test_run_dry_run_flag(self):
         """Test run command accepts --dry-run flag."""
