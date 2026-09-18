@@ -241,6 +241,10 @@ def _apply_pg_bulk_settings(session) -> None:
     # The compose default work_mem is 4MB; the staging-table sort/anti-join
     # paths spill to disk per chunk without a raise.
     session.execute(text("SET work_mem = '64MB'"))
+    # Keep parse temp spills off the internal SSD: `intts` holds the growing
+    # credential indexes and WAL already shares that filesystem, so temp files
+    # there are the fastest way to fill it. The external drive has room.
+    session.execute(text("SET temp_tablespaces = 'pg_default'"))
 
 
 def _reset_pg_bulk_settings(session) -> None:
@@ -250,6 +254,7 @@ def _reset_pg_bulk_settings(session) -> None:
         session.execute(text("SET gin_pending_list_limit = DEFAULT"))
         session.execute(text("SET maintenance_work_mem = DEFAULT"))
         session.execute(text("SET work_mem = DEFAULT"))
+        session.execute(text("SET temp_tablespaces = DEFAULT"))
     except Exception:
         pass
 
