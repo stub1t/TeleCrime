@@ -150,6 +150,12 @@ for rel in "$@"; do
     esac
 done
 
+# --no-deps is REQUIRED on every `up`: without it, compose compares the whole
+# dependency graph and RECREATES containers whose config drifted. On
+# 2026-09-19 a plain `compose up -d web` recreated the db container (the
+# running one predated a compose/.env change), killing PostgreSQL mid-parse
+# and aborting a multi-hour parse job. Hot-deploy must only ever touch the
+# container whose code changed.
 if (( WORKER_RESTART )); then
     echo "--- restarting worker (stop+start, ~10s) ---"
     # Per feedback_docker_restart: clear stale shutdown file before AND after
@@ -158,7 +164,7 @@ if (( WORKER_RESTART )); then
     rm -f "$DATA_DIR/pipeline_shutdown_request.json"
     compose stop -t 5 worker >/dev/null
     rm -f "$DATA_DIR/pipeline_shutdown_request.json"
-    compose up -d worker >/dev/null
+    compose up -d --no-deps worker >/dev/null
     sleep 3
     compose ps worker
 fi
@@ -166,7 +172,7 @@ fi
 if (( WEB_RESTART )); then
     echo "--- restarting web (stop+start) ---"
     compose stop -t 5 web >/dev/null
-    compose up -d web >/dev/null
+    compose up -d --no-deps web >/dev/null
     sleep 3
     compose ps web
 fi

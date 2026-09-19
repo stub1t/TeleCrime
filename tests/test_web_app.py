@@ -1547,6 +1547,63 @@ def test_watchlist_add_defers_count_when_scan_in_flight(tmp_path, monkeypatch):
         assert item.last_known_count == -1
 
 
+def test_watchlist_sweep_skips_without_trigram_indexes(monkeypatch):
+    """Missing trgm indexes must skip the sweep, not burn full-table scans.
+
+    The scheduler's collector already skips; the web sweep kept firing ~140s
+    of pointless ILIKE scans every 30 minutes during the multi-day parse.
+    """
+    from telecrime.web import app as web_app
+
+    monkeypatch.setattr(web_app, "_watchlist_fts_ready", lambda _engine: False)
+
+    called = False
+
+    def _should_not_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        return 0
+
+    monkeypatch.setattr(web_app, "_watchlist_count", _should_not_run)
+
+    # Must return before touching the engine: it is not even a session.
+    _check_watchlist(object())
+
+    assert called is False
+    # The single-flight lock must be released on the early return.
+    assert web_app._watchlist_web_scan_lock.acquire(blocking=False)
+    web_app._watchlist_web_scan_lock.release()
+
+
+def test_watchlist_add_stores_unknown_when_indexes_missing(tmp_path, monkeypatch):
+    """The add route must not run a doomed full scan when trgm is missing."""
+    from telecrime.web import app as web_app
+
+    monkeypatch.setattr(web_app, "_watchlist_fts_ready", lambda _engine: False)
+
+    called = False
+
+    def _should_not_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        return 0
+
+    monkeypatch.setattr(web_app, "_watchlist_count", _should_not_run)
+    app, seed_engine = _sqlite_app(tmp_path)
+
+    response = asyncio.run(
+        _route(app, "/api/watchlist", "POST").endpoint(
+            request=_web_request(method="POST", form={"query": "no-trgm"})
+        )
+    )
+
+    assert response.status_code == 200
+    assert called is False
+    with get_session(seed_engine) as session:
+        item = session.query(WatchlistItem).one()
+        assert item.last_known_count == -1
+
+
 def test_search_count_degrades_gracefully_on_timeout(tmp_path, monkeypatch):
     """A canceled COUNT on parsed_credentials must not 500 /search/count."""
     from telecrime.web import app as web_app

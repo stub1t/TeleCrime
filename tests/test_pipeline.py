@@ -4229,65 +4229,235 @@ class TestStartupRecoveryAttemptBatching:
 class TestPartialParseRecovery:
     """A hard kill mid-file must not lose that file's unparsed tail."""
 
+    def _job_with_group(self, session, *, group_status=GroupStatus.EXTRACTED):
+        from telecrime.models import ArchiveGroup, ExtractionJob
+
+        group = ArchiveGroup(
+            fingerprint=f"resume-{group_status.name}",
+            base_name="big.rar",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=group_status,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+        session.add(job)
+        session.flush()
+        return job, group
+
+    def _row(self, job_id, source_file, tag):
+        from telecrime.models import ParsedCredential
+
+        return ParsedCredential(
+            url="",
+            username="",
+            password="",
+            extraction_job_id=job_id,
+            source_file=source_file,
+            credential_hash=tag * 64,
+        )
+
     def test_marker_lifecycle(self, session):
         from telecrime.models.pipeline_state import PipelineState
-        from telecrime.pipeline.parse import _clear_parse_marker, _set_parse_marker
+        from telecrime.pipeline.parse import (
+            _clear_parse_marker,
+            _marker_payload,
+            _set_parse_marker,
+        )
 
-        _set_parse_marker(session, 7, "/x/big.txt")
+        _set_parse_marker(session, 7, "/x/big.txt", resume=12, mode="parallel")
         row = session.get(PipelineState, "parse_in_progress:7")
-        assert row is not None and row.value_text == "/x/big.txt"
+        payload = _marker_payload(row)
+        assert payload is not None
+        assert payload["file"] == "/x/big.txt"
+        assert payload["resume"] == 12
+        assert payload["mode"] == "parallel"
 
         _clear_parse_marker(session, 7)
         assert session.get(PipelineState, "parse_in_progress:7") is None
         # Clearing twice is harmless.
         _clear_parse_marker(session, 7)
 
-    def test_startup_recovery_removes_partial_file_rows(
-        self, session, test_config, tmp_path
-    ):
-        """Only the marked (in-progress) file is purged; sibling files survive.
+    def test_recovery_keeps_rows_and_resume_count(self, session):
+        """Startup recovery must NOT delete the committed prefix: the marker
+        resumes from the persisted credential count instead."""
+        from telecrime.models import ParsedCredential
+        from telecrime.models.pipeline_state import PipelineState
+        from telecrime.pipeline.parse import (
+            _PARSE_MARKER_PREFIX,
+            _marker_payload,
+            _recover_partial_parses,
+            _set_parse_marker,
+        )
 
-        The parse pre-skip treats any committed row as "file parsed"; a run
-        killed after some batches of one file would otherwise skip that file
-        forever and lose its tail.
-        """
+        job, _group = self._job_with_group(session)
+        session.add(self._row(job.id, "/x/big.txt", "a"))
+        session.add(self._row(job.id, "/x/big.txt", "b"))
+        session.commit()
+        _set_parse_marker(
+            session, job.id, "/x/big.txt", resume=9, mode="parallel", output_hash="h"
+        )
+
+        resumed = _recover_partial_parses(session)
+
+        assert resumed == 1
+        assert session.query(ParsedCredential).count() == 2
+        row = session.get(PipelineState, f"{_PARSE_MARKER_PREFIX}{job.id}")
+        assert row is not None and _marker_payload(row)["resume"] == 9
+
+    def test_recovery_drops_marker_when_file_rows_were_deleted(self, session):
+        """The failure path deletes a job's rows; resuming past a deleted
+        prefix would lose credentials, so the marker must be dropped."""
+        from telecrime.models.pipeline_state import PipelineState
+        from telecrime.pipeline.parse import (
+            _PARSE_MARKER_PREFIX,
+            _recover_partial_parses,
+            _set_parse_marker,
+        )
+
+        job, _group = self._job_with_group(session)
+        session.commit()
+        _set_parse_marker(
+            session, job.id, "/x/big.txt", resume=9, mode="parallel", output_hash="h"
+        )
+
+        resumed = _recover_partial_parses(session)
+
+        assert resumed == 0
+        assert session.get(PipelineState, f"{_PARSE_MARKER_PREFIX}{job.id}") is None
+
+    def test_recovery_drops_marker_for_cleaned_group(self, session):
+        from telecrime.models.pipeline_state import PipelineState
+        from telecrime.pipeline.parse import (
+            _PARSE_MARKER_PREFIX,
+            _recover_partial_parses,
+            _set_parse_marker,
+        )
+
+        job, _group = self._job_with_group(session, group_status=GroupStatus.CLEANED)
+        session.add(self._row(job.id, "/x/big.txt", "a"))
+        session.commit()
+        _set_parse_marker(session, job.id, "/x/big.txt", resume=1, mode="sequential")
+
+        resumed = _recover_partial_parses(session)
+
+        assert resumed == 0
+        assert session.get(PipelineState, f"{_PARSE_MARKER_PREFIX}{job.id}") is None
+
+    def test_startup_recovery_keeps_marker_through_the_pipeline_recovery(
+        self, session, test_config
+    ):
+        """The orchestrator's startup recovery must not purge resume state."""
         from telecrime.models import ParsedCredential
         from telecrime.models.pipeline_state import PipelineState
         from telecrime.pipeline.orchestrator import _run_startup_recovery
-
-        session.add_all(
-            [
-                ParsedCredential(
-                    url="",
-                    username="",
-                    password="",
-                    extraction_job_id=7,
-                    source_file="/x/big.txt",
-                    credential_hash="a" * 64,
-                ),
-                ParsedCredential(
-                    url="",
-                    username="",
-                    password="",
-                    extraction_job_id=7,
-                    source_file="/x/other.txt",
-                    credential_hash="b" * 64,
-                ),
-            ]
-        )
-        session.commit()
         from telecrime.pipeline.parse import _set_parse_marker
 
-        _set_parse_marker(session, 7, "/x/big.txt")
+        job, _group = self._job_with_group(session)
+        session.add(self._row(job.id, "/x/big.txt", "a"))
+        session.commit()
+        _set_parse_marker(session, job.id, "/x/big.txt", resume=3, mode="parallel")
 
         _run_startup_recovery(session, test_config)
         session.expire_all()
 
-        remaining = (
-            session.execute(select(ParsedCredential.source_file)).scalars().all()
+        assert session.query(ParsedCredential).count() == 1
+        assert session.get(PipelineState, f"parse_in_progress:{job.id}") is not None
+
+    @pytest.mark.asyncio
+    async def test_parse_resumes_from_committed_count(
+        self, session, test_config, tmp_path, monkeypatch
+    ):
+        """A resumed file skips the already-committed prefix without probing.
+
+        The skipped credentials are pre-committed rows, so re-inserting them
+        would be a no-op (ON CONFLICT) but costs a DB probe each; the resume
+        must not even hand them to the bulk insert.
+        """
+        from telecrime.models import (
+            ArchiveGroup,
+            ExtractedOutput,
+            ExtractionJob,
+            ParsedCredential,
         )
-        assert remaining == ["/x/other.txt"]
-        assert session.get(PipelineState, "parse_in_progress:7") is None
+        from telecrime.pipeline import parse as parse_mod
+        from telecrime.pipeline.parse import _set_parse_marker
+
+        group = ArchiveGroup(
+            fingerprint="resume-skip",
+            base_name="big.rar",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.EXTRACTED,
+        )
+        session.add(group)
+        session.flush()
+        job = ExtractionJob(group_id=group.id, status=ExtractionStatus.COMPLETED)
+        session.add(job)
+        session.flush()
+
+        credential_file = tmp_path / "Passwords.txt"
+        credential_file.write_text(
+            "https://site1.com;user1;pass1\n"
+            "https://site2.com;user2;pass2\n"
+            "https://site3.com;user3;pass3\n"
+            "https://site4.com;user4;pass4\n"
+        )
+        output = ExtractedOutput(
+            job_id=job.id,
+            output_path=str(credential_file),
+            output_filename="Passwords.txt",
+            output_hash="resumehash",
+        )
+        session.add(output)
+        # Pre-commit the first two credentials, as a crashed run would have.
+        for idx in (1, 2):
+            session.add(
+                ParsedCredential(
+                    url=f"https://site{idx}.com",
+                    domain=f"site{idx}.com",
+                    username=f"user{idx}",
+                    password=f"pass{idx}",
+                    extraction_job_id=job.id,
+                    source_file=str(credential_file),
+                    credential_hash=ParsedCredential.compute_hash(
+                        f"site{idx}.com", f"user{idx}", f"pass{idx}"
+                    ),
+                )
+            )
+        session.commit()
+
+        _set_parse_marker(
+            session,
+            job.id,
+            str(credential_file),
+            resume=2,
+            mode="sequential",
+            output_hash="resumehash",
+        )
+        job.last_error_code = parse_mod._RESUME_CODE
+        session.commit()
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        stage = ParseStage()
+        original_insert = stage._bulk_insert_credentials
+        seen_usernames: list[str] = []
+
+        def _record(ctx_arg, rows, constants=None):
+            seen_usernames.extend(row.get("username") for row in rows)
+            return original_insert(ctx_arg, rows, constants=constants)
+
+        stage._bulk_insert_credentials = _record  # type: ignore[method-assign]
+
+        await stage._parse_job_outputs(ctx, job, has_soft_hash_column=False)
+
+        assert seen_usernames == ["user3", "user4"]
+        assert session.query(ParsedCredential).count() == 4
+        # The resume marker was consumed.
+        from telecrime.models.pipeline_state import PipelineState
+
+        assert session.get(PipelineState, f"parse_in_progress:{job.id}") is None
 
 
 class TestFinalizeStageCredentialCount:

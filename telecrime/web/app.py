@@ -1437,6 +1437,33 @@ _WATCHLIST_WEB_STATEMENT_TIMEOUT = "20s"
 # unknown sentinel (-1) and the next sweep seeds the baseline.
 _watchlist_web_scan_lock = threading.Lock()
 
+# The recovery-rebuilt database has no trigram indexes, so every watchlist
+# ILIKE count is a full-table scan that burns its 20s timeout and returns
+# nothing. The scheduler's collector already skips in that case; without the
+# same guard here the 30-minute web sweep (7 items) fired ~140s of pointless
+# full-table scans that competed with the parse's bulk INSERTs, and the badge
+# counts never converged. Log once per process.
+_watchlist_ft_skip_logged = False
+
+
+def _watchlist_fts_ready(engine) -> bool:
+    """True when the trigram indexes backing the watchlist ILIKE counts exist.
+
+    SQLite/test engines are always "ready": their fixtures are tiny and the
+    probe is PostgreSQL-specific. Unknown probe failures must not disable
+    watchlists — the per-item statement_timeout still bounds any scan.
+    """
+    if getattr(engine, "dialect", None) is None:
+        return True
+    if engine.dialect.name != "postgresql":
+        return True
+    try:
+        from telecrime.fts import fts_available
+
+        return fts_available(engine)
+    except Exception:
+        return True
+
 
 def _check_watchlist(engine, *, incremental_only: bool = False) -> None:
     """Check all enabled watchlist items and update new_count.
@@ -1455,7 +1482,17 @@ def _check_watchlist(engine, *, incremental_only: bool = False) -> None:
         logger.info("Watchlist scan already in progress — skipping overlapping sweep")
         return
 
+    global _watchlist_ft_skip_logged
     try:
+        if not _watchlist_fts_ready(engine):
+            if not _watchlist_ft_skip_logged:
+                logger.warning(
+                    "Watchlist sweep skipped: trigram indexes are missing — "
+                    "every ILIKE count is a full-table scan that times out. "
+                    "Badges/alerts resume automatically once the indexes are rebuilt."
+                )
+                _watchlist_ft_skip_logged = True
+            return
         with get_session(engine) as session:
             items = session.query(WatchlistItem).filter(WatchlistItem.enabled == True).all()
             if not items:
@@ -5058,6 +5095,14 @@ def create_app(database_url: str | None = None) -> FastAPI:
             match_type = "any"
 
         def _initial_count() -> int | None:
+            # Missing trigram indexes make this a full-table scan that can only
+            # time out: store the unknown sentinel and let the sweep seed it
+            # once the indexes are rebuilt.
+            if not _watchlist_fts_ready(engine):
+                logger.info(
+                    "Trigram indexes missing — storing unknown baseline for %r", query
+                )
+                return None
             # Never stack a full ILIKE scan on top of an in-flight sweep: the
             # item is stored with the unknown sentinel and seeded later.
             if not _watchlist_web_scan_lock.acquire(blocking=False):

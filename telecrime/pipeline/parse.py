@@ -3,6 +3,7 @@
 import asyncio
 import io
 import itertools
+import json
 import logging
 import multiprocessing
 import os
@@ -61,17 +62,52 @@ _PARALLEL_PARSE_IDLE_WAIT_SECONDS = 1.0
 # (the duplicate-heavy prefix is deterministic).
 _EARLY_SKIP_CODE = "EARLY_SKIP"
 
+# Job marker for a file whose parse was interrupted. Unlike EARLY_SKIP (which
+# deletes the file's rows and forces a full re-parse), RESUME keeps the
+# committed rows and tells the next run to continue the deterministic
+# credential sequence from the persisted count.
+_RESUME_CODE = "RESUME"
+
 # pipeline_state key prefix for the file currently being parsed. A hard kill
 # (SIGKILL / OOM / container restart mid-file) leaves rows from the file's
 # already-flushed batches committed. The next run's per-file pre-skip
 # (parsed_source_files) skips any file with rows, so without this marker the
-# file's unparsed tail would be lost forever. Startup recovery deletes the
-# marked file's rows so it is re-parsed from the beginning; ON CONFLICT dedups
-# the re-inserts.
+# file's unparsed tail would be lost forever. The marker stores the exact
+# number of credentials already committed for the file's deterministic yield
+# sequence plus the parse mode that produced that sequence (the parallel path
+# can yield carry-over duplicates at hard chunk cuts, so counts are only
+# comparable within the same mode). On startup the marker is validated and
+# kept; the parse stage resumes from the count instead of re-probing millions
+# of already-committed rows.
 _PARSE_MARKER_PREFIX = "parse_in_progress:"
 
 
-def _set_parse_marker(session, job_id: int, source_file: str) -> None:
+def _marker_payload(row: PipelineState | None) -> dict | None:
+    """Decode a parse marker row into its payload dict (or None)."""
+    if row is None or not row.value_text:
+        return None
+    text = row.value_text
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        if isinstance(data, dict) and data.get("file"):
+            return data
+        return None
+    # Legacy marker (pre-resume): value_text was the bare file path.
+    return {"file": text, "resume": 0, "mode": None, "hash": None}
+
+
+def _set_parse_marker(
+    session,
+    job_id: int,
+    source_file: str,
+    *,
+    resume: int = 0,
+    mode: str | None = None,
+    output_hash: str | None = None,
+) -> None:
     """Durably record the file about to be parsed (pre-parse commit)."""
     key = f"{_PARSE_MARKER_PREFIX}{job_id}"
     row = session.get(PipelineState, key)
@@ -79,7 +115,42 @@ def _set_parse_marker(session, job_id: int, source_file: str) -> None:
         row = PipelineState(key=key)
         session.add(row)
     row.value_int = job_id
-    row.value_text = source_file
+    row.value_text = json.dumps(
+        {
+            "file": source_file,
+            "resume": int(resume),
+            "mode": mode,
+            "hash": output_hash,
+        }
+    )
+    session.commit()
+
+
+def _update_parse_marker(
+    session,
+    job_id: int,
+    *,
+    resume: int,
+    mode: str | None,
+    output_hash: str | None,
+) -> None:
+    """Advance the resume count AFTER the rows it describes were committed.
+
+    Called post-commit (not inside the batch transaction) so the marker can
+    never claim more committed credentials than the database actually holds:
+    a crash between the row commit and this marker commit leaves the marker
+    under-counting, and an under-count only re-processes rows that ON CONFLICT
+    already dedups.
+    """
+    key = f"{_PARSE_MARKER_PREFIX}{job_id}"
+    row = session.get(PipelineState, key)
+    if row is None:
+        return
+    data = _marker_payload(row) or {}
+    data["resume"] = int(resume)
+    data["mode"] = mode
+    data["hash"] = output_hash
+    row.value_text = json.dumps(data)
     session.commit()
 
 
@@ -92,11 +163,14 @@ def _clear_parse_marker(session, job_id: int) -> None:
 
 
 def _recover_partial_parses(session) -> int:
-    """Delete rows of files left mid-parse by a crashed run.
+    """Validate parse markers left by a crashed run.
 
-    Returns the number of files recovered (markers removed). Called by
-    startup recovery before any parse work so the pre-skip cannot treat a
-    partially parsed file as complete.
+    Returns the number of files that will be resumed. Committed rows are kept
+    (resuming skips their credentials instead of re-probing them). Markers are
+    dropped when the job/group is gone, the group is no longer EXTRACTED, or
+    the marked file has zero committed rows (the failure path deletes all of a
+    job's rows; a zero-row file must be re-parsed from scratch, and resuming
+    past a deleted prefix would lose data).
     """
     markers = (
         session.execute(
@@ -105,33 +179,48 @@ def _recover_partial_parses(session) -> int:
         .scalars()
         .all()
     )
-    recovered = 0
+    resumed = 0
+    changed = False
     for marker in markers:
+        payload = _marker_payload(marker)
         job_id = marker.value_int
-        source_file = marker.value_text
-        removed = 0
-        if job_id and source_file:
-            removed = (
-                session.execute(
-                    delete(ParsedCredential).where(
-                        ParsedCredential.extraction_job_id == job_id,
-                        ParsedCredential.source_file == source_file,
-                    )
-                ).rowcount
-                or 0
-            )
-        session.delete(marker)
-        recovered += 1
-        logger.warning(
-            "Startup recovery: removed %d partial row(s) from file left mid-parse "
-            "(%s, job %s) — it will be parsed again",
-            removed,
-            source_file,
-            job_id,
+        if payload is None or not job_id:
+            session.delete(marker)
+            changed = True
+            continue
+        job = session.get(ExtractionJob, job_id)
+        group = session.get(ArchiveGroup, job.group_id) if job and job.group_id else None
+        if job is None or group is None or group.status != GroupStatus.EXTRACTED:
+            session.delete(marker)
+            changed = True
+            continue
+        has_rows = (
+            session.execute(
+                select(ParsedCredential.id)
+                .where(
+                    ParsedCredential.extraction_job_id == job_id,
+                    ParsedCredential.source_file == payload["file"],
+                )
+                .limit(1)
+            ).first()
+            is not None
         )
-    if recovered:
+        if not has_rows:
+            session.delete(marker)
+            changed = True
+            continue
+        resumed += 1
+        logger.warning(
+            "Startup recovery: will resume %s (job %s) from credential %s "
+            "(mode %s)",
+            payload["file"],
+            job_id,
+            payload.get("resume"),
+            payload.get("mode"),
+        )
+    if changed:
         session.commit()
-    return recovered
+    return resumed
 
 
 def _iter_line_chunks(
@@ -855,6 +944,9 @@ class ParseStage(PipelineStage):
                             ),
                         ).rowcount
                         ctx.session.commit()
+                        # The rows the marker counted are gone: dropping it
+                        # prevents a resume that would skip re-parsing them.
+                        _clear_parse_marker(ctx.session, job.id)
                         logger.info(
                             "Removed %d partial rows for failed job %d — will re-parse next run",
                             removed or 0,
@@ -959,6 +1051,9 @@ class ParseStage(PipelineStage):
                             ),
                         ).rowcount
                         ctx.session.commit()
+                        # The rows the marker counted are gone: dropping it
+                        # prevents a resume that would skip re-parsing them.
+                        _clear_parse_marker(ctx.session, job_id)
                         logger.info(
                             "Removed %d partial rows for failed job %d — will re-parse next run",
                             removed or 0,
@@ -1034,6 +1129,15 @@ class ParseStage(PipelineStage):
         # A previous run early-skipped a file of this job: parse every file
         # fully this time so the never-parsed tail cannot be skipped forever.
         force_full = job.last_error_code == _EARLY_SKIP_CODE
+
+        # Crash-resume state: the file that was mid-parse when the process
+        # died, with the count/mode/hash needed to continue it instead of
+        # re-probing every already-committed credential.
+        resume_payload = _marker_payload(
+            ctx.session.get(PipelineState, f"{_PARSE_MARKER_PREFIX}{job.id}")
+        )
+        resume_file = resume_payload.get("file") if resume_payload else None
+        resume_seen = False
 
         # Get the extracted output files
         outputs = job.outputs
@@ -1129,19 +1233,66 @@ class ParseStage(PipelineStage):
                 await asyncio.sleep(0)
 
             file_path = Path(output.output_path)
+            file_path_str = str(file_path)
 
             if not file_path.exists():
                 logger.warning("Credential file missing: %s", file_path)
+                if resume_file == file_path_str:
+                    # The marked file is gone: nothing left to resume.
+                    _clear_parse_marker(ctx.session, job.id)
+                    resume_file = None
                 continue
 
+            # The parse mode must be known BEFORE the resume decision: the
+            # parallel and sequential paths yield different (each deterministic)
+            # credential sequences, so a resume count is only valid for the
+            # mode that produced it.
+            try:
+                file_size = file_path.stat().st_size
+            except OSError:
+                file_size = 0
+            workers = self._parallel_worker_count()
+            use_parallel = file_size >= _PARALLEL_PARSE_MIN_BYTES and workers >= 1
+            file_mode = "parallel" if use_parallel else "sequential"
+
+            resume_count = 0
+            if resume_file == file_path_str:
+                resume_seen = True
+                if (
+                    resume_payload
+                    and resume_payload.get("mode") == file_mode
+                    and resume_payload.get("hash")
+                    and output.output_hash
+                    and resume_payload["hash"] == output.output_hash
+                ):
+                    resume_count = int(resume_payload.get("resume") or 0)
+                    if resume_count:
+                        logger.info(
+                            "Resuming %s from credential %d (mode %s)",
+                            file_path.name,
+                            resume_count,
+                            file_mode,
+                        )
+
             # Check if we've already parsed this file (bypassed when a previous
-            # early-skip means the file's tail is still unparsed)
-            if not force_full and str(file_path) in parsed_source_files:
+            # early-skip means the file's tail is still unparsed, or when this
+            # file carries a crash-resume marker).
+            if (
+                not force_full
+                and resume_file != file_path_str
+                and file_path_str in parsed_source_files
+            ):
                 logger.debug("Already parsed: %s", file_path)
                 continue
 
             # Pre-skip when content_hash has been seen ≥3 times across archives.
-            if output.output_hash and output.output_hash in preskip_hashes:
+            # The marked resume file is never pre-skipped: its marker must be
+            # consumed and cleared.
+            if (
+                resume_file != file_path_str
+                and output.output_hash
+                and output.output_hash in preskip_hashes
+            ):
                 logger.info(
                     "Pre-skip (content seen ≥%d times): %s",
                     _preskip_dup_threshold + 1, output.output_filename,
@@ -1150,15 +1301,25 @@ class ParseStage(PipelineStage):
 
             # Record the in-progress file durably before the first row is
             # inserted: if this process is hard-killed mid-file, startup
-            # recovery deletes this file's rows so the unparsed tail is not
-            # skipped by the pre-skip on the next run.
-            _set_parse_marker(ctx.session, job.id, str(file_path))
+            # recovery resumes it from the persisted credential count instead
+            # of re-probing the already-committed prefix.
+            _set_parse_marker(
+                ctx.session,
+                job.id,
+                file_path_str,
+                resume=resume_count,
+                mode=file_mode,
+                output_hash=output.output_hash,
+            )
 
             # Stream credentials in batches to keep memory bounded.
             # Each batch is: compute hashes → DB dedup check → insert → flush → discard.
             # Cross-batch deduplication is handled by the DB hash check; seen_in_batch
             # only deduplicates within the current batch.
             batch: list = []
+            # Sequence position: every yielded credential (including the ones
+            # skipped by a resume) advances this, so the checkpoint value is
+            # always a valid resume count for the same mode.
             file_cred_count = 0
 
             async def _flush_batch(b: list) -> tuple[int, int]:
@@ -1333,24 +1494,42 @@ class ParseStage(PipelineStage):
             # Large files (>20MB) are parsed in parallel worker processes via
             # _iter_parallel_credentials; small files keep the sequential path
             # (lower overhead, and the tests exercise that path directly).
-            # The file was already confirmed to exist above; a single stat()
-            # (with the missing-file fallback preserved) avoids a second
-            # filesystem round-trip per credential file.
-            try:
-                file_size = file_path.stat().st_size
-            except OSError:
-                file_size = 0
-            workers = self._parallel_worker_count()
+            # file_size/workers/mode were resolved above (before the resume
+            # decision) so the parallel branch reuses them.
+            # The mode actually producing the yields (the parallel fallback
+            # switches it) and the resume count valid for that mode.
+            active_mode = file_mode
+            seq_skip = resume_count
+
+            def _checkpoint() -> None:
+                """Advance the crash-resume marker AFTER the row commit.
+
+                Post-commit so the marker can never point past durable rows.
+                """
+                _update_parse_marker(
+                    ctx.session,
+                    job.id,
+                    resume=file_cred_count,
+                    mode=active_mode,
+                    output_hash=output.output_hash,
+                )
 
             async def _sequential_parse() -> None:
                 nonlocal batch, file_cred_count, credentials_found
                 nonlocal duplicates_found, batches_since_commit
                 nonlocal dup_batches_seen, file_skipped_as_dup
+                nonlocal seq_skip
                 for cred in iter_credentials_file(file_path):
                     if file_skipped_as_dup:
                         break
-                    batch.append(cred)
                     file_cred_count += 1
+                    if seq_skip > 0:
+                        # Already committed by a previous attempt; the
+                        # sequential parser is deterministic for an unchanged
+                        # file, so counting skips the exact committed prefix.
+                        seq_skip -= 1
+                        continue
+                    batch.append(cred)
 
                     if len(batch) >= _BATCH_SIZE:
                         new, dups = await _flush_batch(batch)
@@ -1366,6 +1545,7 @@ class ParseStage(PipelineStage):
                         if batches_since_commit >= 2:
                             ctx.session.commit()
                             batches_since_commit = 0
+                            _checkpoint()
                         await asyncio.sleep(0)
                         if not force_full and _is_dup_batch(new, dups, _BATCH_SIZE):
                             dup_batches_seen += 1
@@ -1382,19 +1562,27 @@ class ParseStage(PipelineStage):
             # hashing with the main process's DB inserts — the guard must not
             # be `> 1`, which silently fell back to the fully-serialized
             # sequential path whenever TELECRIME_PARSE_WORKERS=1.
-            if file_size >= _PARALLEL_PARSE_MIN_BYTES and workers >= 1:
+            if use_parallel:
                 try:
                     logger.info(
                         "Parsing %s in parallel (%d workers, %.1f MB)",
                         file_path.name, workers, file_size / 1024 / 1024,
                     )
+                    skip_remaining = resume_count
                     async for tup in self._iter_parallel_credentials(
-                        file_path, str(file_path), workers
+                        file_path, file_path_str, workers
                     ):
                         if file_skipped_as_dup:
                             break
-                        batch.append(tup)
                         file_cred_count += 1
+                        if skip_remaining > 0:
+                            # Already committed by a previous attempt; the
+                            # parallel yield sequence is deterministic for the
+                            # same file/mode, so counting skips the exact
+                            # committed prefix without a DB probe.
+                            skip_remaining -= 1
+                            continue
+                        batch.append(tup)
 
                         if len(batch) >= _BATCH_SIZE:
                             new, dups = await _flush_batch(batch)
@@ -1410,6 +1598,7 @@ class ParseStage(PipelineStage):
                             if batches_since_commit >= 2:
                                 ctx.session.commit()
                                 batches_since_commit = 0
+                                _checkpoint()
                             await asyncio.sleep(0)
                             if not force_full and _is_dup_batch(new, dups, _BATCH_SIZE):
                                 dup_batches_seen += 1
@@ -1436,8 +1625,14 @@ class ParseStage(PipelineStage):
                     # the parallel path: _flush_batch dispatches on the first
                     # item's type, and the sequential fallback appends
                     # Credential objects — a mixed batch would crash the flush.
+                    # The fallback re-parses from the START in sequential mode,
+                    # so the parallel resume prefix does not apply: reset the
+                    # counters and checkpoint under the new mode only after its
+                    # first commit (an under-count is always safe).
                     batch = []
                     file_cred_count = 0
+                    seq_skip = 0
+                    active_mode = "sequential"
                     await _sequential_parse()
             else:
                 await _sequential_parse()
@@ -1450,6 +1645,7 @@ class ParseStage(PipelineStage):
                 ctx.display.update_creds(ctx.credentials_parsed + credentials_found)
             # Commit after each file to release lock promptly
             ctx.session.commit()
+            _checkpoint()
 
             if file_skipped_as_dup:
                 # The confidence heuristic stopped early; the file's tail may
@@ -1522,6 +1718,12 @@ class ParseStage(PipelineStage):
                     credentials_found,
                     duplicates_found,
                 )
+
+        if resume_file and not resume_seen:
+            # The marked file is not among this job's credential outputs
+            # (removed or renamed): drop the stale marker so it cannot keep
+            # blocking the pre-skip for this job on every run.
+            _clear_parse_marker(ctx.session, job.id)
 
         # Send one notification per archive (not per file)
         if ctx.notifier and (credentials_found or duplicates_found):

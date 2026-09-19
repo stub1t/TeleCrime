@@ -294,6 +294,9 @@ def _reset_module_caches() -> None:
     if web_app is not None:
         web_app._db_column_cache.clear()
         web_app._cred_agg_allowed_cache.clear()
+        # Once-per-process skip log flag; a test that stubs the probe must not
+        # leak its "already logged" state into the next test.
+        web_app._watchlist_ft_skip_logged = False
 
     progress = sys.modules.get("telecrime.pipeline.progress")
     if progress is not None:
