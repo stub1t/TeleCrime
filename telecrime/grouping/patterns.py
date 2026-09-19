@@ -152,9 +152,9 @@ def group_by_pattern(attachments: list[FileAttachment]) -> list[GroupingResult]:
                 by_message[getattr(p[0], "message_id", None)].append(p)
 
             message_sets: list[list[tuple[FileAttachment, int | None]]] = []
-            for msg_parts in by_message.values():
-                msg_explicit = [p for p in msg_parts if p[1] is not None]
-                msg_no_part = [p[0] for p in msg_parts if p[1] is None]
+            for explicit_msg_parts in by_message.values():
+                msg_explicit = [p for p in explicit_msg_parts if p[1] is not None]
+                msg_no_part = [p[0] for p in explicit_msg_parts if p[1] is None]
                 if uses_part_n:
                     # Bare .rar files (e.g. Archive.rar mixed with
                     # Archive.part1.rar) are standalone uploads, not part of
@@ -166,15 +166,15 @@ def group_by_pattern(attachments: list[FileAttachment]) -> list[GroupingResult]:
                     # Old-style RAR: companion .rar accompanies the
                     # .r00/.r01 series. A no-part-only message set has an
                     # empty index set and is absorbed by a matching series.
-                    message_sets.append(list(msg_parts))
+                    message_sets.append(list(explicit_msg_parts))
 
             merged_sets: list[list[tuple[FileAttachment, int | None]]] = []
             for msg_set in message_sets:
                 indexes = {p[1] for p in msg_set if p[1] is not None}
-                for existing in merged_sets:
-                    existing_indexes = {p[1] for p in existing if p[1] is not None}
+                for existing_set in merged_sets:
+                    existing_indexes = {p[1] for p in existing_set if p[1] is not None}
                     if indexes.isdisjoint(existing_indexes):
-                        existing.extend(msg_set)
+                        existing_set.extend(msg_set)
                         break
                 else:
                     merged_sets.append(list(msg_set))
@@ -220,24 +220,26 @@ def group_by_pattern(attachments: list[FileAttachment]) -> list[GroupingResult]:
             # No explicit part numbers — group by message instead.
             # Files in the same message belong together; files in
             # different messages are independent archives.
-            by_message: dict[int | None, list[FileAttachment]] = defaultdict(list)
+            by_message_no_part: dict[int | None, list[FileAttachment]] = defaultdict(list)
             for att, _ in parts:
                 msg_id = att.message_id if hasattr(att, "message_id") else None
-                by_message[msg_id].append(att)
+                by_message_no_part[msg_id].append(att)
 
-            for msg_id, msg_parts in by_message.items():
-                if len(msg_parts) > 1:
+            for _msg_id, no_part_msg_parts in by_message_no_part.items():
+                if len(no_part_msg_parts) > 1:
                     # Multiple files in the same message → group them
                     results.append(GroupingResult(
-                        base_name=msg_parts[0].detected_base_name or msg_parts[0].filename or base_name,
-                        attachments=msg_parts,
-                        expected_parts=len(msg_parts),
-                        part_numbers={a.id: idx for idx, a in enumerate(msg_parts)},
+                        base_name=no_part_msg_parts[0].detected_base_name
+                        or no_part_msg_parts[0].filename
+                        or base_name,
+                        attachments=no_part_msg_parts,
+                        expected_parts=len(no_part_msg_parts),
+                        part_numbers={a.id: idx for idx, a in enumerate(no_part_msg_parts)},
                         confidence=0.8,
                     ))
                 else:
                     # Single file per message → standalone
-                    standalone.append(msg_parts[0])
+                    standalone.append(no_part_msg_parts[0])
 
     # Add standalone files as single-file groups
     for attachment in standalone:

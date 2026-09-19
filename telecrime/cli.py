@@ -972,7 +972,11 @@ def retry(
     terminal: bool = typer.Option(False, "--terminal", help="Include terminal failures too"),
 ) -> None:
     """Retry failed jobs."""
+    from typing import cast
+
     from sqlalchemy import select, update
+    from sqlalchemy.engine import CursorResult
+    from sqlalchemy.sql.elements import ColumnElement
 
     from telecrime.models import ArchiveGroup, DownloadArtifact, ExtractionJob
     from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
@@ -989,7 +993,9 @@ def retry(
             statuses = [DownloadStatus.FAILED]
             if terminal:
                 statuses.append(DownloadStatus.FAILED_TERMINAL)
-            download_filter = [DownloadArtifact.status.in_(statuses)]
+            download_filter: list[ColumnElement[bool]] = [
+                DownloadArtifact.status.in_(statuses)
+            ]
             if job_id:
                 download_filter.append(DownloadArtifact.id == job_id)
 
@@ -999,14 +1005,16 @@ def retry(
                 .values(status=DownloadStatus.PENDING, error_message=None),
                 execution_options={"synchronize_session": False},
             )
-            reset_count += int(result.rowcount or 0)
+            reset_count += int(cast(CursorResult, result).rowcount or 0)
 
         if extractions or (not downloads and not extractions):
             # Reset failed extractions
             extraction_statuses = [ExtractionStatus.FAILED, ExtractionStatus.PASSWORD_NEEDED]
             if terminal:
                 extraction_statuses.append(ExtractionStatus.FAILED_TERMINAL)
-            job_filter = [ExtractionJob.status.in_(extraction_statuses)]
+            job_filter: list[ColumnElement[bool]] = [
+                ExtractionJob.status.in_(extraction_statuses)
+            ]
             if job_id:
                 job_filter.append(ExtractionJob.id == job_id)
 
@@ -1036,7 +1044,7 @@ def retry(
                 ),
                 execution_options={"synchronize_session": False},
             )
-            reset_count += int(result.rowcount or 0)
+            reset_count += int(cast(CursorResult, result).rowcount or 0)
 
         session.commit()
         console.print(f"[green]Reset {reset_count} jobs for retry[/green]")

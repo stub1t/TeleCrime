@@ -5566,7 +5566,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     }
                     for conv in rows
                 ),
-                key=lambda row: (-row["cred_count"], row["conv"].id),
+                key=lambda row: (-int(row["cred_count"]), row["conv"].id),
             )
 
             return templates.TemplateResponse(

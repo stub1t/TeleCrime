@@ -392,7 +392,8 @@ class FinalizeStage(PipelineStage):
         for i in range(0, len(group_ids), self._BATCH_SIZE):
             batch = group_ids[i : i + self._BATCH_SIZE]
             statuses.update(
-                ctx.session.execute(
+                (row[0], row[1])
+                for row in ctx.session.execute(
                     select(ArchiveGroup.id, ArchiveGroup.status).where(
                         ArchiveGroup.id.in_(batch)
                     )
