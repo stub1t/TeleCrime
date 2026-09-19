@@ -978,7 +978,12 @@ def retry(
     from sqlalchemy.engine import CursorResult
     from sqlalchemy.sql.elements import ColumnElement
 
-    from telecrime.models import ArchiveGroup, DownloadArtifact, ExtractionJob
+    from telecrime.models import (
+        ArchiveGroup,
+        ArchiveGroupPart,
+        DownloadArtifact,
+        ExtractionJob,
+    )
     from telecrime.states import DownloadStatus, ExtractionStatus, GroupStatus
 
     _, engine = get_config_and_engine(config_path)
@@ -999,6 +1004,24 @@ def retry(
             if job_id:
                 download_filter.append(DownloadArtifact.id == job_id)
 
+            # Capture the groups whose failed downloads are about to be
+            # requeued. _next_pending_artifact excludes FAILED_TERMINAL groups,
+            # so without flipping the owning group back to a selectable status
+            # the reset artifacts are never downloaded (the retry silently
+            # did nothing for terminal groups).
+            resettable_group_ids = [
+                row[0]
+                for row in session.execute(
+                    select(ArchiveGroupPart.group_id)
+                    .join(
+                        DownloadArtifact,
+                        DownloadArtifact.id == ArchiveGroupPart.artifact_id,
+                    )
+                    .where(*download_filter)
+                    .distinct()
+                )
+            ]
+
             result = session.execute(
                 update(DownloadArtifact)
                 .where(*download_filter)
@@ -1006,6 +1029,20 @@ def retry(
                 execution_options={"synchronize_session": False},
             )
             reset_count += int(cast(CursorResult, result).rowcount or 0)
+
+            if resettable_group_ids:
+                session.execute(
+                    update(ArchiveGroup)
+                    .where(
+                        ArchiveGroup.id.in_(resettable_group_ids),
+                        # CLEANED groups keep their reclaimed state: their
+                        # archives were deleted, so a download retry there is
+                        # not what the operator asked for.
+                        ArchiveGroup.status == GroupStatus.FAILED_TERMINAL,
+                    )
+                    .values(status=GroupStatus.INCOMPLETE),
+                    execution_options={"synchronize_session": False},
+                )
 
         if extractions or (not downloads and not extractions):
             # Reset failed extractions

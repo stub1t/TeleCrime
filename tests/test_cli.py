@@ -189,8 +189,9 @@ class TestCliRetry:
                 result = runner.invoke(app, ["retry", "--downloads", "--extractions"])
 
         assert result.exit_code == 0
+        # groups SELECT (to flip terminal groups of requeued downloads),
         # downloads UPDATE, archive_groups UPDATE, extraction_jobs UPDATE
-        assert mock_sess.execute.call_count == 3
+        assert mock_sess.execute.call_count == 4
         mock_sess.query.assert_not_called()
         assert "Reset 4 jobs for retry" in result.stdout
 
@@ -202,6 +203,7 @@ class TestCliRetry:
         """
         from telecrime.database import get_engine, init_db
         from telecrime.models import (
+            ArchiveGroupPart,
             Conversation,
             DownloadArtifact,
             ExtractedOutput,
@@ -257,7 +259,21 @@ class TestCliRetry:
                 expected_part_count=1,
                 status=GroupStatus.EXTRACTED,
             )
-            session.add_all([failed_group, done_group])
+            terminal_group = ArchiveGroup(
+                fingerprint="retry-terminal",
+                base_name="c.zip",
+                expected_part_count=1,
+                status=GroupStatus.FAILED_TERMINAL,
+            )
+            session.add_all([failed_group, done_group, terminal_group])
+            session.flush()
+            # The terminal artifact belongs to the terminal group: retrying its
+            # download must flip the group back to a selectable status.
+            session.add(
+                ArchiveGroupPart(
+                    group_id=terminal_group.id, artifact_id=terminal.id, part_index=0
+                )
+            )
             session.flush()
             failed_job = ExtractionJob(
                 group_id=failed_group.id,
@@ -308,6 +324,13 @@ class TestCliRetry:
                 == ExtractionStatus.COMPLETED
             )
 
+        # The terminal group stays terminal while its download is terminal.
+        with get_session(engine) as session:
+            assert (
+                session.get(ArchiveGroup, terminal_group.id).status
+                == GroupStatus.FAILED_TERMINAL
+            )
+
         # --terminal widens the reset to permanently failed rows.
         with patch("telecrime.cli.get_config_and_engine", return_value=(MagicMock(), engine)):
             result = runner.invoke(app, ["retry", "--downloads", "--terminal"])
@@ -318,6 +341,12 @@ class TestCliRetry:
             assert (
                 session.get(DownloadArtifact, terminal.id).status
                 == DownloadStatus.PENDING
+            )
+            # Without this flip the requeued artifact is never selected:
+            # _next_pending_artifact skips FAILED_TERMINAL groups.
+            assert (
+                session.get(ArchiveGroup, terminal_group.id).status
+                == GroupStatus.INCOMPLETE
             )
 
 
