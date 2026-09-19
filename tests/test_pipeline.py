@@ -745,6 +745,153 @@ class TestExtractStageDirect:
         assert group.status in (GroupStatus.READY, GroupStatus.FAILED)
 
 
+class TestPasswordCandidateExhaustion:
+    """A password that ever worked must never be blacklisted by siblings."""
+
+    async def _build_group(self, session, tmp_path, *, username=None):
+        from sqlalchemy.orm import joinedload
+
+        from telecrime.models import (
+            ArchiveGroup,
+            ArchiveGroupPart,
+            Conversation,
+            DownloadArtifact,
+            FileAttachment,
+            Message,
+        )
+
+        conv = Conversation(platform_id=901, conversation_type="channel", username=username)
+        session.add(conv)
+        session.flush()
+        msg = Message(
+            conversation_id=conv.id,
+            platform_id=11,
+            platform_timestamp=datetime.now(UTC),
+            text="ulps",
+        )
+        session.add(msg)
+        session.flush()
+        attachment = FileAttachment(
+            message_id=msg.id,
+            platform_file_id="exhaustion-file",
+            filename="dump.rar",
+            archive_type="rar",
+        )
+        session.add(attachment)
+        session.flush()
+        dl_path = tmp_path / "downloads" / "dump.rar"
+        dl_path.parent.mkdir(parents=True, exist_ok=True)
+        dl_path.write_bytes(b"Rar!\x1a\x07\x01\x00")
+        artifact = DownloadArtifact(attachment_id=attachment.id, local_path=str(dl_path))
+        session.add(artifact)
+        session.flush()
+        group = ArchiveGroup(
+            fingerprint="exhaustion-group",
+            base_name="dump.rar",
+            expected_part_count=1,
+            detected_part_count=1,
+            status=GroupStatus.READY,
+        )
+        session.add(group)
+        session.flush()
+        session.add(ArchiveGroupPart(group_id=group.id, artifact_id=artifact.id, part_index=0))
+        session.commit()
+        return session.get(
+            ArchiveGroup,
+            group.id,
+            options=[
+                joinedload(ArchiveGroup.parts)
+                .joinedload(ArchiveGroupPart.artifact)
+                .joinedload(DownloadArtifact.attachment)
+            ],
+        )
+
+    @pytest.mark.asyncio
+    async def test_succeeded_password_is_not_exhausted(self, session, test_config, tmp_path):
+        """A value with times_succeeded > 0 stays available even at 3 failures.
+
+        Regression: candidate `https://t.me/NewWlfrCloud` had succeeded on two
+        WLFR archives and failed on three that used a sibling password. The
+        exhaustion filter dropped it (and every same-valued row) conversation-
+        wide, so the very next archive using the working password reported
+        "all 1 password candidates failed" and was never extracted.
+        """
+        from telecrime.models import PasswordCandidate
+        from telecrime.states import PasswordScope
+
+        group = await self._build_group(session, tmp_path, username="wlfrcloud")
+        conv_id = group.parts[0].artifact.attachment.message.conversation_id
+        session.add_all([
+            PasswordCandidate(
+                value="https://t.me/WLFRCloud",
+                scope=PasswordScope.MESSAGE,
+                extraction_method="caption",
+                confidence=0.8,
+                conversation_id=conv_id,
+                times_succeeded=2,
+                times_failed=3,
+            ),
+            PasswordCandidate(
+                value="never-worked",
+                scope=PasswordScope.MESSAGE,
+                extraction_method="caption",
+                confidence=0.8,
+                conversation_id=conv_id,
+                times_succeeded=0,
+                times_failed=3,
+            ),
+        ])
+        session.commit()
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        stage = ExtractStage()
+        candidates = await stage._get_password_candidates(ctx, group)
+
+        values = [c.value for c in candidates]
+        assert "https://t.me/WLFRCloud" in values
+        # Values that never worked are still dropped after MAX failures.
+        assert "never-worked" not in values
+
+    @pytest.mark.asyncio
+    async def test_duplicate_blacklisted_value_does_not_suppress_fresh_row(
+        self, session, test_config, tmp_path
+    ):
+        """A blacklisted (0-success) row must not filter a same-valued success."""
+        from telecrime.models import PasswordCandidate
+        from telecrime.states import PasswordScope
+
+        group = await self._build_group(session, tmp_path, username="wlfrcloud")
+        conv_id = group.parts[0].artifact.attachment.message.conversation_id
+        session.add_all([
+            PasswordCandidate(
+                value="@NewWlfrCloud",
+                scope=PasswordScope.NEARBY,
+                extraction_method="nearby",
+                confidence=0.5,
+                conversation_id=conv_id,
+                times_succeeded=0,
+                times_failed=3,
+            ),
+            PasswordCandidate(
+                value="@NewWlfrCloud",
+                scope=PasswordScope.MESSAGE,
+                extraction_method="caption",
+                confidence=0.9,
+                conversation_id=conv_id,
+                times_succeeded=1,
+                times_failed=0,
+            ),
+        ])
+        session.commit()
+
+        ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
+        stage = ExtractStage()
+        candidates = await stage._get_password_candidates(ctx, group)
+
+        values = [c.value for c in candidates]
+        assert "@NewWlfrCloud" in values
+
+
 class TestExtractStageRarFallback:
     """7z→unrar fallback must not erase accumulated password failures."""
 
@@ -4077,6 +4224,70 @@ class TestStartupRecoveryAttemptBatching:
             .all()
         )
         assert len(pending) == 2
+
+
+class TestPartialParseRecovery:
+    """A hard kill mid-file must not lose that file's unparsed tail."""
+
+    def test_marker_lifecycle(self, session):
+        from telecrime.models.pipeline_state import PipelineState
+        from telecrime.pipeline.parse import _clear_parse_marker, _set_parse_marker
+
+        _set_parse_marker(session, 7, "/x/big.txt")
+        row = session.get(PipelineState, "parse_in_progress:7")
+        assert row is not None and row.value_text == "/x/big.txt"
+
+        _clear_parse_marker(session, 7)
+        assert session.get(PipelineState, "parse_in_progress:7") is None
+        # Clearing twice is harmless.
+        _clear_parse_marker(session, 7)
+
+    def test_startup_recovery_removes_partial_file_rows(
+        self, session, test_config, tmp_path
+    ):
+        """Only the marked (in-progress) file is purged; sibling files survive.
+
+        The parse pre-skip treats any committed row as "file parsed"; a run
+        killed after some batches of one file would otherwise skip that file
+        forever and lose its tail.
+        """
+        from telecrime.models import ParsedCredential
+        from telecrime.models.pipeline_state import PipelineState
+        from telecrime.pipeline.orchestrator import _run_startup_recovery
+
+        session.add_all(
+            [
+                ParsedCredential(
+                    url="",
+                    username="",
+                    password="",
+                    extraction_job_id=7,
+                    source_file="/x/big.txt",
+                    credential_hash="a" * 64,
+                ),
+                ParsedCredential(
+                    url="",
+                    username="",
+                    password="",
+                    extraction_job_id=7,
+                    source_file="/x/other.txt",
+                    credential_hash="b" * 64,
+                ),
+            ]
+        )
+        session.commit()
+        from telecrime.pipeline.parse import _set_parse_marker
+
+        _set_parse_marker(session, 7, "/x/big.txt")
+
+        _run_startup_recovery(session, test_config)
+        session.expire_all()
+
+        remaining = (
+            session.execute(select(ParsedCredential.source_file)).scalars().all()
+        )
+        assert remaining == ["/x/other.txt"]
+        assert session.get(PipelineState, "parse_in_progress:7") is None
 
 
 class TestFinalizeStageCredentialCount:

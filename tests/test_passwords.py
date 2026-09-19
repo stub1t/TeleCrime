@@ -196,6 +196,37 @@ class TestExtractPasswordsFromText:
         assert "@BetaCloud" in passwords
         assert "@GammaCloud" in passwords
 
+    def test_cyrillic_homoglyph_marker_is_recognized(self):
+        """Regression: a Cyrillic 'а' in "pаss:" must still find the password.
+
+        Real captions from stealer channels use "pаss:" with U+0430; the
+        Latin-only marker regex missed it and the archive was never unlocked
+        even though the password was printed in the message.
+        """
+        results = extract_passwords_from_text(
+            "pаss: **`https://t.me/WichLoveFromR`**"
+        )
+        passwords = [p for p, _ in results]
+        assert "https://t.me/WichLoveFromR" in passwords
+
+    def test_cyrillic_homoglyph_marker_accented_word(self):
+        """Uppercase/full-Cyrillic homoglyphs must match too."""
+        results = extract_passwords_from_text("РАSS: @NewWlfrCloud")
+        passwords = [p for p, _ in results]
+        assert "@NewWlfrCloud" in passwords
+
+    def test_homoglyph_password_value_keeps_original_chars(self):
+        """Translation is for matching only: value characters are untouched."""
+        results = extract_passwords_from_text("pass: Пароль123")
+        passwords = [p for p, _ in results]
+        assert "Пароль123" in passwords
+
+    def test_inline_homoglyph_marker(self):
+        """archive_pаss=... filename form is recognized without altering value."""
+        results = extract_inline_passwords("dump_pаss=Secr3t.zip")
+        passwords = [p for p, _ in results]
+        assert "Secr3t" in passwords
+
 
 class TestIsValidPassword:
     """Tests for _is_valid_password helper."""

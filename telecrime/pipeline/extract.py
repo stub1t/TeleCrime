@@ -7,7 +7,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import joinedload
 
 from telecrime.extractor.interface import ExtractionResult
@@ -844,6 +844,12 @@ class ExtractStage(PipelineStage):
                 if result.success:
                     job.used_password_id = pwd_candidate.id
                     pwd_candidate.times_succeeded += 1
+                    # A success proves the value works for this conversation:
+                    # clear accumulated failures, otherwise three archives
+                    # posted with a *different* password blacklist the working
+                    # channel password forever (times_failed >= MAX is never
+                    # reset).
+                    pwd_candidate.times_failed = 0
                     logger.info("Password succeeded for %s", main_archive.name)
                     break
                 elif result.wrong_password:
@@ -885,7 +891,17 @@ class ExtractStage(PipelineStage):
                 select(PasswordCandidate)
                 .where(
                     PasswordCandidate.conversation_id == message.conversation_id,
-                    PasswordCandidate.times_failed < MAX_FAILED_ATTEMPTS,
+                    # A value that has ever succeeded is never exhausted: a
+                    # channel reuses one password across most archives, and the
+                    # three failures that trip MAX_FAILED_ATTEMPTS usually come
+                    # from sibling archives protected by a *different*
+                    # password. Dropping it here (and again by value below)
+                    # left the working password untried and the archive stuck
+                    # in PASSWORD_NEEDED forever.
+                    or_(
+                        PasswordCandidate.times_failed < MAX_FAILED_ATTEMPTS,
+                        PasswordCandidate.times_succeeded > 0,
+                    ),
                 )
                 .order_by(
                     PasswordCandidate.times_succeeded.desc(),
@@ -904,11 +920,25 @@ class ExtractStage(PipelineStage):
         # CRITICAL detail: the `existing` query above AUTOFLUSHED the fresh
         # (0,0) candidate rows into the DB — they come back in `existing`
         # and would survive any filter applied to new_candidates only. The
-        # exhausted values must be filtered from BOTH pools by VALUE.
+        # exhausted values must be filtered from BOTH pools by VALUE — except
+        # values that ever succeeded (see `_succeeded_values` below).
+        _succeeded_values = (
+            select(PasswordCandidate.value)
+            .where(
+                PasswordCandidate.conversation_id == message.conversation_id,
+                PasswordCandidate.times_succeeded > 0,
+            )
+            .scalar_subquery()
+        )
         _failed_rows = ctx.session.execute(
             select(PasswordCandidate.value).where(
                 PasswordCandidate.conversation_id == message.conversation_id,
                 PasswordCandidate.times_failed >= MAX_FAILED_ATTEMPTS,
+                # Same rule as the `existing` query: if ANY row with this value
+                # has ever succeeded, the value is not exhausted. Filtering by
+                # a single blacklisted duplicate row would suppress the fresh,
+                # working candidate with the same value.
+                PasswordCandidate.value.not_in(_succeeded_values),
             )
         ).scalars().all()
         exhausted = set(_failed_rows)
@@ -917,7 +947,12 @@ class ExtractStage(PipelineStage):
             new_candidates = [c for c in new_candidates if c.value not in exhausted]
         # Carry accumulated failure/success history onto fresh candidates so
         # their ranking reflects reality (rank_passwords boosts success).
-        _history = {c.value: (c.times_failed, c.times_succeeded) for c in existing}
+        # setdefault (not a plain dict comp) keeps the best row per value:
+        # `existing` is ordered by successes DESC, and a duplicate row later
+        # in the list must not overwrite the successful row's counters.
+        _history: dict[str, tuple[int, int]] = {}
+        for c in existing:
+            _history.setdefault(c.value, (c.times_failed, c.times_succeeded))
         for c in new_candidates:
             h = _history.get(c.value)
             if h is not None and c.times_failed == 0 and c.times_succeeded == 0:

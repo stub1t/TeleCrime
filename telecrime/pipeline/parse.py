@@ -21,6 +21,7 @@ from sqlalchemy.orm import selectinload
 
 from telecrime.database import get_dialect_insert
 from telecrime.models import ArchiveGroup, ExtractionJob, ParsedCredential
+from telecrime.models.pipeline_state import PipelineState
 from telecrime.models.system_info import SystemInfoRecord
 from telecrime.pipeline.orchestrator import PipelineContext, PipelineStage
 from telecrime.states import ExtractionStatus, GroupStatus
@@ -59,6 +60,78 @@ _PARALLEL_PARSE_IDLE_WAIT_SECONDS = 1.0
 # full parse of that file instead of early-skipping at the same point forever
 # (the duplicate-heavy prefix is deterministic).
 _EARLY_SKIP_CODE = "EARLY_SKIP"
+
+# pipeline_state key prefix for the file currently being parsed. A hard kill
+# (SIGKILL / OOM / container restart mid-file) leaves rows from the file's
+# already-flushed batches committed. The next run's per-file pre-skip
+# (parsed_source_files) skips any file with rows, so without this marker the
+# file's unparsed tail would be lost forever. Startup recovery deletes the
+# marked file's rows so it is re-parsed from the beginning; ON CONFLICT dedups
+# the re-inserts.
+_PARSE_MARKER_PREFIX = "parse_in_progress:"
+
+
+def _set_parse_marker(session, job_id: int, source_file: str) -> None:
+    """Durably record the file about to be parsed (pre-parse commit)."""
+    key = f"{_PARSE_MARKER_PREFIX}{job_id}"
+    row = session.get(PipelineState, key)
+    if row is None:
+        row = PipelineState(key=key)
+        session.add(row)
+    row.value_int = job_id
+    row.value_text = source_file
+    session.commit()
+
+
+def _clear_parse_marker(session, job_id: int) -> None:
+    """Drop the in-progress marker after a file finished (or was cleaned)."""
+    session.execute(
+        delete(PipelineState).where(PipelineState.key == f"{_PARSE_MARKER_PREFIX}{job_id}")
+    )
+    session.commit()
+
+
+def _recover_partial_parses(session) -> int:
+    """Delete rows of files left mid-parse by a crashed run.
+
+    Returns the number of files recovered (markers removed). Called by
+    startup recovery before any parse work so the pre-skip cannot treat a
+    partially parsed file as complete.
+    """
+    markers = (
+        session.execute(
+            select(PipelineState).where(PipelineState.key.like(f"{_PARSE_MARKER_PREFIX}%"))
+        )
+        .scalars()
+        .all()
+    )
+    recovered = 0
+    for marker in markers:
+        job_id = marker.value_int
+        source_file = marker.value_text
+        removed = 0
+        if job_id and source_file:
+            removed = (
+                session.execute(
+                    delete(ParsedCredential).where(
+                        ParsedCredential.extraction_job_id == job_id,
+                        ParsedCredential.source_file == source_file,
+                    )
+                ).rowcount
+                or 0
+            )
+        session.delete(marker)
+        recovered += 1
+        logger.warning(
+            "Startup recovery: removed %d partial row(s) from file left mid-parse "
+            "(%s, job %s) — it will be parsed again",
+            removed,
+            source_file,
+            job_id,
+        )
+    if recovered:
+        session.commit()
+    return recovered
 
 
 def _iter_line_chunks(
@@ -1075,6 +1148,12 @@ class ParseStage(PipelineStage):
                 )
                 continue
 
+            # Record the in-progress file durably before the first row is
+            # inserted: if this process is hard-killed mid-file, startup
+            # recovery deletes this file's rows so the unparsed tail is not
+            # skipped by the pre-skip on the next run.
+            _set_parse_marker(ctx.session, job.id, str(file_path))
+
             # Stream credentials in batches to keep memory bounded.
             # Each batch is: compute hashes → DB dedup check → insert → flush → discard.
             # Cross-batch deduplication is handled by the DB hash check; seen_in_batch
@@ -1430,6 +1509,10 @@ class ParseStage(PipelineStage):
                 # marker served its purpose.
                 job.last_error_code = None
                 ctx.session.commit()
+
+            # File fully consumed (or its partial rows intentionally cleaned by
+            # the early-skip branch): the marker has served its purpose.
+            _clear_parse_marker(ctx.session, job.id)
 
             if file_cred_count:
                 logger.info(

@@ -708,6 +708,22 @@ def _run_startup_recovery(session: Session, config: Config) -> None:
     cleanup (batch mode's AcquireStage.run does its own)."""
     from telecrime.pipeline.acquire import AcquireStage
 
+    # Crash recovery: a hard kill mid-file leaves that file's already-flushed
+    # rows committed. The parse pre-skip treats any row as "file done", so the
+    # unparsed tail would be skipped forever. Delete the marked file's rows
+    # before any parse work so it is re-parsed from the start.
+    try:
+        from telecrime.pipeline.parse import _recover_partial_parses
+
+        _partial_files = _recover_partial_parses(session)
+        if _partial_files:
+            logger.info(
+                "Startup recovery: %d file(s) left mid-parse will be re-parsed",
+                _partial_files,
+            )
+    except Exception as _e:
+        logger.warning("Partial-parse recovery failed: %s", _e)
+
     acquire_stage = AcquireStage()
 
     # Startup recovery: reset any artifacts stuck in DOWNLOADING state

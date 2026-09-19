@@ -69,6 +69,28 @@ INLINE_PASSWORD_PATTERN = re.compile(
 
 MAX_FAILED_ATTEMPTS = 3
 
+# Cyrillic/Greek lookalikes used to disguise password markers ("pаss:" with
+# U+0430, "раss:" with U+0440). Stealer channels type labels like "pаss" with
+# a Cyrillic 'а' so scrapers miss the real password while humans read it
+# normally. The mapping is 1:1 per character, so a translated copy can be
+# searched with match spans that still index the original text (a lower() copy
+# cannot: some Unicode case mappings change length).
+_HOMOGLYPH_TABLE = str.maketrans({
+    # Cyrillic
+    "а": "a", "А": "a", "в": "b", "В": "b", "е": "e", "Е": "e",
+    "ё": "e", "Ё": "e", "к": "k", "К": "k", "м": "m", "М": "m",
+    "н": "h", "Н": "h", "о": "o", "О": "o", "р": "p", "Р": "p",
+    "с": "c", "С": "c", "т": "t", "Т": "t", "у": "y", "У": "y",
+    "х": "x", "Х": "x", "і": "i", "І": "i", "ј": "j", "Ј": "j",
+    "ѕ": "s", "Ѕ": "s", "г": "r", "Г": "r", "ԁ": "d", "Ԁ": "d",
+    "ԛ": "q", "Ԛ": "q", "ѡ": "w", "Ѡ": "w",
+    # Greek
+    "α": "a", "Α": "a", "ε": "e", "Ε": "e", "ο": "o", "Ο": "o",
+    "ρ": "p", "Ρ": "p", "τ": "t", "Τ": "t", "υ": "u", "Υ": "u",
+    "ν": "v", "Ν": "v", "χ": "x", "Χ": "x", "κ": "k", "Κ": "k",
+    "ι": "i", "Ι": "i", "ς": "s",
+})
+
 
 def extract_inline_passwords(text: str) -> list[tuple[str, float]]:
     """Extract inline password patterns from filenames or short strings."""
@@ -77,8 +99,13 @@ def extract_inline_passwords(text: str) -> list[tuple[str, float]]:
 
     results: list[tuple[str, float]] = []
     seen: set[str] = set()
-    for match in INLINE_PASSWORD_PATTERN.finditer(text):
-        pwd = normalize_password(match.group(1))
+    # Match on a 1:1 homoglyph-translated copy so "pаss=..." is recognized,
+    # then slice the original text so the password value keeps its real
+    # characters.
+    match_text = text.translate(_HOMOGLYPH_TABLE)
+    for match in INLINE_PASSWORD_PATTERN.finditer(match_text):
+        start, end = match.span(1)
+        pwd = normalize_password(text[start:end])
         pwd = pwd.strip(" \t\r\n,.;")
         # Strip common archive extensions if present
         for ext in [".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz"]:
@@ -423,11 +450,15 @@ def extract_passwords_from_text(text: str) -> list[tuple[str, float]]:
 
     results: list[tuple[str, float]] = []
     seen_pwds: set[str] = set()
-    text_lower = text.lower()
+    # Markers are matched on a 1:1 homoglyph-translated copy (Cyrillic "pаss:"
+    # etc.) with IGNORECASE, so match.end() indexes the ORIGINAL text. A
+    # lower() copy is not safe for that: some Unicode lowercase mappings (İ)
+    # change string length and shift every subsequent slice.
+    marker_text = text.translate(_HOMOGLYPH_TABLE)
 
     # Look for explicit password markers
     for marker_pattern in PASSWORD_MARKERS:
-        for match in re.finditer(marker_pattern, text_lower):
+        for match in re.finditer(marker_pattern, marker_text, re.IGNORECASE):
             # Get the text after the marker
             remaining_text = text[match.end():]
             lines = remaining_text.split("\n")
