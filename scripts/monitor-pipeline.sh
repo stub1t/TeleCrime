@@ -45,5 +45,22 @@ while true; do
     fi
   fi
 
+  # Internal root hosts the `intts` tablespace (both dedup indexes) and
+  # pg_wal; when it fills, PostgreSQL writes fail. Warn at a higher threshold
+  # than the bulk-data volume. Dedupe by filesystem source so / and the
+  # tablespace path do not warn twice.
+  _seen_fs=""
+  for _disk_path in "${TELECRIME_PGTS_PATH:-/home/user/recovery/pgts}" /; do
+    [ -e "$_disk_path" ] || continue
+    _src=$(df -P "$_disk_path" 2>/dev/null | awk 'NR==2{print $1}')
+    case "${_src:-}" in ''|*[!A-Za-z0-9/._-]*) continue ;; esac
+    case " $_seen_fs " in *" $_src "*) continue ;; esac
+    _seen_fs="$_seen_fs $_src"
+    _free_gb=$(df -BG "$_disk_path" 2>/dev/null | awk 'NR==2{gsub("G","",$4); print $4}')
+    if [ -n "${_free_gb:-}" ] && [ "$_free_gb" -lt "${TELECRIME_INTERNAL_DISK_WARN_GB:-15}" ]; then
+      log "WARNING: low disk on $_disk_path — ${_free_gb} GB free (intts/pg_wal filesystem)"
+    fi
+  done
+
   sleep "$INTERVAL"
 done

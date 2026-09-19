@@ -258,6 +258,27 @@ case "$DB_Q" in
     ;;
 esac
 
+# --- Internal-volume disk pressure ------------------------------------------
+# The `intts` tablespace (both dedup indexes) and pg_wal live on the internal
+# root filesystem; when it fills, PostgreSQL writes fail. The external data
+# volume is checked by monitor-pipeline.sh. Warn well before full so an
+# operator can relocate indexes. Thresholds are env-overridable for tests.
+INTERNAL_DISK_WARN_GB="${TELECRIME_INTERNAL_DISK_WARN_GB:-15}"
+INTERNAL_TS_PATH="${TELECRIME_PGTS_PATH:-/home/user/recovery/pgts}"
+_seen_fs=""
+for _disk_path in "$INTERNAL_TS_PATH" /; do
+  [ -e "$_disk_path" ] || continue
+  _src=$(df -P "$_disk_path" 2>/dev/null | awk 'NR==2{print $1}')
+  case "${_src:-}" in ''|*[!A-Za-z0-9/._-]*) continue ;; esac
+  case " $_seen_fs " in *" $_src "*) continue ;; esac
+  _seen_fs="$_seen_fs $_src"
+  _free_gb=$(df -BG "$_disk_path" 2>/dev/null | awk 'NR==2{gsub("G","",$4); print $4}')
+  case "${_free_gb:-}" in ''|*[!0-9]*) continue ;; esac
+  if [ "$_free_gb" -lt "$INTERNAL_DISK_WARN_GB" ]; then
+    log "WARNING: low disk on $_disk_path — ${_free_gb} GB free (intts/pg_wal filesystem)"
+  fi
+done
+
 log "check: pipeline_pid=$PIPELINE_PID alive=$PIPELINE_ALIVE heartbeat_age=${HEARTBEAT_AGE}s db_active=$DB_ACTIVE dl_active=$DL_ACTIVE frozen=$FROZEN sig=$SIG"
 
 # --- Drive-wedge detection (BEFORE the heal logic) ---

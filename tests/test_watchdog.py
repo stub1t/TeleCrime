@@ -123,6 +123,40 @@ def test_watchdog_survives_empty_progress_and_garbage_inputs(watchdog):
     assert "pipeline_pid=0 alive=0" in log
 
 
+def test_watchdog_warns_on_low_internal_disk(watchdog):
+    """A nearly-full internal volume (intts/pg_wal) must warn on every check.
+
+    The internal root filesystem was never monitored (only /mnt/telecrime);
+    when it fills, PostgreSQL writes fail.
+    """
+    stub_dir = watchdog.data / "diskbin"
+    stub_dir.mkdir()
+    _write_stub(
+        stub_dir,
+        "df",
+        'case "$*" in\n'
+        '  *-P*) printf "Filesystem 1024-blocks Used Available Capacity Mounted on\\n"\n'
+        '        printf "/dev/mapper/root 100000 90000 10000 90%% /\\n" ;;\n'
+        '  *) printf "Filesystem 1G-blocks Used Available Use%% Mounted on\\n"\n'
+        '     printf "/dev/mapper/root 100 90 8 93%% /\\n" ;;\n'
+        "esac\n",
+    )
+    env_path = f"{stub_dir}:{watchdog.env['PATH']}"
+
+    result = _run(
+        watchdog,
+        {
+            "PATH": env_path,
+            "TELECRIME_INTERNAL_DISK_WARN_GB": "15",
+            "TELECRIME_PGTS_PATH": str(watchdog.data / "no-such-pgts"),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "WARNING: low disk on / — 8 GB free (intts/pg_wal filesystem)" in log
+
+
 def test_watchdog_detects_frozen_progress_from_stale_snapshot(watchdog):
     """Two identical signatures >=540s apart with no DB/download activity are
     reported frozen and healed."""
