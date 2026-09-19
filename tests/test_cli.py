@@ -19,7 +19,7 @@ runner = CliRunner()
 class TestCliInit:
     """Tests for init command."""
 
-    def test_init_creates_database(self, tmp_path):
+    def test_init_creates_database(self, tmp_path, monkeypatch):
         """init must create the schema and write the config file for real.
 
         The old version patched init_db, save_config and Path.exists, so a
@@ -29,6 +29,12 @@ class TestCliInit:
 
         from telecrime.config import Config, load_config
         from telecrime.database import get_engine
+
+        # The round-trip assertion below reads the FILE's database_url, but
+        # load_config's documented priority is env > file. CI exports
+        # TELECRIME_DATABASE_URL globally, which overrode the file and made
+        # this test fail only in CI (the test env leaked into the assertion).
+        monkeypatch.delenv("TELECRIME_DATABASE_URL", raising=False)
 
         config = Config(
             database_url=f"sqlite:///{tmp_path / 'init.db'}",
