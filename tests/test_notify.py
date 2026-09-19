@@ -657,6 +657,28 @@ async def test_send_returns_false_for_connection_drop_cancellation():
 
 
 @pytest.mark.asyncio
+async def test_send_logs_exception_type_when_message_is_empty(caplog):
+    """Bare TimeoutError() stringifies to '' and made every failure log blank.
+
+    Live logs showed "Failed to send notification: " with no detail, which hid
+    whether the failure was a timeout, a connection drop, or a formatting bug.
+    """
+    import logging
+
+    client = MagicMock()
+    client.is_connected.return_value = True
+    client.get_me = AsyncMock(return_value=MagicMock(id=7))
+    client.send_message = AsyncMock(side_effect=TimeoutError())
+    n = TelegramNotifier(client=client, enabled=True)
+
+    with caplog.at_level(logging.WARNING, logger="telecrime.notify"):
+        assert await n.send("hello") is False
+
+    assert "Failed to send notification: TimeoutError" in caplog.text
+    assert "(no detail)" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_flusher_loop_continues_after_tick_error(monkeypatch):
     """One failing tick (DB/Telegram hiccup) must not kill the background
     flusher permanently."""

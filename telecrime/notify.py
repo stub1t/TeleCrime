@@ -534,7 +534,13 @@ class TelegramNotifier:
             )
             return False
         except Exception as e:
-            logger.warning("Failed to send notification: %s", e)
+            # Some failures (TimeoutError, bare ConnectionError) stringify to
+            # an empty message, leaving the log line blank and undiagnosable.
+            # Always include the type name.
+            detail = str(e) or "(no detail)"
+            logger.warning(
+                "Failed to send notification: %s: %s", type(e).__name__, detail
+            )
             return False
 
     # -------------------------------------------------------------- digests
