@@ -262,6 +262,39 @@ def test_vacuum_job_gives_up_after_bounded_transient_retries(monkeypatch):
     assert len(calls) == sched._VACUUM_MAX_ATTEMPTS
 
 
+def test_vacuum_job_retries_lock_timeout(monkeypatch):
+    """A lock-timeout collision retries instead of skipping maintenance 168h.
+
+    The pipeline's startup DDL races the scheduled vacuum on the same tables.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    from telecrime import scheduler as sched
+
+    calls: list[object] = []
+
+    def _fake_once(engine):
+        calls.append(engine)
+        if len(calls) < 2:
+            raise OperationalError(
+                "VACUUM",
+                {},
+                Exception(
+                    "canceling statement due to lock timeout\n"
+                    "[SQL: VACUUM ANALYZE]"
+                ),
+            )
+        return 3
+
+    monkeypatch.setattr(sched, "_run_vacuum_once", _fake_once)
+    monkeypatch.setattr(sched.time, "sleep", lambda _delay: None)
+
+    result = sched._run_vacuum_job(object())
+
+    assert result == "VACUUM completed, pruned 3 stale extracted_output rows"
+    assert len(calls) == 2
+
+
 def test_vacuum_job_does_not_retry_non_transient_errors(monkeypatch):
     """A non-connection OperationalError must fail fast, not burn retries."""
     from sqlalchemy.exc import OperationalError

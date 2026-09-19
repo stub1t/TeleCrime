@@ -1090,6 +1090,14 @@ _VACUUM_TRANSIENT_MSG_FRAGMENTS = (
     "connection refused",
     "terminating connection",
     "server is in recovery",
+    # Lock contention is transient too: the pipeline's startup schema
+    # ensure_runtime_schema DDL (ADD COLUMN IF NOT EXISTS, ACCESS EXCLUSIVE)
+    # races the concurrently scheduled vacuum, and a 30s lock_timeout used to
+    # skip maintenance for the full 168h interval. Bounded retries clear it
+    # once the DDL commits.
+    "lock timeout",
+    "locknotavailable",
+    "could not obtain lock",
 )
 
 
