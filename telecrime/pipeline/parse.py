@@ -62,12 +62,6 @@ _PARALLEL_PARSE_IDLE_WAIT_SECONDS = 1.0
 # (the duplicate-heavy prefix is deterministic).
 _EARLY_SKIP_CODE = "EARLY_SKIP"
 
-# Job marker for a file whose parse was interrupted. Unlike EARLY_SKIP (which
-# deletes the file's rows and forces a full re-parse), RESUME keeps the
-# committed rows and tells the next run to continue the deterministic
-# credential sequence from the persisted count.
-_RESUME_CODE = "RESUME"
-
 # pipeline_state key prefix for the file currently being parsed. A hard kill
 # (SIGKILL / OOM / container restart mid-file) leaves rows from the file's
 # already-flushed batches committed. The next run's per-file pre-skip

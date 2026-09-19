@@ -4381,7 +4381,6 @@ class TestPartialParseRecovery:
             ExtractionJob,
             ParsedCredential,
         )
-        from telecrime.pipeline import parse as parse_mod
         from telecrime.pipeline.parse import _set_parse_marker
 
         group = ArchiveGroup(
@@ -4436,7 +4435,6 @@ class TestPartialParseRecovery:
             mode="sequential",
             output_hash="resumehash",
         )
-        job.last_error_code = parse_mod._RESUME_CODE
         session.commit()
 
         ctx = PipelineContext(config=test_config, session=session, adapter=MagicMock())
