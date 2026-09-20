@@ -2528,7 +2528,13 @@ def _claim_cred_counts_refresh(cache: dict, ttl: float) -> bool:
                 "Credential-count refresh claim stale (%.0fs) — reclaiming",
                 0.0 if claimed_at is None else now - claimed_at,
             )
-        if now - cache["ts"] <= ttl:
+        # A falsy ts means "never refreshed" (the cache is initialised with
+        # 0.0). Comparing it against a monotonic clock only works when the
+        # clock's epoch is older than ttl: on a freshly booted host/runner
+        # time.monotonic() can be smaller than ttl, so 0.0 looked like a
+        # refresh "seconds ago" and the first claim was wrongly rejected.
+        last_refresh = cache.get("ts") or 0.0
+        if last_refresh and now - last_refresh <= ttl:
             return False
         cache["refreshing"] = True
         cache["claimed_at"] = now

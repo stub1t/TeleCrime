@@ -1660,15 +1660,46 @@ def test_search_facets_degrades_gracefully_on_timeout(tmp_path, monkeypatch):
 
 def test_claim_cred_counts_refresh_reclaims_stale_claim():
     """A dead in-flight refresh must not wedge credential-count updates forever."""
+    now = time.monotonic()
     cache: dict = {
-        "ts": 0.0,
+        "ts": now - 1000,
         "data": {},
         "refreshing": True,
-        "claimed_at": 0.0,  # ancient claim: presumed dead
+        "claimed_at": now - 1000,  # ancient claim: presumed dead
         "lock": threading.Lock(),
     }
     assert _claim_cred_counts_refresh(cache, 90) is True
     assert cache["refreshing"] is True
+
+
+def test_claim_cred_counts_refresh_rejects_fresh_claim():
+    """The single-flight claim holds for the TTL window."""
+    now = time.monotonic()
+    cache: dict = {
+        "ts": now,
+        "data": {},
+        "refreshing": False,
+        "claimed_at": None,
+        "lock": threading.Lock(),
+    }
+    assert _claim_cred_counts_refresh(cache, 90) is False
+
+
+def test_claim_cred_counts_refresh_zero_ts_is_claimable_on_fresh_boot():
+    """ts=0.0 means "never refreshed", not "refreshed at clock epoch 0".
+
+    GitHub's fresh runners have time.monotonic() < ttl, which made the first
+    claim look like a recent refresh and rejected it (red CI, passed on
+    long-uptime hosts).
+    """
+    cache: dict = {
+        "ts": 0.0,
+        "data": {},
+        "refreshing": False,
+        "claimed_at": None,
+        "lock": threading.Lock(),
+    }
+    assert _claim_cred_counts_refresh(cache, 90) is True
 
 
 def test_no_unbounded_statement_timeout_in_web_or_scheduler():
