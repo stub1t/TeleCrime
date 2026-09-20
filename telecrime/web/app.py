@@ -3230,6 +3230,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 # re-runs the per-column ILIKE probes.
                 candidate_pool: list[int] | None = None
                 filter_clause = _credential_filter_clause(filters)
+                # Self-heal when the trigram indexes appear out of band (e.g.
+                # an operator runs `telecrime fts rebuild`): the flag is probed
+                # once at startup, so without this the web process would keep
+                # serving degraded LIKE search until restarted. Only runs while
+                # the flag is False, and the probe is bounded.
+                if terms and not app.state.fts_enabled:
+                    app.state.fts_enabled = _ensure_search_infra(engine)
                 fts_available = app.state.fts_enabled and terms
 
                 if fts_available:

@@ -1799,3 +1799,39 @@ def test_triage_retry_extraction_reopens_cleaned_group(tmp_path):
         assert artifact.status == DownloadStatus.PENDING
         assert artifact.is_deleted is False
         assert artifact.local_path is None
+
+
+def test_search_self_heals_fts_flag_after_rebuild(tmp_path, monkeypatch):
+    """An out-of-band trigram rebuild must enable search without a restart.
+
+    app.state.fts_enabled is probed once at startup; without the re-probe a
+    `telecrime fts rebuild` (or a recovered index) left the dashboard serving
+    degraded LIKE search until the next web restart.
+    """
+    from telecrime.web import app as web_app
+
+    app, _engine = _sqlite_app(tmp_path)
+    app.state.fts_enabled = False
+    monkeypatch.setattr(web_app, "_ensure_search_infra", lambda _engine: True)
+
+    response = _route(app, "/search").endpoint(
+        request=_web_request(),
+        q="needle",
+        limit=50,
+        limit_messages=0,
+        limit_attachments=0,
+        limit_archives=0,
+        limit_extracted=0,
+        limit_conversations=0,
+        limit_channels=0,
+        page=1,
+        page_size=50,
+        after_id=0,
+        regex=False,
+        facets=False,
+        no_markdown=False,
+        source_conv=0,
+    )
+
+    assert response.status_code == 200
+    assert app.state.fts_enabled is True

@@ -69,11 +69,18 @@ def fts_available(engine) -> bool:
             if not has_extension:
                 return False
             names = list(_PG_TRGM_INDEXES)
+            # pg_indexes lists indexes left INVALID by an interrupted
+            # CREATE INDEX CONCURRENTLY, but the planner ignores them: search
+            # then degrades to sequential scans while fts_available() reports
+            # "available". Check indisvalid instead.
             rows = conn.execute(
                 text(
-                    "SELECT indexname FROM pg_indexes "
-                    "WHERE tablename = 'parsed_credentials' "
-                    "AND indexname IN :names"
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_index i ON i.indexrelid = c.oid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'public' "
+                    "  AND i.indisvalid "
+                    "  AND c.relname IN :names"
                 ).bindparams(bindparam("names", expanding=True)),
                 {"names": names},
             ).fetchall()
@@ -87,23 +94,49 @@ def ensure_fts(engine, rebuild: bool = False) -> bool:
 
     The GIN indexes are normally created by Alembic migration i9j0k1l2m3n4;
     indexes deliberately dropped by later migrations (email_domain,
-    source_archive, url) are not recreated here. rebuild=True drops and
-    recreates the remaining indexes inside a single transaction — if any step
-    fails the transaction rolls back and the old indexes stay intact.
+    source_archive, url) are not recreated here.
+
+    On PostgreSQL the rebuild uses CREATE INDEX CONCURRENTLY in autocommit
+    mode: a plain CREATE INDEX holds a SHARE lock on parsed_credentials for
+    the entire multi-hour build on a production-sized table, blocking every
+    pipeline INSERT (the parse stage) until it finishes. CONCURRENTLY never
+    blocks writers; an interrupted build leaves an INVALID index behind,
+    which is dropped and retried here, and which fts_available() ignores.
+    SQLite (test fixtures) uses the regular DDL path.
     """
     try:
         with engine.begin() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-            if rebuild:
+        if not rebuild:
+            return True
+
+        if engine.dialect.name == "postgresql":
+            # CONCURRENTLY requires running outside any transaction block.
+            with engine.connect().execution_options(
+                isolation_level="AUTOCOMMIT"
+            ) as conn:
                 for name in _PG_TRGM_INDEXES:
-                    conn.execute(text(f"DROP INDEX IF EXISTS {name}"))
+                    conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {name}"))
                 for name, column in _PG_TRGM_INDEXES.items():
                     conn.execute(
                         text(
-                            f"CREATE INDEX {name} ON parsed_credentials "
+                            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} "
+                            f"ON parsed_credentials "
                             f"USING GIN ({column} gin_trgm_ops)"
                         )
                     )
+            return True
+
+        with engine.begin() as conn:
+            for name in _PG_TRGM_INDEXES:
+                conn.execute(text(f"DROP INDEX IF EXISTS {name}"))
+            for name, column in _PG_TRGM_INDEXES.items():
+                conn.execute(
+                    text(
+                        f"CREATE INDEX {name} ON parsed_credentials "
+                        f"USING GIN ({column} gin_trgm_ops)"
+                    )
+                )
         return True
     except Exception:
         return False
