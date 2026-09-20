@@ -48,4 +48,16 @@ jobs:
         run: uv run mypy telecrime/
 
       - name: Pytest
-        run: uv run pytest tests/ -q
+        # Emit the failing test names as a check-run annotation: the raw job
+        # log needs repo-admin auth, so without this a red CI run only says
+        # "Process completed with exit code 1" and cannot be diagnosed from
+        # the API/annotations alone.
+        run: |
+          set +e
+          uv run pytest tests/ -q 2>&1 | tee /tmp/pytest.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            summary=$(grep -E "^(FAILED|ERROR)" /tmp/pytest.log | head -20 | tr '\n' ';')
+            echo "::error title=Pytest failures::${summary:-pytest exited $rc}"
+          fi
+          exit "$rc"
