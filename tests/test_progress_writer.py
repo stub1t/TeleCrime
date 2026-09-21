@@ -177,3 +177,32 @@ def test_write_failure_warns_once_and_cleans_temp_file(tmp_path, monkeypatch, ca
     assert len(warnings) == 1
     assert "no space left on device" in warnings[0].getMessage()
     assert list(tmp_path.glob(".progress-*.tmp")) == []
+
+
+def test_progress_mirror_is_written_even_when_primary_fails(tmp_path, monkeypatch):
+    """The local mirror must stay fresh when the data-drive write fails/hangs.
+
+    A wedged data volume blocks the primary write in D-state; the watchdog
+    reads the mirror (on the local filesystem) so monitoring survives.
+    """
+    import os
+
+    primary = tmp_path / "pipeline_progress.json"
+    mirror = tmp_path / "pipeline_progress.mirror.json"
+    monkeypatch.setenv("TELECRIME_PROGRESS_FILE", str(primary))
+    monkeypatch.setenv("TELECRIME_PROGRESS_MIRROR_FILE", str(mirror))
+
+    real_replace = os.replace
+
+    def _replace(src, dst):
+        if str(dst) == str(primary):
+            raise OSError("data drive wedged")
+        real_replace(src, dst)
+
+    monkeypatch.setattr("telecrime.pipeline.progress.os.replace", _replace)
+
+    _write_progress_data({"running": True, "credentials": 7})
+
+    assert not primary.exists()
+    assert json.loads(mirror.read_text())["credentials"] == 7
+    assert list(tmp_path.glob(".progress-*.tmp")) == []

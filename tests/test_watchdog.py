@@ -75,6 +75,10 @@ esac
     # the host's real /proc and could see (or miss) D-state kernel threads.
     env["TELECRIME_PROC_DIR"] = str(data / "proc")
     env.pop("TELECRIME_PIPELINE_STALE_SECONDS", None)
+    # The autouse isolation fixture points the progress mirror at the pytest
+    # tmp dir; the script's rewritten default (DATA_DIR/telecrime-progress.json)
+    # is what these tests set up, so drop the leaked override.
+    env.pop("TELECRIME_PROGRESS_MIRROR_FILE", None)
     return SimpleNamespace(repo=repo, data=data, script=script, env=env, calls=calls)
 
 
@@ -505,3 +509,41 @@ def test_watchdog_drive_wedge_ignores_legacy_pid_only_snapshot(watchdog):
     assert "123 1 dmcrypt_write/0" in (
         watchdog.data / "telecrime-wedge-pids.txt"
     ).read_text()
+
+
+def test_watchdog_prefers_local_progress_mirror(watchdog):
+    """The heartbeat read must use the local mirror, not the data drive."""
+    (watchdog.data / "telecrime-progress.json").write_text(
+        json.dumps(_progress_payload())
+    )
+    # No primary progress file: only the mirror exists.
+    result = _run(watchdog)
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "heartbeat_age=9999s" not in log
+    match = re.search(r"heartbeat_age=(\d+)s", log)
+    assert match is not None and int(match.group(1)) < 120
+
+
+def test_watchdog_logs_breadcrumb_when_heal_lock_is_stuck(watchdog):
+    """A wedged holder must be visible, not silent.
+
+    A previous run blocked in D-state on the data drive holds the heal lock;
+    later runs used to exit silently, so monitoring stopped with no trace.
+    """
+    import fcntl
+
+    lock_path = watchdog.data / "telecrime-heal.lock"
+    handle = lock_path.open("w")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    handle.write(f"999999 {int(time.time()) - 2000}")
+    handle.flush()
+    try:
+        result = _run(watchdog)
+    finally:
+        handle.close()
+
+    assert result.returncode == 0, result.stderr
+    log = (watchdog.data / "watchdog.log").read_text()
+    assert "has held the heal lock for" in log

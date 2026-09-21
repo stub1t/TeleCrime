@@ -51,8 +51,21 @@ DATA_DIR="${TELECRIME_DATA_DIR:-$(dotenv_value TELECRIME_DATA_DIR)}"
 DATA_DIR="${DATA_DIR:-$REPO_DIR/data}"
 mkdir -p "$DATA_DIR"
 
-LOG="$DATA_DIR/watchdog.log"
+# The watchdog's own log MUST live on the script's filesystem (normally the
+# internal SSD), not under $DATA_DIR: on 2026-09-21 an append to the wedged
+# data drive left the watchdog in uninterruptible D-state holding the heal
+# lock, so every later run exited silently and the pipeline stayed hung with
+# no monitoring. Overridable for tests/other layouts.
+LOG="${TELECRIME_WATCHDOG_LOG:-$REPO_DIR/data/watchdog.log}"
+mkdir -p "$(dirname "$LOG")"
+# Prefer the local progress mirror (written by the pipeline every tick) so a
+# wedged data drive cannot block the heartbeat read; fall back to the primary
+# file for older pipelines that do not write a mirror yet.
+PROGRESS_MIRROR="${TELECRIME_PROGRESS_MIRROR_FILE:-/tmp/telecrime-progress.json}"
 PROGRESS="$DATA_DIR/pipeline_progress.json"
+if [ -f "$PROGRESS_MIRROR" ]; then
+  PROGRESS="$PROGRESS_MIRROR"
+fi
 SNAP=/tmp/telecrime-watchdog-snap.txt   # last observed progress signature
 WEDGE_PROC_DIR="${TELECRIME_PROC_DIR:-/proc}"  # overridable for hermetic tests
 # A transient D-state `dmcrypt_write*`/`jbd2/*` thread under heavy write load
@@ -73,11 +86,27 @@ HEAL_LOCK=/tmp/telecrime-heal.lock
 
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >> "$LOG"; }
 
-# Avoid concurrent heal attempts (cron can overlap on slow DB)
-exec 9>"$HEAL_LOCK"
+# Avoid concurrent heal attempts (cron can overlap on slow DB). The lock file
+# records "pid epoch" of the holder so a run that cannot acquire the lock can
+# distinguish a normal in-flight heal from a wedged holder (e.g. a previous
+# watchdog blocked in D-state on a failing data drive) and leave a breadcrumb
+# instead of exiting silently — silence is how "monitoring stopped" hid.
+# Append (>>), never truncate (>): the open itself would wipe the holder's
+# "pid epoch" line before we can read it and report a wedged holder.
+exec 9>>"$HEAL_LOCK"
 if ! flock -n 9; then
+  _holder=$(cat "$HEAL_LOCK" 2>/dev/null)
+  _held_since=${_holder##* }
+  case "$_held_since" in ''|*[!0-9]*) _held_since=0 ;; esac
+  if [ "$_held_since" != "0" ]; then
+    _held_for=$(( $(date +%s) - _held_since ))
+    if [ "$_held_for" -gt 900 ]; then
+      log "WARNING: another watchdog run has held the heal lock for ${_held_for}s — it may be wedged (check the data drive); skipping this check"
+    fi
+  fi
   exit 0
 fi
+echo "$$ $(date +%s)" >&9
 
 # --- 1. Pipeline process running? ---
 PIPELINE_PID=0

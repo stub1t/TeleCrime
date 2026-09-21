@@ -235,6 +235,10 @@ def _isolate_runtime_state_files(tmp_path, monkeypatch):
         str(tmp_path / "pipeline_progress.json"),
     )
     monkeypatch.setenv(
+        "TELECRIME_PROGRESS_MIRROR_FILE",
+        str(tmp_path / "pipeline_progress.mirror.json"),
+    )
+    monkeypatch.setenv(
         "TELECRIME_STATUS_FILE",
         str(tmp_path / "scheduler_status.json"),
     )

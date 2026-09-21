@@ -15,7 +15,11 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 INTERVAL="${TELECRIME_MONITOR_INTERVAL:-300}"
-LOG="${TELECRIME_MONITOR_LOG:-/mnt/telecrime/data/monitor.log}"
+# Keep the monitor's own log off the data drive: a wedged/failing data volume
+# must not block the monitor's logging (2026-09-21: the watchdog hung writing
+# its log to the wedged drive and monitoring stopped). The repo normally lives
+# on the internal SSD. Overridable via TELECRIME_MONITOR_LOG.
+LOG="${TELECRIME_MONITOR_LOG:-$REPO_DIR/data/monitor.log}"
 
 mkdir -p "$(dirname "$LOG")"
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >> "$LOG"; }

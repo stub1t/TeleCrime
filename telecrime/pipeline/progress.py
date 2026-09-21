@@ -36,28 +36,55 @@ def _progress_path() -> Path:
     return Path(os.environ.get("TELECRIME_PROGRESS_FILE", str(default_path)))
 
 
+def _progress_mirror_path() -> Path:
+    """Small copy of the progress file on the LOCAL filesystem (default /tmp).
+
+    The primary file lives on the data volume. When that drive wedges, the
+    watchdog's heartbeat read blocks in uninterruptible D-state (a read that
+    ``timeout`` cannot kill) and host monitoring stops. The mirror gives the
+    watchdog a heartbeat source that never touches the data drive.
+    """
+    return Path(
+        os.environ.get(
+            "TELECRIME_PROGRESS_MIRROR_FILE", "/tmp/telecrime-progress.json"
+        )
+    )
+
+
+def _atomic_write_json(data: dict[str, object], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Unique temp name per write: the pipeline's heartbeat thread and the
+    # scheduler process (patch_progress) write this file concurrently, and
+    # a shared ".tmp" name let two writers clobber each other's temp —
+    # worst case renaming a torn file into place (readers then see no
+    # heartbeat and the watchdog kills a healthy pipeline).
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".progress-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _write_progress_data(data: dict[str, object], path: Path | None = None) -> None:
     path = path or _progress_path()
+    # Mirror FIRST and best-effort: when the data drive wedges, the primary
+    # write below blocks in D-state, and this already-fresh local copy is what
+    # lets the watchdog still see a heartbeat and report the wedge instead of
+    # hanging on the same drive.
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Unique temp name per write: the pipeline's heartbeat thread and the
-        # scheduler process (patch_progress) write this file concurrently, and
-        # a shared ".tmp" name let two writers clobber each other's temp —
-        # worst case renaming a torn file into place (readers then see no
-        # heartbeat and the watchdog kills a healthy pipeline).
-        fd, tmp = tempfile.mkstemp(
-            dir=str(path.parent), prefix=".progress-", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp, path)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        _atomic_write_json(data, _progress_mirror_path())
+    except Exception:
+        pass
+    try:
+        _atomic_write_json(data, path)
     except Exception as exc:
         # Swallowing silently made a healthy pipeline indistinguishable from a
         # dead one: the heartbeat stops updating, the watchdog kills the run,
