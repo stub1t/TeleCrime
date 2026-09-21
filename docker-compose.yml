@@ -1,23 +1,36 @@
 services:
   db:
     image: postgres:16-alpine
-    command: >
-      postgres
-      -c shared_buffers=${TELECRIME_POSTGRES_SHARED_BUFFERS:-128MB}
-      -c effective_cache_size=${TELECRIME_POSTGRES_EFFECTIVE_CACHE_SIZE:-4GB}
-      -c work_mem=${TELECRIME_POSTGRES_WORK_MEM:-4MB}
-      -c maintenance_work_mem=${TELECRIME_POSTGRES_MAINTENANCE_WORK_MEM:-64MB}
-      -c max_wal_size=${TELECRIME_POSTGRES_MAX_WAL_SIZE:-8GB}
-      -c checkpoint_timeout=${TELECRIME_POSTGRES_CHECKPOINT_TIMEOUT:-30min}
-      -c wal_buffers=${TELECRIME_POSTGRES_WAL_BUFFERS:-64MB}
-      -c wal_compression=${TELECRIME_POSTGRES_WAL_COMPRESSION:-lz4}
-      -c bgwriter_lru_maxpages=${TELECRIME_POSTGRES_BGWRITER_LRU_MAXPAGES:-1000}
-      -c bgwriter_lru_multiplier=${TELECRIME_POSTGRES_BGWRITER_LRU_MULTIPLIER:-4}
-      -c temp_tablespaces=${TELECRIME_POSTGRES_TEMP_TABLESPACES:-pg_default}
-      -c statement_timeout=${TELECRIME_POSTGRES_STATEMENT_TIMEOUT:-5min}
-      -c lock_timeout=${TELECRIME_POSTGRES_LOCK_TIMEOUT:-30s}
-      -c idle_in_transaction_session_timeout=${TELECRIME_POSTGRES_IDLE_TRANSACTION_TIMEOUT:-10min}
-      -c synchronous_commit=off
+    # Refuse to start when the external Postgres volume is not mounted: the
+    # official image initializes a FRESH cluster when the data dir has no
+    # PG_VERSION, so a missing/broken bind mount (e.g. the encrypted USB drive
+    # failed to mount after a wedge/reboot) would silently replace the real
+    # dataset with an empty database. First-time setup bypasses the guard with
+    # TELECRIME_ALLOW_FRESH_PG=1.
+    command:
+      - sh
+      - -c
+      - |
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ] && [ "$${TELECRIME_ALLOW_FRESH_PG:-0}" != "1" ]; then
+          echo 'FATAL: external Postgres volume not mounted (no PG_VERSION) - refusing to initialize a fresh cluster; set TELECRIME_ALLOW_FRESH_PG=1 for first-time setup.' >&2
+          exit 1
+        fi
+        exec /usr/local/bin/docker-entrypoint.sh postgres \
+          -c shared_buffers=${TELECRIME_POSTGRES_SHARED_BUFFERS:-128MB} \
+          -c effective_cache_size=${TELECRIME_POSTGRES_EFFECTIVE_CACHE_SIZE:-4GB} \
+          -c work_mem=${TELECRIME_POSTGRES_WORK_MEM:-4MB} \
+          -c maintenance_work_mem=${TELECRIME_POSTGRES_MAINTENANCE_WORK_MEM:-64MB} \
+          -c max_wal_size=${TELECRIME_POSTGRES_MAX_WAL_SIZE:-8GB} \
+          -c checkpoint_timeout=${TELECRIME_POSTGRES_CHECKPOINT_TIMEOUT:-30min} \
+          -c wal_buffers=${TELECRIME_POSTGRES_WAL_BUFFERS:-64MB} \
+          -c wal_compression=${TELECRIME_POSTGRES_WAL_COMPRESSION:-lz4} \
+          -c bgwriter_lru_maxpages=${TELECRIME_POSTGRES_BGWRITER_LRU_MAXPAGES:-1000} \
+          -c bgwriter_lru_multiplier=${TELECRIME_POSTGRES_BGWRITER_LRU_MULTIPLIER:-4} \
+          -c temp_tablespaces=${TELECRIME_POSTGRES_TEMP_TABLESPACES:-pg_default} \
+          -c statement_timeout=${TELECRIME_POSTGRES_STATEMENT_TIMEOUT:-5min} \
+          -c lock_timeout=${TELECRIME_POSTGRES_LOCK_TIMEOUT:-30s} \
+          -c idle_in_transaction_session_timeout=${TELECRIME_POSTGRES_IDLE_TRANSACTION_TIMEOUT:-10min} \
+          -c synchronous_commit=off
     environment:
       POSTGRES_DB: telecrime
       POSTGRES_USER: telecrime
